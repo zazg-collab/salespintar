@@ -188,7 +188,10 @@ class BaileysManager {
 
     sock.ev.on('messages.upsert', async (msg) => {
       for (const message of msg.messages) {
-        if (!message.key.fromMe && this.messageHandler) {
+        if (message.key.fromMe) continue;
+        const remoteJid = message.key.remoteJid || '';
+        if (remoteJid.endsWith('@g.us')) continue;
+        if (this.messageHandler) {
           await this.messageHandler(businessId, message);
         }
       }

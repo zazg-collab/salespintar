@@ -14,6 +14,7 @@ export async function handleIncomingMessage(businessId: string, msg: proto.IWebM
       || '';
 
     if (!remoteJid || !messageText) return;
+    if (remoteJid.endsWith('@g.us')) return;
 
     const waNumber = remoteJid.split('@')[0];
     const waId = remoteJid;
