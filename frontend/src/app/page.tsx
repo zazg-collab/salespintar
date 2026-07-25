@@ -1,5 +1,14 @@
-import { Link } from 'react-router-dom';
+'use client';
+
+import Link from 'next/link';
 import { MessageSquare, Zap, Shield, BarChart3 } from 'lucide-react';
+
+const features = [
+  { icon: MessageSquare, title: 'Auto Reply AI', desc: 'Balas otomatis 24/7 dengan Groq LLM. Konteks percakapan 20 pesan terakhir.' },
+  { icon: Zap, title: 'Human Takeover', desc: 'Sales ambil alih kapan saja dengan satu klik. AI berhenti otomatis.' },
+  { icon: Shield, title: 'Broadcast Aman', desc: 'Kirim pesan massal terjadwal dengan throttle cerdas. Anti spam built-in.' },
+  { icon: BarChart3, title: 'Dashboard Real-time', desc: 'KPI, grafik tren, performa AI — semua real-time via WebSocket.' },
+];
 
 export default function Landing() {
   return (
@@ -8,11 +17,11 @@ export default function Landing() {
         <div className="max-w-6xl mx-auto flex items-center justify-between">
           <h1 className="text-2xl font-bold text-indigo-600">SalesPintar</h1>
           <div className="flex items-center gap-4">
-            <Link to="/login" className="text-sm font-medium text-gray-600 hover:text-gray-900">
+            <Link href="/login" className="text-sm font-medium text-gray-600 hover:text-gray-900">
               Masuk
             </Link>
             <Link
-              to="/register"
+              href="/register"
               className="px-4 py-2 text-sm font-medium text-white bg-indigo-600 rounded-lg hover:bg-indigo-700"
             >
               Coba Gratis
@@ -31,7 +40,7 @@ export default function Landing() {
         </p>
         <div className="mt-10 flex items-center justify-center gap-4">
           <Link
-            to="/register"
+            href="/register"
             className="px-8 py-3 text-lg font-medium text-white bg-indigo-600 rounded-xl hover:bg-indigo-700 shadow-lg shadow-indigo-200"
           >
             Mulai Gratis
@@ -66,10 +75,3 @@ export default function Landing() {
     </div>
   );
 }
-
-const features = [
-  { icon: MessageSquare, title: 'Auto Reply AI', desc: 'Balas otomatis 24/7 dengan Groq LLM. Konteks percakapan 20 pesan terakhir.' },
-  { icon: Zap, title: 'Human Takeover', desc: 'Sales ambil alih kapan saja dengan satu klik. AI berhenti otomatis.' },
-  { icon: Shield, title: 'Broadcast Aman', desc: 'Kirim pesan massal terjadwal dengan throttle cerdas. Anti spam built-in.' },
-  { icon: BarChart3, title: 'Dashboard Real-time', desc: 'KPI, grafik tren, performa AI — semua real-time via WebSocket.' },
-];

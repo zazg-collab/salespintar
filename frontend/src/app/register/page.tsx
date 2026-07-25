@@ -1,10 +1,13 @@
+'use client';
+
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { useAuthStore } from '../stores/auth';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { useAuthStore } from '../../stores/auth';
 
 export default function Register() {
   const { register, isLoading, error, clearError } = useAuthStore();
-  const navigate = useNavigate();
+  const router = useRouter();
   const [form, setForm] = useState({
     businessName: '',
     name: '',
@@ -23,7 +26,7 @@ export default function Register() {
 
     try {
       await register(form.businessName, form.name, form.email, form.password);
-      navigate('/app/wa-setup');
+      router.push('/app/wa-setup');
     } catch {}
   };
 
@@ -120,7 +123,7 @@ export default function Register() {
 
           <p className="mt-4 text-center text-sm text-gray-500">
             Sudah punya akun?{' '}
-            <Link to="/login" className="text-indigo-600 hover:underline font-medium">
+            <Link href="/login" className="text-indigo-600 hover:underline font-medium">
               Masuk
             </Link>
           </p>

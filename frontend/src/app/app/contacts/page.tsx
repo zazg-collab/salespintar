@@ -1,7 +1,9 @@
+'use client';
+
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { apiGet, apiPost, apiPatch, apiDelete } from '../lib/api';
-import { Users, Search, Plus, Edit2, Trash2, Upload } from 'lucide-react';
+import { apiGet, apiPost, apiPatch, apiDelete } from '../../../lib/api';
+import { Users, Search, Plus, Edit2, Trash2 } from 'lucide-react';
 
 export default function Contacts() {
   const queryClient = useQueryClient();
@@ -127,7 +129,7 @@ export default function Contacts() {
       )}
 
       <div className="bg-white rounded-xl border border-gray-200 overflow-hidden">
-        {leads?.data?.length === 0 && (
+        {(!leads?.data || leads.data.length === 0) && (
           <div className="text-center py-12 text-gray-400">
             <Users className="w-12 h-12 mx-auto mb-3 opacity-50" />
             <p>Belum ada kontak</p>

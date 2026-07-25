@@ -132,11 +132,8 @@ function replaceVariables(template: string, lead: any, vars: string[]): string {
   let result = template;
   for (const v of vars) {
     const key = v.toLowerCase();
-    const value = lead[key] || lead[key === 'nama' ? 'name' : key] || '';
-    const escaped = String(value).replace(/[&<>"']/g, (c) => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;'
-    }[c] || c));
-    result = result.replace(new RegExp(`\\{\\{\\s*${v}\\s*\\}\\}`, 'gi'), escaped);
+    const value = String(lead[key] || lead[key === 'nama' ? 'name' : key] || '');
+    result = result.replace(new RegExp(`\\{\\{\\s*${v}\\s*\\}\\}`, 'gi'), value);
   }
   return result;
 }

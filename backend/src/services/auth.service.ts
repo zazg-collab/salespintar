@@ -1,6 +1,7 @@
+import crypto from 'crypto';
 import { z } from 'zod';
 import { prisma } from '../config/prisma';
-import { hashPassword, comparePassword, signAccessToken, signRefreshToken, verifyRefreshToken } from '../utils/crypto';
+import { hashPassword, comparePassword, signAccessToken, signRefreshToken, verifyRefreshToken, hashRefreshToken } from '../utils/crypto';
 import { ConflictError, UnauthorizedError, NotFoundError } from '../utils/errors';
 import { env } from '../config/env';
 
@@ -16,6 +17,11 @@ export const registerSchema = z.object({
 export const loginSchema = z.object({
   email: z.string().email(),
   password: z.string().min(1),
+});
+
+export const acceptInviteSchema = z.object({
+  token: z.string().min(1),
+  password: z.string().min(8).max(128),
 });
 
 export const inviteSchema = z.object({
@@ -74,7 +80,7 @@ export async function register(data: z.infer<typeof registerSchema>) {
     data: {
       businessId: business.id,
       userId: user.id,
-      refreshToken,
+      refreshToken: hashRefreshToken(refreshToken),
       expiresAt,
     },
   });
@@ -114,7 +120,7 @@ export async function login(data: z.infer<typeof loginSchema>) {
     data: {
       businessId: user.businessId,
       userId: user.id,
-      refreshToken,
+      refreshToken: hashRefreshToken(refreshToken),
       expiresAt,
     },
   });
@@ -135,8 +141,10 @@ export async function refreshTokens(refreshToken: string) {
     throw new UnauthorizedError('Invalid refresh token');
   }
 
+  const hashedToken = hashRefreshToken(refreshToken);
+
   const session = await prisma.session.findUnique({
-    where: { refreshToken },
+    where: { refreshToken: hashedToken },
     include: { user: { include: { business: true } } },
   });
 
@@ -163,7 +171,7 @@ export async function refreshTokens(refreshToken: string) {
     data: {
       businessId: session.businessId,
       userId: session.userId,
-      refreshToken: newRefreshToken,
+      refreshToken: hashRefreshToken(newRefreshToken),
       expiresAt: new Date(Date.now() + REFRESH_TOKEN_EXPIRY_MS),
     },
   });
@@ -172,8 +180,9 @@ export async function refreshTokens(refreshToken: string) {
 }
 
 export async function logout(refreshToken: string) {
+  const hashedToken = hashRefreshToken(refreshToken);
   const session = await prisma.session.findUnique({
-    where: { refreshToken },
+    where: { refreshToken: hashedToken },
   });
   if (session) {
     await prisma.session.delete({ where: { id: session.id } });
@@ -202,19 +211,65 @@ export async function revokeSession(sessionId: string, userId: string, businessI
   await prisma.session.delete({ where: { id: session.id } });
 }
 
+export async function acceptInvite(data: z.infer<typeof acceptInviteSchema>) {
+  const user = await prisma.user.findFirst({
+    where: { inviteToken: data.token, isActive: true },
+  });
+  if (!user) throw new UnauthorizedError('Invalid or expired invite token');
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: {
+      password: await hashPassword(data.password),
+      inviteToken: null,
+    },
+  });
+
+  const payload = { userId: user.id, businessId: user.businessId, role: user.role };
+  const accessToken = signAccessToken(payload);
+  const refreshToken = signRefreshToken(payload);
+  const expiresAt = new Date(Date.now() + REFRESH_TOKEN_EXPIRY_MS);
+
+  await prisma.session.create({
+    data: {
+      businessId: user.businessId,
+      userId: user.id,
+      refreshToken: hashRefreshToken(refreshToken),
+      expiresAt,
+    },
+  });
+
+  return {
+    user: { id: user.id, name: user.name, email: user.email, role: user.role },
+    accessToken,
+    refreshToken,
+  };
+}
+
 export async function inviteUser(businessId: string, data: z.infer<typeof inviteSchema>) {
   const existing = await prisma.user.findUnique({ where: { email: data.email } });
   if (existing) throw new ConflictError('Email already registered');
+
+  const inviteToken = crypto.randomBytes(32).toString('hex');
+  const invitedPassword = crypto.randomBytes(8).toString('hex');
 
   const user = await prisma.user.create({
     data: {
       businessId,
       name: data.name,
       email: data.email,
-      password: await hashPassword(Math.random().toString(36).slice(2)),
+      password: await hashPassword(invitedPassword),
       role: data.role,
+      inviteToken,
     },
   });
 
-  return { id: user.id, name: user.name, email: user.email, role: user.role };
+  return {
+    id: user.id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    inviteToken,
+    message: 'User invited. Share the invite token with them to set their password.',
+  };
 }

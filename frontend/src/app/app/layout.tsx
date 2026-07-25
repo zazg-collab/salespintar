@@ -1,6 +1,10 @@
-import { Outlet, NavLink, useNavigate } from 'react-router-dom';
-import { useAuthStore } from '../stores/auth';
-import { useWebSocket } from '../hooks/useWebSocket';
+'use client';
+
+import { useEffect, useState } from 'react';
+import { useRouter, usePathname } from 'next/navigation';
+import Link from 'next/link';
+import { useAuthStore } from '../../stores/auth';
+import { useWebSocket } from '../../hooks/useWebSocket';
 import {
   LayoutDashboard,
   MessageSquare,
@@ -11,27 +15,37 @@ import {
   Menu,
   X,
 } from 'lucide-react';
-import { useState } from 'react';
 
 const navItems = [
-  { to: '/app/dashboard', label: 'Dashboard', icon: LayoutDashboard },
-  { to: '/app/chat', label: 'Chat', icon: MessageSquare },
-  { to: '/app/broadcasts', label: 'Broadcast', icon: Send },
-  { to: '/app/contacts', label: 'Kontak', icon: Users },
-  { to: '/app/wa-setup', label: 'WhatsApp', icon: Smartphone },
+  { href: '/app/dashboard', label: 'Dashboard', icon: LayoutDashboard },
+  { href: '/app/chat', label: 'Chat', icon: MessageSquare },
+  { href: '/app/broadcasts', label: 'Broadcast', icon: Send },
+  { href: '/app/contacts', label: 'Kontak', icon: Users },
+  { href: '/app/wa-setup', label: 'WhatsApp', icon: Smartphone },
 ];
 
-export default function Layout() {
-  const { user, business, logout } = useAuthStore();
-  const navigate = useNavigate();
+export default function AppLayout({ children }: { children: React.ReactNode }) {
+  const { user, business, isAuthenticated, logout } = useAuthStore();
+  const router = useRouter();
+  const pathname = usePathname();
   const [sidebarOpen, setSidebarOpen] = useState(false);
 
   useWebSocket();
 
+  useEffect(() => {
+    if (!isAuthenticated) {
+      router.push('/login');
+    }
+  }, [isAuthenticated, router]);
+
   const handleLogout = async () => {
     await logout();
-    navigate('/login');
+    router.push('/login');
   };
+
+  if (!isAuthenticated) {
+    return null;
+  }
 
   return (
     <div className="flex h-screen bg-gray-50">
@@ -51,23 +65,24 @@ export default function Layout() {
         </div>
 
         <nav className="p-4 space-y-1">
-          {navItems.map((item) => (
-            <NavLink
-              key={item.to}
-              to={item.to}
-              onClick={() => setSidebarOpen(false)}
-              className={({ isActive }) =>
-                `flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+          {navItems.map((item) => {
+            const isActive = pathname.startsWith(item.href);
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                onClick={() => setSidebarOpen(false)}
+                className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
                   isActive
                     ? 'bg-indigo-50 text-indigo-700'
                     : 'text-gray-600 hover:bg-gray-100'
-                }`
-              }
-            >
-              <item.icon className="w-5 h-5" />
-              {item.label}
-            </NavLink>
-          ))}
+                }`}
+              >
+                <item.icon className="w-5 h-5" />
+                {item.label}
+              </Link>
+            );
+          })}
         </nav>
 
         <div className="absolute bottom-0 left-0 right-0 p-4 border-t border-gray-200">
@@ -103,7 +118,7 @@ export default function Layout() {
         </header>
 
         <main className="flex-1 overflow-auto p-6">
-          <Outlet />
+          {children}
         </main>
       </div>
     </div>

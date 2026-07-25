@@ -1,3 +1,5 @@
+'use client';
+
 import { create } from 'zustand';
 import { apiPost, setTokens, clearTokens, getAccessToken, apiGet } from '../lib/api';
 

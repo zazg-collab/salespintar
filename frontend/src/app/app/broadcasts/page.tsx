@@ -1,7 +1,9 @@
+'use client';
+
 import { useState } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { apiGet, apiPost, apiDelete } from '../lib/api';
-import { useAuthStore } from '../stores/auth';
+import { apiGet, apiPost, apiDelete } from '../../../lib/api';
+import { useAuthStore } from '../../../stores/auth';
 import { Plus, Send, Trash2, X } from 'lucide-react';
 
 export default function Broadcasts() {
@@ -143,7 +145,7 @@ export default function Broadcasts() {
       )}
 
       <div className="space-y-3">
-        {broadcasts?.data?.length === 0 && (
+        {(!broadcasts?.data || broadcasts.data.length === 0) && (
           <div className="text-center py-12 text-gray-400">
             <Send className="w-12 h-12 mx-auto mb-3 opacity-50" />
             <p>Belum ada broadcast</p>

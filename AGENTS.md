@@ -5,9 +5,9 @@
 | Command | What it does |
 |---------|-------------|
 | `npm run setup` | Start infra (PostgreSQL+Redis), generate Prisma client, run migrations |
-| `npm run dev` | Infra up → start backend (port 3000) + frontend (port 5173) concurrently |
+| `npm run dev` | Infra up → start backend (port 3000) + frontend (port 3000) concurrently |
 | `npm run dev:backend` | `cd backend && tsx watch src/server.ts` (kills port 3000 first) |
-| `npm run dev:frontend` | `cd frontend && vite` |
+| `npm run dev:frontend` | `cd frontend && next dev` (port 3000) |
 | `npm run infra:up` | `docker compose -f docker-compose.dev.yml up -d` (PostgreSQL host-network + Redis) |
 | `npm run db:migrate` | `cd backend && npx prisma migrate dev --name init` |
 | `npm run db:generate` | `cd backend && npx prisma generate` |
@@ -23,8 +23,9 @@
   - Zod validates ALL inputs (env vars at startup, all request bodies/params).
   - Custom error classes: `AppError` → `NotFoundError` (404), `ConflictError` (409), `UnauthorizedError` (401), `ForbiddenError` (403), `ValidationError` (400).
   - Services/auth middleware attach `req.user = { userId, businessId, role }`.
-- **`frontend/`:** React 19 + Vite + Tailwind + TanStack Query + Zustand. **ESM** (`"type": "module"` in package.json).
-  - Vite proxies `/api` and `/socket.io` to `localhost:3000`.
+- **`frontend/`:** Next.js 15 App Router + React 19 + Tailwind + TanStack Query + Zustand. **ESM** (`"type": "module"` in package.json).
+  - Dev: `next dev` (port 3000, proxied from root `npm run dev`).
+  - Build: `next build` (static export via `BUILD_STATIC=true`, output to `out/`).
   - Path alias `@/` → `./src/`.
 - **Infra:** Docker Compose (prod: `docker-compose.yml`, dev: `docker-compose.dev.yml`). Dev uses `network_mode: host`.
 - **WA sessions:** Stored in `./wa_sessions/<business_id>/` (FS) + DB `wa_credentials.session_data`. Volume-mounted for persistence.
@@ -56,12 +57,14 @@ All jobs carry `businessId` in payload. Workers check conversation status before
 - **BAILEYS:** One socket per business (~50-80MB RAM each). Cap: `WA_MAX_CONNECTIONS` (default 50). Auto-reconnect with exponential backoff (max 5 attempts). Server startup resets all stale `CONNECTED` credentials to `DISCONNECTED`. Group messages (`@g.us` JIDs) are filtered out in `messages.upsert` handler — only individual chats trigger auto-reply.
 - **AI:** Groq SDK. Rate-limited: 3s per lead, 3 consecutive unanswered, 50/day per lead. Falls back: primary model → `GROQ_FALLBACK_MODEL` → hardcoded text.
 - **Validation:** Zod schemas co-located with services (not routes). Apply via `validate(schema)` middleware.
-- **Auth:** JWT access (15m) + refresh (7d, httpOnly cookie). `JwtPayload = { userId, businessId, role }`. Refresh rotation with stolen-token detection.
+- **Auth:** JWT access (15m) + refresh (7d, httpOnly cookie). `JwtPayload = { userId, businessId, role }`. Refresh rotation with stolen-token detection. Refresh token di-hash (SHA-256) sebelum disimpan di DB.
+- **Invite flow:** `POST /auth/invite` (ADMIN) → return `inviteToken`. Sales accepts via `POST /auth/accept-invite` with token + new password.
 - **Logging:** Winston + correlationId (from `x-correlation-id` header or auto-generated UUID). JSON in prod, colorized in dev.
 
 ## Non-Obvious
 
 - `.env` must be at **repo root** (loaded by `backend/src/config/env.ts` via `dotenv` from `../../.env`). Not needed inside `backend/`.
+- Docker compose prod: `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB` via env vars (defaults: `salespintar`).
 - `NODE_OPTIONS="--max-old-space-size=768"` in production Docker (many Baileys connections).
 - Backend `dev` script kills port 3000 with `fuser -k 3000/tcp` before starting.
 - `prisma migrate dev` is for local dev; `prisma migrate deploy` in CI/CD.

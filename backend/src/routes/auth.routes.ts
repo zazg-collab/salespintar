@@ -69,6 +69,19 @@ router.delete('/sessions/:id', authenticate, async (req: Request, res: Response,
   } catch (err) { next(err); }
 });
 
+router.post('/accept-invite', validate(authService.acceptInviteSchema), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const result = await authService.acceptInvite(req.body);
+    res.cookie('refreshToken', result.refreshToken, {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === 'production',
+      sameSite: 'strict',
+      maxAge: 7 * 24 * 60 * 60 * 1000,
+    });
+    res.json(result);
+  } catch (err) { next(err); }
+});
+
 router.post('/invite', authenticate, authorize('ADMIN'), validate(authService.inviteSchema), async (req: Request, res: Response, next: NextFunction) => {
   try {
     const result = await authService.inviteUser(req.user!.businessId, req.body);

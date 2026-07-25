@@ -1,7 +1,24 @@
+'use client';
+
 const API_BASE = '/api/v1';
 
-let accessToken: string | null = localStorage.getItem('accessToken');
-let refreshToken: string | null = localStorage.getItem('refreshToken');
+function getStoredAccessToken(): string | null {
+  if (typeof localStorage === 'undefined') return null;
+  return localStorage.getItem('accessToken');
+}
+
+function getStoredRefreshToken(): string | null {
+  if (typeof localStorage === 'undefined') return null;
+  return localStorage.getItem('refreshToken');
+}
+
+let accessToken: string | null = null;
+let refreshToken: string | null = null;
+
+export function initTokens() {
+  accessToken = getStoredAccessToken();
+  refreshToken = getStoredRefreshToken();
+}
 
 export function setTokens(access: string, refresh: string) {
   accessToken = access;
@@ -95,3 +112,5 @@ export function apiPatch<T = any>(endpoint: string, data?: any) {
 export function apiDelete<T = any>(endpoint: string) {
   return apiRequest<T>(endpoint, { method: 'DELETE' });
 }
+
+initTokens();

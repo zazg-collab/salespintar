@@ -1,6 +1,8 @@
+'use client';
+
 import { useState } from 'react';
 import { useQuery, useMutation } from '@tanstack/react-query';
-import { apiGet, apiPost } from '../lib/api';
+import { apiGet, apiPost } from '../../../lib/api';
 import { Smartphone, RefreshCw, AlertCircle, CheckCircle, XCircle } from 'lucide-react';
 
 export default function WASetup() {

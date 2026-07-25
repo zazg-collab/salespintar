@@ -1,10 +1,13 @@
+'use client';
+
 import { useState } from 'react';
-import { Link, useNavigate } from 'react-router-dom';
-import { useAuthStore } from '../stores/auth';
+import Link from 'next/link';
+import { useRouter } from 'next/navigation';
+import { useAuthStore } from '../../stores/auth';
 
 export default function Login() {
   const { login, isLoading, error, clearError } = useAuthStore();
-  const navigate = useNavigate();
+  const router = useRouter();
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
 
@@ -13,7 +16,7 @@ export default function Login() {
     clearError();
     try {
       await login(email, password);
-      navigate('/app/dashboard');
+      router.push('/app/dashboard');
     } catch {}
   };
 
@@ -52,7 +55,7 @@ export default function Login() {
                 onChange={(e) => setPassword(e.target.value)}
                 required
                 minLength={8}
-                className="w-full px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 outline-none"
+                className="w-full px-3 py-2.5 border border-gray-300 rounded-lg focus:ring-2 focus:ring-indigo-500 outline-none"
                 placeholder="Minimal 8 karakter"
               />
             </div>
@@ -68,7 +71,7 @@ export default function Login() {
 
           <p className="mt-4 text-center text-sm text-gray-500">
             Belum punya akun?{' '}
-            <Link to="/register" className="text-indigo-600 hover:underline font-medium">
+            <Link href="/register" className="text-indigo-600 hover:underline font-medium">
               Daftar sekarang
             </Link>
           </p>

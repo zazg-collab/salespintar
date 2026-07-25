@@ -1,5 +1,7 @@
+'use client';
+
 import { useQuery } from '@tanstack/react-query';
-import { apiGet } from '../lib/api';
+import { apiGet } from '../../../lib/api';
 import {
   BarChart3,
   MessageSquare,
@@ -105,7 +107,7 @@ export default function Dashboard() {
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <div className="bg-white p-6 rounded-xl border border-gray-200">
           <h3 className="font-semibold mb-4">Percakapan Terbaru</h3>
-          {recent?.length === 0 && (
+          {(!recent || recent.length === 0) && (
             <p className="text-sm text-gray-400">Belum ada percakapan</p>
           )}
           <div className="space-y-3">
