@@ -67,32 +67,49 @@ export class SessionBoundaryParser {
 
   /**
    * Cek apakah transkrip memiliki tanda formulir landing page resmi (inbound form).
+   * Hanya mencocokkan format pesan pengisian formulir pembeli, BUKAN rincian biaya/total COD dari CS.
    */
   public static isTrueFormInbound(transcript: string): boolean {
     if (!transcript) return false;
     return (
+      /-\s*(?:Fb|Goo[A-Za-z0-9]*|TT|Ad|NPM|NFR)\s*-?/i.test(transcript) ||
       /Halo,\s*saya\s*sudah\s*melakukan\s*pemesanan/i.test(transcript) ||
+      /saya\s+sudah\s+melakukan\s+pemesanan|atas\s+nama\s*[\w\s]+,|mohon\s+segera\s+diproses\s+ya/i.test(transcript) ||
       /Terima\s+kasih\s+sudah\s+mengisi\s+form\s+pemesanan/i.test(transcript) ||
       /form\s+pemesanan\s+([^\n\r!]+?)\s+di\s+toko\s+kami/i.test(transcript) ||
       /Formulir\s+Pemesanan/i.test(transcript) ||
-      /(?:📦\s*)?Produk\s*:\s*[^\n\r💰]+/i.test(transcript) ||
-      /TOTAL\s+COD\s*:\s*[\d\.\,kK]+/i.test(transcript) ||
-      /RINCIAN\s+BIAYA/i.test(transcript) ||
       /cdv\.form\.id|app\.formulir\.com|orderonline/i.test(transcript)
     );
   }
 
   /**
    * Cek apakah transkrip memiliki konfirmasi closing transaksi sah.
+   *
+   * @param transcript   - Teks penuh sesi aktif (CS + Buyer), dipakai untuk deteksi sinyal closing positif.
+   * @param buyerOnlyText - Teks pesan BUYER saja (opsional). Jika disediakan, dipakai untuk cek
+   *                        exclusion (ragu-ragu / purna jual) agar template CS tidak memblokir closing.
    */
-  public static isDeterministicClosing(transcript: string): boolean {
+  public static isDeterministicClosing(transcript: string, buyerOnlyText?: string): boolean {
     if (!transcript) return false;
+
+    // Gunakan buyer-only text untuk exclusion agar template CS tidak memicu false-block.
+    // Contoh: "resi akan segera kami informasikan" dari CS TIDAK boleh memblokir closing.
+    const exclusionText = buyerOnlyText ?? transcript;
+
+    // Jangan tandai closing jika ada sinyal keraguan/penolakan kuat dari PEMBELI
+    const hasHesitation = /(tanya\s+(?:mama|ibu|istri|suami|bapak|ortu|orang\s*tua)|minta\s+izin|izin\s+dulu|pikir\s+dulu|nanti\s+dulu|belum\s+ada\s+uang|belum\s+gajian|kemahalan|gak\s+jadi|nggak\s+jadi|batal|cancel)/i.test(exclusionText);
+    if (hasHesitation) return false;
+
+    // Jangan tandai closing jika PEMBELI mengirim sinyal purna jual (resi / barang sampai / komplain)
+    // CATATAN: "terima kasih banyak atas kepercayaannya" SENGAJA dihapus dari sini —
+    // frasa itu adalah template CS DEAL_CONFIRMED (item 10), bukan sinyal purna jual pembeli.
+    const isAfterSalesChat = /(resi|nomor\s+resi|status\s+pengiriman|kapan\s+sampai|belum\s+sampai|sudah\s+diterima|sdh\s+diterima)/i.test(exclusionText);
+    if (isAfterSalesChat) return false;
+
     return (
       /akan\s+langsung\s+kami\s+proses|pesanan\s+(?:kakak|bapak|ibu|anda)?\s*segera\s+kami\s+proses/i.test(transcript) ||
-      /terimakasih\s+untuk\s+orderan/i.test(transcript) ||
-      /paketnya\s+(?:udah|sudah)\s+di\s*kirim/i.test(transcript) ||
       /CATATAN[\s\S]*?Pastikan\s+hp\s+Selalu\s+Aktif/i.test(transcript) ||
-      /(?:TOTAL\s+COD|RINCIAN\s+BIAYA)[\s\S]*?(?:baik|oke|siap|deal|kirim|proses|setuju|bisa\s+kirim)/i.test(transcript)
+      /(?:TOTAL\s+COD|RINCIAN\s+BIAYA)[\s\S]*?(?:sudah\s+benar|sudah\s+sesuai|fix\s+kirim|bungkus\s+kak|bungkus\s+mas|proses\s+sekarang|kirim\s+sekarang)/i.test(transcript)
     );
   }
 
