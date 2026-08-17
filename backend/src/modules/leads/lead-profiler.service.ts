@@ -235,14 +235,18 @@ export class LeadProfilerService {
 
     // Ambil data lead yang sudah tercatat sebelumnya di database (jika ada)
     let existingValidProduct: string | null = null;
+    let existingLeadData: any = null;
     try {
       const existingLead = await prisma.lead.findFirst({
         where: {
           businessId,
           waNumber: sanitizedContactPhone,
         },
-        select: { minatProduk: true },
+        select: { minatProduk: true, lastInsight: true, score: true, leadStage: true, conversionStatus: true, objectionType: true, taktikCS: true, draftWA: true, leadCategory: true },
       });
+      if (existingLead) {
+        existingLeadData = existingLead;
+      }
       if (
         existingLead?.minatProduk &&
         !['umum', 'tidak ada', 'tidak ada informasi produk', 'tidak diketahui', 'belum spesifik', 'umum (internal cs)'].includes(
@@ -296,7 +300,7 @@ export class LeadProfilerService {
       );
 
     const isAfterSalesOrGeneralQuery =
-      /dah\s+yampek|sampai\s+mana|mana\s+paket|resi\b|no\s+resi|nomor\s+resi|status\s+pengiriman|kapan\s+dikirim|kok\s+belum\s+sampai|komplain|barang\s+rusak|retur\b|garansi/i.test(
+      /dah\s+yampek|sampai\s+mana|mana\s+paket|resi\b|no\s+resi|nomor\s+resi|status\s+pengiriman|kapan\s+dikirim|kok\s+belum\s+sampai|komplain|barang\s+rusak|mau\s+retur|proses\s+retur|klaim\s+garansi|minta\s+garansi|garansi\s+(?:rusak|beda|klaim)/i.test(
         buyerOnlyText,
       );
 
@@ -334,9 +338,62 @@ export class LeadProfilerService {
     ].join('\n');
 
     let isInternalTeamChat = false;
+    let bypassLlm = false;
+    let mockedLlmResponse: any = null;
+
+    // --- LLM GATEKEEPER (Mencegah Token Explosion) ---
+    const isDeterministicClosingSignalStr = SessionBoundaryParser.isDeterministicClosing(activeSession.rawTranscript, buyerOnlyText);
+    
+    const AFTER_SALES_RESI_PATTERN = /nomor\s+resi|no\s+resi|status\s+pengiriman|sampai\s+mana|belum\s+sampai|kapan\s+sampai|mana\s+paket|paket\s+(?:belum|mana|nyampe|belum\s+sampai)|kok\s+belum\s+sampai|dah\s+(?:nyampe|sampai)\?/i;
+    const isAfterSalesDeliveryStr = /(sdh|sudah|telah|pun)\s+(diterima|sampai|sampe|tiba|mendarat|nyampe|masuk)/i.test(buyerOnlyText);
+    const isAfterSalesWarrantyStr = /(tidak sesuai|gagang beda|logo beda|pecah|rusak|cacat|retur|tukar baru|komplain)/i.test(buyerOnlyText);
+    const isAfterSalesResiStr = AFTER_SALES_RESI_PATTERN.test(buyerOnlyText);
+    const isAfterSalesStr = isAfterSalesDeliveryStr || isAfterSalesWarrantyStr || isAfterSalesResiStr;
+
+    const lastBuyerMessage = buyerMessages[buyerMessages.length - 1] || '';
+    const isShortNonIntent = lastBuyerMessage.length < 20 && !/mau|harga|pesan|cod|transfer|ongkir|rusak|batal|garansi/i.test(lastBuyerMessage);
+
+    if (isDeterministicClosingSignalStr && !isAfterSalesStr) {
+      bypassLlm = true;
+      mockedLlmResponse = {
+        conversion: 'CLOSING',
+        objectionType: 'DEAL_CONFIRMED',
+        score: 95,
+        lastInsight: `Pelanggan baru setuju pemesanan ${minatProduk || 'produk'} dan mengonfirmasi pengiriman.`,
+        leadCategory: 'NEW_INBOUND'
+      };
+    } else if (isAfterSalesStr) {
+      bypassLlm = true;
+      let objType = 'AFTER_SALES_RESI';
+      if (isAfterSalesDeliveryStr) objType = 'AFTER_SALES_DELIVERY';
+      else if (isAfterSalesWarrantyStr) objType = 'COMPLAINT_DEFECT';
+      mockedLlmResponse = {
+        conversion: 'PENDING',
+        objectionType: objType,
+        score: 0,
+        leadCategory: 'OTHERS'
+      };
+    } else if (isShortNonIntent && existingLeadData) {
+      bypassLlm = true;
+      mockedLlmResponse = {
+        conversion: existingLeadData.conversionStatus,
+        objectionType: existingLeadData.objectionType,
+        score: existingLeadData.score,
+        lastInsight: existingLeadData.lastInsight,
+        leadCategory: existingLeadData.leadCategory,
+        taktikCS: existingLeadData.taktikCS,
+        draftWA: existingLeadData.draftWA,
+        minatProduk: existingLeadData.minatProduk || anchorProduct
+      };
+    }
 
     try {
-      const resp = await complete('classify', {
+      let parsed: any = {};
+      if (bypassLlm) {
+        parsed = mockedLlmResponse;
+        logger.info(`[LeadProfiler] Bypassing LLM API for ${contactJid} (Gatekeeper Activated)`);
+      } else {
+        const resp = await complete('classify', {
         businessId,
         messages: [
           {
@@ -419,8 +476,8 @@ FORMAT OUTPUT WAJIB JSON MURNI:
           },
         ],
       });
-
-      const parsed = JSON.parse(resp.text || '{}');
+      parsed = JSON.parse(resp.text || '{}');
+      }
       if (parsed.isInternalTeam === true) {
         isInternalTeamChat = true;
       }
@@ -500,10 +557,15 @@ FORMAT OUTPUT WAJIB JSON MURNI:
         /(tidak sesuai|gagang beda|logo beda|pecah|rusak|cacat|retur|tukar baru|komplain)/i.test(parsed.lastInsight || '') ||
         /(tidak sesuai|gagang beda|logo beda|pecah|rusak|cacat|retur|tukar baru|komplain)/i.test(buyerOnlyText);
 
+      // PRECISION FIX: "kurir" dan "paket" dihapus — terlalu luas, buyer bisa ngomong
+      // "bisa COD kurir apa?" atau "paket GKE 40 harganya?" yang BUKAN after-sales.
+      // Ganti dengan frasa multi-kata yang hanya match sinyal purna jual yang genuine.
+      const AFTER_SALES_RESI_PATTERN =
+        /nomor\s+resi|no\s+resi|status\s+pengiriman|sampai\s+mana|belum\s+sampai|kapan\s+sampai|mana\s+paket|paket\s+(?:belum|mana|nyampe|belum\s+sampai)|kok\s+belum\s+sampai|dah\s+(?:nyampe|sampai)\?/i;
       const isAfterSalesResi =
         objectionType === 'AFTER_SALES_RESI' ||
-        /(resi|status pengiriman|kurir|paket|sampai mana|belum sampai)/i.test(parsed.lastInsight || '') ||
-        /(resi|status pengiriman|kurir|paket|sampai mana|belum sampai)/i.test(buyerOnlyText);
+        AFTER_SALES_RESI_PATTERN.test(parsed.lastInsight || '') ||
+        AFTER_SALES_RESI_PATTERN.test(buyerOnlyText);
 
       isAfterSalesDomain = isAfterSalesDelivery || isAfterSalesWarranty || isAfterSalesResi;
 
