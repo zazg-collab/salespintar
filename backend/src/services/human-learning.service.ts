@@ -779,10 +779,20 @@ class HumanLearningManager {
         // ── Realtime CRM Profiler (0-Second Latency) ──────────────────────
         if (!crmPaused) {
           const fKey = fullHistoryKey(businessId, csPhone, contactJid);
-          redisClient.lrange(fKey, 0, -1).then(lines => {
-            if (lines && lines.length > 0) {
-              const fullTranscript = lines.join('\n');
-              LeadProfilerService.processConversation({
+          const totalLen = await redisClient.llen(fKey);
+          let fullTranscript = '';
+          
+          if (totalLen <= 35) {
+            const lines = await redisClient.lrange(fKey, 0, -1);
+            if (lines && lines.length > 0) fullTranscript = lines.join('\n');
+          } else {
+            const head = await redisClient.lrange(fKey, 0, 9);
+            const tail = await redisClient.lrange(fKey, -25, -1);
+            fullTranscript = head.join('\n') + `\n\n[... ${totalLen - 35} pesan disembunyikan ...]\n\n` + tail.join('\n');
+          }
+          
+          if (fullTranscript) {
+            LeadProfilerService.processConversation({
                 businessId,
                 contactJid,
                 csPhone,
@@ -792,8 +802,7 @@ class HumanLearningManager {
               }).catch(err => {
                 logger.warn(`[HL] Realtime LeadProfiler background error: ${err.message}`);
               });
-            }
-          }).catch(() => {});
+          }
         }
 
         // Deteksi Sinyal Closing Pintar (Smart Instant Flush)

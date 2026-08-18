@@ -50,14 +50,21 @@ export async function handleReconciliationSweeper(
         continue;
       }
 
-      // Ambil riwayat lengkap
-      const lines = await redisClient.lrange(key, 0, -1);
-      if (!lines || lines.length === 0) {
-        dilewati++;
-        continue;
+      // Ambil riwayat dengan strategi Head-Tail (10 baris awal + 25 baris akhir)
+      const bufLen = await redisClient.llen(key);
+      let fullTranscript = '';
+      if (bufLen <= 35) {
+        const lines = await redisClient.lrange(key, 0, -1);
+        if (!lines || lines.length === 0) {
+          dilewati++;
+          continue;
+        }
+        fullTranscript = lines.join('\n');
+      } else {
+        const head = await redisClient.lrange(key, 0, 9);
+        const tail = await redisClient.lrange(key, -25, -1);
+        fullTranscript = head.join('\n') + `\n\n[... ${bufLen - 35} pesan disembunyikan ...]\n\n` + tail.join('\n');
       }
-
-      const fullTranscript = lines.join('\n');
       
       // Kirim ke LeadProfilerService
       // Karena Gatekeeper sudah aktif, ini akan aman dari Token Explosion
