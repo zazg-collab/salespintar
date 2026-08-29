@@ -4,11 +4,23 @@ import type { ReconciliationSweeperJobData, ReconciliationSweeperResult } from '
 import { redisCache as redisClient } from '../config/redis';
 import { prisma } from '../config/prisma';
 import { LeadProfilerService } from '../modules/leads/lead-profiler.service';
-import { pecahKunciBuffer } from '../services/human-learning.service';
+import { pecahKunciBuffer, crmSedangDijeda } from '../services/human-learning.service';
 
 export async function handleReconciliationSweeper(
   job: Job<ReconciliationSweeperJobData, ReconciliationSweeperResult>,
 ): Promise<ReconciliationSweeperResult> {
+  // Langkah B Fase 24 (Temuan B): sebelumnya sweeper ini TIDAK PERNAH memeriksa jeda CRM sama
+  // sekali — beda dg jalur realtime (human-learning.service.ts) yang menahan diri kalau
+  // `crmSedangDijeda()`, dan beda juga dg sepupu-nya `sweepDailyBatch` yg SUDAH memeriksa
+  // `hlSedangDijeda()`. Akibatnya menjeda "AI CRM Lead Profiling" tidak benar-benar berhenti —
+  // sweeper 7x/hari tetap diam-diam mereklasifikasi lead PENDING di latar belakang. Pola cek
+  // di sini disamakan dg `sweepDailyBatch` (cek sekali di awal run, bukan per-key — konsisten dg
+  // asumsi single-tenant `crmSedangDijeda()` saat ini, lihat catatan di definisinya).
+  if (await crmSedangDijeda()) {
+    logger.info('[ReconciliationSweeper] Penyapuan dilewati — AI CRM Lead Profiling sedang DIJEDA');
+    return { diperiksa: 0, diperbarui: 0, dilewati: 0 };
+  }
+
   logger.info(`[ReconciliationSweeper] Memulai proses penyapuan riwayat lengkap (Full-Transcript)...`);
 
   // Cari semua kunci hl:full_history:*
@@ -50,22 +62,19 @@ export async function handleReconciliationSweeper(
         continue;
       }
 
-      // Ambil riwayat dengan strategi Head-Tail (10 baris awal + 25 baris akhir)
-      const bufLen = await redisClient.llen(key);
-      let fullTranscript = '';
-      if (bufLen <= 35) {
-        const lines = await redisClient.lrange(key, 0, -1);
-        if (!lines || lines.length === 0) {
-          dilewati++;
-          continue;
-        }
-        fullTranscript = lines.join('\n');
-      } else {
-        const head = await redisClient.lrange(key, 0, 9);
-        const tail = await redisClient.lrange(key, -25, -1);
-        fullTranscript = head.join('\n') + `\n\n[... ${bufLen - 35} pesan disembunyikan ...]\n\n` + tail.join('\n');
+      // Langkah C Kelompok 2 (Dual-View, Temuan T1): dulu strategi Head-Tail (10 awal + 25
+      // akhir) dipotong DI SINI, sebelum masuk ke LeadProfilerService -- sama seperti bug
+      // realtime di human-learning.service.ts, Rule Engine sweeper ini pun ikut buta terhadap
+      // closing di baris tengah. `hl:full_history:*` sudah dibatasi maks 100 baris via LTRIM
+      // (Fase 24), jadi baca penuh murah. Kompresi head-tail dipindah ke titik pembuatan
+      // payload LLM di lead-profiler.service.ts::compressForLlm.
+      const lines = await redisClient.lrange(key, 0, -1);
+      if (!lines || lines.length === 0) {
+        dilewati++;
+        continue;
       }
-      
+      const fullTranscript = lines.join('\n');
+
       // Kirim ke LeadProfilerService
       // Karena Gatekeeper sudah aktif, ini akan aman dari Token Explosion
       await LeadProfilerService.processConversation({

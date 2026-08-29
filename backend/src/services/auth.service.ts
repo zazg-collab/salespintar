@@ -157,7 +157,18 @@ export async function refreshTokens(refreshToken: string) {
   if (!session.user.isActive) throw new UnauthorizedError('Account inactive');
   if (!session.user.business.isActive) throw new UnauthorizedError('Business inactive');
 
-  await prisma.session.delete({ where: { id: session.id } });
+  // Sengaja deleteMany, bukan delete.
+  //
+  // Rotasi refresh token itu baca-lalu-hapus, jadi dua permintaan refresh yang
+  // datang bersamaan sama-sama menemukan session ini, lalu sama-sama mencoba
+  // menghapusnya. Dengan delete(), yang kalah cepat kena P2025 "No record was
+  // found for a delete" → error 500 ke pengguna. deleteMany() memperlakukan
+  // "baris sudah tidak ada" sebagai hasil yang sah, bukan kegagalan.
+  //
+  // Ini menghilangkan error 500-nya, tapi TIDAK menghapus balapannya. Peredam
+  // utamanya ada di sisi frontend (lihat single-flight di lib/api.ts) yang
+  // memastikan hanya ada satu proses refresh berjalan pada satu waktu.
+  await prisma.session.deleteMany({ where: { id: session.id } });
 
   const newPayload = {
     userId: session.user.id,

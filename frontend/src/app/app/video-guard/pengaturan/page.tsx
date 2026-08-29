@@ -1,0 +1,352 @@
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import Link from 'next/link';
+import {
+  ArrowLeft, SlidersHorizontal, Loader2, Save, CheckCircle2, KeyRound, Info, RefreshCw,
+  VideoOff, Video,
+} from 'lucide-react';
+import { apiGet, apiPut, apiPost } from '../../../../lib/api';
+
+/**
+ * [2026-08-27, Fase B -- provider picker fallback Video Audit] Sebelumnya halaman ini cuma 1 field
+ * "Gemini API Key" (fallback selalu Gemini, tidak bisa diganti). Sekarang provider bisa dipilih
+ * (Google/OpenAI/OpenRouter/Groq) dgn dropdown model yang otomatis dimuat dari `POST
+ * /llm-models/list` (pola SAMA PERSIS dgn halaman copywriting-ads/pengaturan, Fase A) -- BEDANYA
+ * di sini ada peringatan kapabilitas video: cuma Google (native) & OpenRouter+model Gemini yang
+ * bisa memproses video sama sekali; OpenAI/Groq TIDAK BISA (fallback ini cuma dipakai kalau agy
+ * primary invoker gagal -- kalau providernya tidak bisa video, hasil analisis video/audio di
+ * laporan akan kosong, cuma foto/teks yang tetap teranalisis).
+ */
+
+type Provider = 'google' | 'openai' | 'openrouter' | 'groq';
+
+interface VideoAuditFallbackConfig {
+  provider: Provider;
+  model: string | null;
+  usingLegacyGeminiKeyFallback: boolean;
+  apiKeyConfigured: boolean;
+  apiKeyPreview: string | null;
+}
+
+interface SettingsResponse {
+  videoAuditFallback: VideoAuditFallbackConfig;
+  defaultReinforcementLayers: string[];
+}
+
+interface ModelEntry {
+  id: string;
+  label?: string;
+  supportsVideo?: boolean;
+}
+
+const LAYERS: { key: string; label: string }[] = [
+  { key: 'template_overlay', label: 'Template Overlay' },
+  { key: 'color_grade', label: 'Color Grade' },
+  { key: 'metadata_label', label: 'Metadata Label' },
+  { key: 'highlight_soften', label: 'Highlight Soften' },
+  { key: 'micro_reframe', label: 'Micro Reframe' },
+];
+
+const PROVIDERS: {
+  key: Provider;
+  label: string;
+  defaultModel: string;
+  keyHint: string;
+  videoCapability: 'always' | 'never' | 'model-dependent';
+}[] = [
+  {
+    key: 'google',
+    label: 'Google AI Studio (Gemini)',
+    defaultModel: 'gemini-2.5-flash',
+    keyHint: 'Sama seperti sebelumnya -- provider Gemini asli, bisa memproses video secara native.',
+    videoCapability: 'always',
+  },
+  {
+    key: 'openai',
+    label: 'OpenAI',
+    defaultModel: 'gpt-4o-mini',
+    keyHint: 'Wajib diisi sendiri. PERHATIAN: OpenAI belum punya kemampuan memproses video sama sekali (baru sebatas foto/teks).',
+    videoCapability: 'never',
+  },
+  {
+    key: 'openrouter',
+    label: 'OpenRouter',
+    defaultModel: 'google/gemini-2.5-flash',
+    keyHint: 'Wajib diisi sendiri. Kemampuan video TERGANTUNG model yang dipilih -- cuma model keluarga Gemini yang diakses lewat OpenRouter yang bisa video, model lain (mis. GPT/Claude/Llama via OpenRouter) cuma foto/teks.',
+    videoCapability: 'model-dependent',
+  },
+  {
+    key: 'groq',
+    label: 'Groq',
+    defaultModel: 'llama-3.3-70b-versatile',
+    keyHint: 'Wajib diisi sendiri -- dapatkan API key gratis di console.groq.com. PERHATIAN: Groq cuma dukung foto/vision, TIDAK BISA memproses video sama sekali.',
+    videoCapability: 'never',
+  },
+];
+
+function providerMetaOf(p: Provider) {
+  return PROVIDERS.find((x) => x.key === p) ?? PROVIDERS[0];
+}
+
+export default function VideoGuardSettingsPage() {
+  const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [provider, setProvider] = useState<Provider>('google');
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [modelInput, setModelInput] = useState('');
+  const [modelOptions, setModelOptions] = useState<ModelEntry[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [defaultLayers, setDefaultLayers] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const meta = providerMetaOf(provider);
+
+  async function loadModels(prov: Provider, keyOverride?: string) {
+    setModelsLoading(true);
+    setModelsError(null);
+    try {
+      const body: Record<string, unknown> = { provider: prov, slot: 'videoAuditFallback' };
+      const key = (keyOverride ?? apiKeyInput).trim();
+      if (key) body.apiKey = key;
+      const res = await apiPost<{ models: ModelEntry[] }>('/llm-models/list', body);
+      setModelOptions(res.models ?? []);
+    } catch (e) {
+      setModelOptions([]);
+      setModelsError((e as Error).message || 'Gagal memuat daftar model.');
+    } finally {
+      setModelsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    apiGet<SettingsResponse>('/video-guard/settings')
+      .then((res) => {
+        setSettings(res);
+        setProvider(res.videoAuditFallback.provider);
+        setModelInput(res.videoAuditFallback.model ?? '');
+        setDefaultLayers(res.defaultReinforcementLayers ?? []);
+        loadModels(res.videoAuditFallback.provider);
+      })
+      .catch((e) => setError(e.message || 'Gagal memuat pengaturan.'));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function handleProviderClick(p: Provider) {
+    setProvider(p);
+    setError(null);
+    loadModels(p);
+  }
+
+  function toggleLayer(key: string) {
+    setDefaultLayers((prev) => (prev.includes(key) ? prev.filter((l) => l !== key) : [...prev, key]));
+  }
+
+  // Model yang sedang dipilih bisa video atau tidak -- dipakai utk banner peringatan di bawah.
+  const selectedModelEntry = modelOptions.find((m) => m.id === modelInput);
+  const videoWarning: string | null = (() => {
+    if (meta.videoCapability === 'never') {
+      return `${meta.label} tidak bisa memproses video sama sekali -- kalau fallback ini yang jalan (audit utama gagal), hasil analisis video/audio akan kosong (null), cuma foto/teks yang tetap teranalisis.`;
+    }
+    if (meta.videoCapability === 'model-dependent' && selectedModelEntry && !selectedModelEntry.supportsVideo) {
+      return `Model "${modelInput}" (via OpenRouter) tidak terdeteksi mendukung video -- kalau fallback ini yang jalan, hasil analisis video/audio akan kosong (null). Pilih model keluarga Gemini (mis. "google/gemini-2.5-flash") kalau butuh fallback yang tetap bisa video.`;
+    }
+    return null;
+  })();
+
+  const modelSelectOptions =
+    modelInput && !modelOptions.some((m) => m.id === modelInput)
+      ? [{ id: modelInput, label: `${modelInput} (tersimpan)` }, ...modelOptions]
+      : modelOptions;
+
+  async function handleSave(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSaved(false);
+    setSaving(true);
+    try {
+      const body: { provider: Provider; apiKey?: string; model?: string; defaultReinforcementLayers?: string[] } = {
+        provider,
+        defaultReinforcementLayers: defaultLayers as any,
+        model: modelInput.trim(),
+      };
+      if (apiKeyInput.trim()) body.apiKey = apiKeyInput.trim();
+      await apiPut('/video-guard/settings', body);
+      const fresh = await apiGet<SettingsResponse>('/video-guard/settings');
+      setSettings(fresh);
+      setProvider(fresh.videoAuditFallback.provider);
+      setModelInput(fresh.videoAuditFallback.model ?? '');
+      setApiKeyInput('');
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
+    } catch (e) {
+      setError((e as Error).message || 'Gagal menyimpan pengaturan.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="max-w-2xl mx-auto space-y-6">
+      <Link href="/app/video-guard" className="inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700">
+        <ArrowLeft className="w-4 h-4" /> Kembali ke Dashboard
+      </Link>
+
+      <div>
+        <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2">
+          <SlidersHorizontal className="w-6 h-6 text-indigo-600" /> Pengaturan Meta Video AI Guards
+        </h1>
+        <p className="text-xs text-gray-500 mt-1">
+          Audit utama selalu pakai Agy (kuota Google AI Pro). Provider di bawah HANYA dipakai sbg
+          fallback kalau Agy gagal/limit -- pilih layanan &amp; model, dropdown model dimuat otomatis.
+        </p>
+      </div>
+
+      {error && <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>}
+
+      {!settings && !error && (
+        <div className="flex items-center gap-2 text-gray-500 text-sm py-12 justify-center">
+          <Loader2 className="w-4 h-4 animate-spin text-indigo-600" /> Memuat…
+        </div>
+      )}
+
+      {settings && (
+        <form onSubmit={handleSave} className="bg-white rounded-2xl border border-gray-200 p-6 space-y-6">
+          <div>
+            <h2 className="text-sm font-bold text-gray-900">Fallback Video Audit</h2>
+            <p className="text-xs text-gray-500 mt-0.5">Dipakai otomatis kalau Agy (primary) gagal atau limit.</p>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">Provider LLM</label>
+            <div className="flex flex-wrap gap-2">
+              {PROVIDERS.map((p) => (
+                <button
+                  type="button"
+                  key={p.key}
+                  onClick={() => handleProviderClick(p.key)}
+                  className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors ${
+                    provider === p.key ? 'bg-indigo-600 border-indigo-600 text-white' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  {p.label}
+                </button>
+              ))}
+            </div>
+            {provider === 'google' && settings.videoAuditFallback.usingLegacyGeminiKeyFallback && (
+              <p className="text-xs text-indigo-600 mt-2 flex items-center gap-1">
+                <Info className="w-3.5 h-3.5" /> Masih pakai key Gemini lama (sebelum fitur multi-provider ini ada).
+              </p>
+            )}
+          </div>
+
+          {videoWarning ? (
+            <div className="bg-amber-50 border border-amber-200 rounded-xl px-4 py-3 flex items-start gap-2.5">
+              <VideoOff className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <p className="text-xs text-amber-800">{videoWarning}</p>
+            </div>
+          ) : (
+            <div className="bg-emerald-50 border border-emerald-200 rounded-xl px-4 py-3 flex items-start gap-2.5">
+              <Video className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+              <p className="text-xs text-emerald-800">
+                Provider/model ini bisa memproses video -- fallback tetap lengkap (video+audio+teks) kalau Agy gagal.
+              </p>
+            </div>
+          )}
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1 flex items-center gap-1.5">
+              <KeyRound className="w-4 h-4 text-indigo-600" /> API Key ({meta.label})
+            </label>
+            <p className="text-xs text-gray-500 mb-2">
+              {settings.videoAuditFallback.apiKeyConfigured
+                ? `Sudah diisi (${settings.videoAuditFallback.apiKeyPreview}). Isi kolom di bawah untuk mengganti, kosongkan untuk menghapus.`
+                : meta.keyHint}
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                placeholder={settings.videoAuditFallback.apiKeyConfigured ? 'Ganti key (opsional)…' : `Masukkan ${meta.label} API Key…`}
+                className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+              />
+              <button
+                type="button"
+                onClick={() => loadModels(provider)}
+                disabled={modelsLoading}
+                title="Muat ulang daftar model dengan key di atas"
+                className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-lg border border-gray-300 text-xs font-semibold text-gray-600 hover:bg-gray-50 disabled:opacity-60"
+              >
+                {modelsLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                Muat model
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Model</label>
+            {modelsLoading ? (
+              <div className="flex items-center gap-2 text-xs text-gray-500 py-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-indigo-600" /> Memuat daftar model dari {meta.label}…
+              </div>
+            ) : modelsError ? (
+              <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">{modelsError}</div>
+            ) : (
+              // fix [2026-08-27, keluhan Bossfren -- "openrouter modelnya bnyk bgt, pusing nyari
+              // dropdown"]: dropdown <select> diganti input teks + <datalist> (autocomplete bawaan
+              // browser) -- ketik utk filter, tetap bisa isi model id manual di luar daftar. Kosongkan
+              // = pakai default provider (sama spt opsi "Otomatis" di <select> versi lama).
+              <>
+                <input
+                  type="text"
+                  list="video-fallback-model-options"
+                  value={modelInput}
+                  onChange={(e) => setModelInput(e.target.value)}
+                  placeholder={`Ketik utk cari model (opsional) — kosongkan utk default: ${meta.defaultModel}`}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 bg-white"
+                />
+                <datalist id="video-fallback-model-options">
+                  {modelSelectOptions.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {(m.label || m.id) + (provider === 'openrouter' ? (m.supportsVideo ? ' (bisa video)' : ' (foto/teks saja)') : '')}
+                    </option>
+                  ))}
+                </datalist>
+              </>
+            )}
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">Default Layer Reinforcement</label>
+            <div className="flex flex-wrap gap-2">
+              {LAYERS.map((l) => (
+                <label
+                  key={l.key}
+                  className={`px-3 py-1.5 rounded-full text-xs font-semibold border cursor-pointer transition-colors ${
+                    defaultLayers.includes(l.key) ? 'bg-indigo-600 border-indigo-600 text-white' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  <input type="checkbox" checked={defaultLayers.includes(l.key)} onChange={() => toggleLayer(l.key)} className="hidden" />
+                  {l.label}
+                </label>
+              ))}
+            </div>
+            <p className="text-xs text-gray-400 mt-2">Cuma preselect di halaman Reinforcement — tetap bisa diubah tiap kali submit.</p>
+          </div>
+
+          <button
+            type="submit"
+            disabled={saving}
+            className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-colors shadow-sm"
+          >
+            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : saved ? <CheckCircle2 className="w-4 h-4" /> : <Save className="w-4 h-4" />}
+            {saving ? 'Menyimpan…' : saved ? 'Tersimpan' : 'Simpan Pengaturan'}
+          </button>
+        </form>
+      )}
+    </div>
+  );
+}

@@ -1,0 +1,450 @@
+import { Router, Request, Response, NextFunction } from 'express';
+import { z } from 'zod';
+import { prisma } from '../config/prisma';
+import { Prisma } from '@prisma/client';
+import { env } from '../config/env';
+import { authenticate } from '../middleware/auth';
+import { encrypt, decrypt, maskedPreview } from '../services/crypto.service';
+import { logger } from '../utils/logger';
+import { ValidationError } from '../utils/errors';
+
+/**
+ * Proxy tipis ke `metaguard_service` (FastAPI, Python) -- VPS Antigravity ("VPS 45"), endpoint
+ * `/v1/copywriting/check` & `/v1/copywriting/generate` (blueprint
+ * `20260826-blueprint-videoguard-media-analysis-copywriting.md` Bagian 5). Pola file ini SENGAJA
+ * dicontek persis dari `video-guard.routes.ts` (helper `metaguardHeaders`/`requireMetaguardUrl`
+ * diduplikasi kecil di sini, bukan di-import -- keduanya tidak di-export dari video-guard.routes.ts,
+ * dan menambah export baru ke file production-critical itu demi fitur terpisah scope-nya dianggap
+ * risiko yang tidak perlu diambil untuk beberapa fungsi pendek).
+ *
+ * Beda dari `/video-guard/audit`: 2 endpoint check/generate di sini SYNCHRONOUS (bukan submit+poll
+ * job) -- `metaguard_service` sendiri sudah didesain synchronous utk fitur ini (blueprint Bagian
+ * 5.4, teks doang lewat LLM, skip semua pipeline video/media) -- jadi proxy Node ini juga tinggal
+ * forward-dan-tunggu, TIDAK ada tabel Prisma/status polling utk fitur ini (beda dari `VideoAdAudit`
+ * yang menyimpan histori audit video -- Copywriting Ads stateless per Bagian 5, hasil cek/generate
+ * tidak dipersist, murni request-response).
+ *
+ * [2026-08-26, Fase provider-agnostic] Sebelumnya modul ini HANYA meneruskan Gemini API key
+ * (Business.settings.metaGuardGeminiApiKeyEncrypted, SATU kolom dipakai bersama dgn Video Guard).
+ * Sekarang mendukung 4 provider LLM (agy/google/openai/openrouter) KHUSUS fitur Copywriting Ads --
+ * pipeline audit video Video Guard TIDAK disentuh sama sekali. Setting provider/key/model baru
+ * disimpan di kolom TERPISAH (`copywritingLlmProvider`/`copywritingLlmApiKeyEncrypted`/
+ * `copywritingLlmModel`) -- provider `google` tanpa key sendiri di kolom baru ini otomatis fallback
+ * ke `metaGuardGeminiApiKeyEncrypted` yang sudah ada (lihat `resolveCopywritingLlmConfig` di bawah).
+ *
+ * [2026-08-26, koreksi lanjutan] Ternyata Batch E (Check Ads + Generate Ads OTOMATIS tiap audit,
+ * lihat metaguard_service main.py `_run_audit_job`) diam-diam memakai provider `google` (API key
+ * per-business) tiap kali audit jalan -- itu yang menghabiskan kuota free-tier Gemini API key
+ * (20 request/hari) dengan cepat, BUKAN audit videonya sendiri (yang sudah pakai `agy`/kuota Google
+ * AI Pro subscription lewat AgyCliInvoker, sama sekali tidak menyentuh API key 20/hari itu). Default
+ * provider DIGANTI ke `agy` (bukan `google` lagi) -- provider ini TIDAK butuh API key APAPUN dari
+ * business (pakai kredensial api-bridge yang sama dgn Video Guard, pool "copywriting-ads" TERPISAH
+ * dari pool "video-guard" biar tidak antre di belakang audit video yang bisa sampai 10 menit).
+ * `google`/`openai`/`openrouter` TETAP tersedia sbg pilihan manual di halaman Pengaturan (utk yang
+ * sengaja mau pilih provider/model tertentu), tapi bukan default lagi.
+ *
+ * Business logic AI SAMA SEKALI TIDAK ADA di sini -- sama seperti video-guard.routes.ts: (1) auth
+ * JWT + resolve businessId, (2) resolve provider/key/model per-business dari Business.settings, (3)
+ * forward ke metaguard_service lewat header `X-Llm-Provider`/`X-Llm-Api-Key`/`X-Llm-Model` (header
+ * lama `X-Gemini-Api-Key` TIDAK dikirim lagi dari sisi sini -- metaguard_service tetap menerimanya
+ * sbg fallback kompatibilitas kalau dipanggil dari jalur lain, tapi proxy Node ini sekarang SELALU
+ * pakai header baru), (4) balikin hasilnya apa adanya ke frontend.
+ */
+
+const router = Router();
+router.use(authenticate);
+
+// Panggilan LLM synchronous bisa makan waktu lebih lama drpd submit/poll job ringan video-guard
+// (METAGUARD_TIMEOUT_MS 15s di sana) -- kasih ruang lebih longgar di sini krn request ini BLOCKING
+// sampai LLM benar-benar selesai jawab (bukan async job spt /v1/audit). [2026-08-26] Dinaikkan dari
+// 60s -- provider `agy` (default baru) bisa makan waktu s/d 120s per percobaan + retry tenacity 2x
+// di sisi metaguard_service (_call_agy_structured), jadi 60s terlalu pendek dan akan abort di tengah
+// jalan. nginx proxy_read_timeout di host sudah 600s utk /api, jadi aman dinaikkan ke sini.
+const COPYWRITING_TIMEOUT_MS = 260_000;
+
+type CopywritingLlmProvider = 'agy' | 'google' | 'openai' | 'openrouter' | 'groq';
+
+const KNOWN_PROVIDERS: CopywritingLlmProvider[] = ['agy', 'google', 'openai', 'openrouter', 'groq'];
+
+function isKnownProvider(v: unknown): v is CopywritingLlmProvider {
+  return typeof v === 'string' && (KNOWN_PROVIDERS as string[]).includes(v);
+}
+
+function metaguardHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...extra };
+  if (env.METAGUARD_INTERNAL_API_KEY) {
+    headers['X-Internal-Api-Key'] = env.METAGUARD_INTERNAL_API_KEY;
+  }
+  return headers;
+}
+
+function requireMetaguardUrl(): string {
+  if (!env.METAGUARD_SERVICE_URL) {
+    throw new ValidationError(
+      'METAGUARD_SERVICE_URL belum diset di .env backend -- fitur Copywriting Ads belum aktif.',
+    );
+  }
+  return env.METAGUARD_SERVICE_URL;
+}
+
+type CopywritingFeature = 'check' | 'generate';
+
+interface CopywritingLlmConfig {
+  provider: CopywritingLlmProvider;
+  apiKey: string | null;
+  model: string | null;
+  usingLegacyGeminiKeyFallback: boolean;
+  // fix v1.8.0 (Bossfren 2026-08-27 -- "check & generate ads ada opsi layanan dan model sendiri"):
+  // true kalau feature ini BELUM pernah dikonfigurasi terpisah -- lagi baca setting SHARED lama
+  // (copywritingLlm*, dari sebelum Check/Generate dipisah). Dipakai frontend utk kasih catatan
+  // "masih pakai setting lama, isi di sini utk pisahkan".
+  usingLegacySharedFallback: boolean;
+}
+
+// fix v1.8.0: field per-feature di Business.settings -- 'check' -> checkAdsLlm*, 'generate' ->
+// generateAdsLlm*. SEBELUMNYA (field ini tidak ada) Check Ads & Generate Ads WAJIB berbagi SATU
+// config (copywritingLlmProvider/Model/ApiKeyEncrypted) -- Bossfren eksplisit minta dipisah supaya
+// tiap fitur bisa pilih provider/model sendiri (mis. Check Ads pakai Groq murah+cepat, Generate Ads
+// pakai OpenRouter model yang lebih kreatif).
+function fieldNames(feature: CopywritingFeature) {
+  const prefix = feature === 'check' ? 'checkAds' : 'generateAds';
+  return {
+    provider: `${prefix}LlmProvider`,
+    apiKey: `${prefix}LlmApiKeyEncrypted`,
+    model: `${prefix}LlmModel`,
+  };
+}
+
+/** Resolve provider/API key/model Copywriting Ads per-business, PER FEATURE (Check vs Generate --
+ *  fix v1.8.0, sebelumnya satu config dipakai bersama keduanya). Urutan resolusi per feature:
+ *  1. Field per-feature baru (`checkAdsLlm*`/`generateAdsLlm*`) kalau sudah pernah diisi eksplisit.
+ *  2. Kalau belum, field SHARED lama (`copywritingLlm*`) -- backward compat, business yang sudah
+ *     pernah setting provider sebelum fitur split ini ada TETAP jalan identik tanpa perlu setting
+ *     ulang (`usingLegacySharedFallback: true` dikembalikan supaya frontend bisa kasih tahu).
+ *  3. Default kalau tidak ada keduanya = `agy` (tidak butuh API key sama sekali).
+ *  Provider `google` TANPA key sendiri di manapun otomatis fallback ke `metaGuardGeminiApiKeyEncrypted`
+ *  (kolom Video Guard yang sudah ada, paling lama). Provider `openai`/`openrouter`/`groq` TIDAK
+ *  punya fallback apa pun -- wajib diisi sendiri. */
+async function resolveCopywritingLlmConfig(
+  businessId: string,
+  feature: CopywritingFeature,
+): Promise<CopywritingLlmConfig> {
+  const business = await prisma.business.findUnique({
+    where: { id: businessId },
+    select: { settings: true },
+  });
+  const settings = (business?.settings as Record<string, unknown>) ?? {};
+  const fields = fieldNames(feature);
+
+  const perFeatureProvider = settings[fields.provider];
+  const sharedProvider = settings.copywritingLlmProvider;
+  const usingLegacySharedFallback = !isKnownProvider(perFeatureProvider) && isKnownProvider(sharedProvider);
+  const rawProvider = isKnownProvider(perFeatureProvider)
+    ? perFeatureProvider
+    : isKnownProvider(sharedProvider)
+    ? sharedProvider
+    : 'agy';
+  const provider: CopywritingLlmProvider = rawProvider === 'agy' ? 'agy' : rawProvider;
+
+  const perFeatureModel = settings[fields.model];
+  const sharedModel = settings.copywritingLlmModel;
+  const rawModel =
+    typeof perFeatureModel === 'string' && perFeatureModel.trim()
+      ? perFeatureModel
+      : usingLegacySharedFallback && typeof sharedModel === 'string' && sharedModel.trim()
+      ? sharedModel
+      : null;
+  const model = rawModel ? rawModel.trim() : null;
+
+  let apiKey: string | null = null;
+  const perFeatureEncrypted = settings[fields.apiKey];
+  const sharedEncrypted = settings.copywritingLlmApiKeyEncrypted;
+  const encrypted =
+    typeof perFeatureEncrypted === 'string' && perFeatureEncrypted
+      ? perFeatureEncrypted
+      : usingLegacySharedFallback && typeof sharedEncrypted === 'string' && sharedEncrypted
+      ? sharedEncrypted
+      : null;
+  if (encrypted) {
+    try {
+      apiKey = decrypt(encrypted);
+    } catch (e) {
+      logger.warn(
+        `[CopywritingAds] Gagal decrypt ${fields.apiKey} (feature=${feature}) business ${businessId}: ${(e as Error).message}`,
+      );
+    }
+  }
+
+  let usingLegacyGeminiKeyFallback = false;
+  if (provider === 'google' && !apiKey) {
+    const legacyEncrypted = settings.metaGuardGeminiApiKeyEncrypted;
+    if (typeof legacyEncrypted === 'string' && legacyEncrypted) {
+      try {
+        apiKey = decrypt(legacyEncrypted);
+        usingLegacyGeminiKeyFallback = true;
+      } catch (e) {
+        logger.warn(
+          `[CopywritingAds] Gagal decrypt metaGuardGeminiApiKeyEncrypted (fallback) business ${businessId}: ${(e as Error).message}`,
+        );
+      }
+    }
+  }
+
+  return { provider, apiKey, model, usingLegacyGeminiKeyFallback, usingLegacySharedFallback };
+}
+
+function llmHeaders(config: CopywritingLlmConfig, extra?: Record<string, string>): Record<string, string> {
+  return metaguardHeaders({
+    ...extra,
+    'X-Llm-Provider': config.provider,
+    ...(config.apiKey ? { 'X-Llm-Api-Key': config.apiKey } : {}),
+    ...(config.model ? { 'X-Llm-Model': config.model } : {}),
+  });
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// GET/PUT /copywriting-ads/settings — provider/API key/model LLM khusus Copywriting Ads
+// Pola sama persis dengan GET/PUT /video-guard/settings: TIDAK PERNAH balikin key mentah/
+// terenkripsi, cuma boolean "configured" + preview tersamar.
+// ══════════════════════════════════════════════════════════════════════════
+
+// fix v1.8.0: GET sekarang balikin config KEDUA feature sekaligus (checkAds/generateAds), masing2
+// hasil resolveCopywritingLlmConfig utk feature itu -- frontend render 2 section independen.
+function serializeConfig(config: CopywritingLlmConfig) {
+  return {
+    provider: config.provider,
+    model: config.model,
+    usingLegacyGeminiKeyFallback: config.usingLegacyGeminiKeyFallback,
+    usingLegacySharedFallback: config.usingLegacySharedFallback,
+  };
+}
+
+router.get('/settings', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const business = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+    const settings = (business?.settings as Record<string, unknown>) ?? {};
+
+    async function withPreview(feature: CopywritingFeature) {
+      const config = await resolveCopywritingLlmConfig(businessId, feature);
+      const fields = fieldNames(feature);
+      const perFeatureEncrypted = settings[fields.apiKey];
+      const sharedEncrypted = settings.copywritingLlmApiKeyEncrypted;
+      const encrypted =
+        typeof perFeatureEncrypted === 'string' && perFeatureEncrypted
+          ? perFeatureEncrypted
+          : config.usingLegacySharedFallback && typeof sharedEncrypted === 'string' && sharedEncrypted
+          ? sharedEncrypted
+          : null;
+      let preview: string | null = null;
+      if (encrypted) {
+        try {
+          preview = maskedPreview(decrypt(encrypted));
+        } catch (e) {
+          logger.warn(`[CopywritingAds] Gagal decrypt utk preview (${feature}), business ${businessId}: ${(e as Error).message}`);
+          preview = '(gagal dibaca, isi ulang key)';
+        }
+      }
+      return { ...serializeConfig(config), apiKeyConfigured: Boolean(encrypted), apiKeyPreview: preview };
+    }
+
+    res.json({
+      checkAds: await withPreview('check'),
+      generateAds: await withPreview('generate'),
+    });
+  } catch (e) { next(e); }
+});
+
+const settingsSchema = z.object({
+  feature: z.enum(['check', 'generate']),
+  provider: z.enum(['agy', 'google', 'openai', 'openrouter', 'groq']).optional(),
+  apiKey: z.string().optional(), // kirim string kosong "" utk hapus, undefined = tidak diubah
+  model: z.string().optional(), // kirim string kosong "" utk hapus/pakai default provider
+});
+
+// fix v1.8.0: PUT sekarang WAJIB sebut `feature` ('check'|'generate') -- menulis ke field per-feature
+// baru (checkAdsLlm*/generateAdsLlm*), TIDAK PERNAH lagi menulis ke copywritingLlm* lama (field lama
+// dibiarkan apa adanya sbg fallback baca-saja utk business yang belum pernah pakai UI baru ini).
+router.put('/settings', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const body = settingsSchema.parse(req.body);
+    const fields = fieldNames(body.feature);
+
+    const business = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+    const settings = { ...((business?.settings as Record<string, unknown>) ?? {}) };
+
+    if (body.provider !== undefined) {
+      settings[fields.provider] = body.provider;
+    }
+    if (body.apiKey !== undefined) {
+      const trimmed = body.apiKey.trim();
+      if (trimmed) settings[fields.apiKey] = encrypt(trimmed);
+      else delete settings[fields.apiKey];
+    }
+    if (body.model !== undefined) {
+      const trimmed = body.model.trim();
+      if (trimmed) settings[fields.model] = trimmed;
+      else delete settings[fields.model];
+    }
+
+    await prisma.business.update({ where: { id: businessId }, data: { settings: settings as Prisma.InputJsonValue } });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// POST /copywriting-ads/check — proxy ke metaguard_service /v1/copywriting/check
+// Tab "Check Ads": audit copy iklan yang SUDAH ADA (headline/primary_text) -- bisa dari paste
+// manual, atau prefill dari hasil audit Video Guard/Ads Creative (blueprint 5.1 poin 2, frontend
+// yang mengisi query param/state, endpoint ini sendiri tidak tahu-menahu soal sumbernya).
+// ══════════════════════════════════════════════════════════════════════════
+
+const checkSchema = z.object({
+  headline: z.string().optional(),
+  primary_text: z.string().optional(),
+});
+
+router.post('/check', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const payload = checkSchema.parse(req.body);
+
+    const llmConfig = await resolveCopywritingLlmConfig(businessId, 'check');
+    const baseUrl = requireMetaguardUrl();
+    const upstream = await fetch(`${baseUrl}/v1/copywriting/check`, {
+      method: 'POST',
+      headers: llmHeaders(llmConfig, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(COPYWRITING_TIMEOUT_MS),
+    });
+    const data = await upstream.json();
+    if (!upstream.ok) {
+      logger.warn(`[CopywritingAds] metaguard_service /v1/copywriting/check menolak: ${upstream.status} ${JSON.stringify(data)}`);
+    }
+    res.status(upstream.status).json(data);
+  } catch (e) { next(e); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// POST /copywriting-ads/generate — proxy ke metaguard_service /v1/copywriting/generate
+// Tab "Generate Ads": keyword/produk (+ opsional URL kompetitor) -> 3 angle x platform.
+// ══════════════════════════════════════════════════════════════════════════
+
+const generateSchema = z.object({
+  product_or_keyword: z.string().min(1, 'product_or_keyword wajib diisi'),
+  competitor_url: z.string().optional(),
+  extra_context: z.string().optional(),
+});
+
+router.post('/generate', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const payload = generateSchema.parse(req.body);
+
+    const llmConfig = await resolveCopywritingLlmConfig(businessId, 'generate');
+    const baseUrl = requireMetaguardUrl();
+    const upstream = await fetch(`${baseUrl}/v1/copywriting/generate`, {
+      method: 'POST',
+      headers: llmHeaders(llmConfig, { 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(COPYWRITING_TIMEOUT_MS),
+    });
+    const data = await upstream.json();
+    if (!upstream.ok) {
+      logger.warn(`[CopywritingAds] metaguard_service /v1/copywriting/generate menolak: ${upstream.status} ${JSON.stringify(data)}`);
+    }
+    res.status(upstream.status).json(data);
+  } catch (e) { next(e); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// GET /copywriting-ads/landing-page-audits — data "LP Matcher" (Chunk (g) bagian 2, Fase 4,
+// Cowork 2026-08-28). Baca-saja dari LandingPageAuditRecord, yang diisi oleh
+// `landing_page_sentinel.py` (VPS45) lewat POST /automation-sync/findings (source=
+// landing_page_sentinel). TIDAK ADA logic AI di sini -- message-match score, dropoff risk, dan
+// saran rewrite (H1/subhead/bullets/CTA) sudah dihitung di VPS45, endpoint ini murni expose baca
+// per business, terbaru per adId (satu ad bisa punya banyak baris histori seiring waktu, frontend
+// cuma butuh kondisi TERKINI).
+// ══════════════════════════════════════════════════════════════════════════
+
+const LP_RISK_ORDER: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+
+router.get('/landing-page-audits', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const limitParam = Number(req.query.limit);
+    const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 200) : 50;
+
+    // `distinct: ['adId']` + `orderBy: createdAt desc` -> baris pertama per grup adId adalah yang
+    // paling baru (perilaku terdokumentasi Prisma utk kombinasi distinct+orderBy ini).
+    const rows = await prisma.landingPageAuditRecord.findMany({
+      where: { businessId },
+      orderBy: { createdAt: 'desc' },
+      distinct: ['adId'],
+      take: limit,
+    });
+
+    rows.sort((a, b) => (LP_RISK_ORDER[a.dropoffRisk] ?? 9) - (LP_RISK_ORDER[b.dropoffRisk] ?? 9));
+
+    res.json({ items: rows, count: rows.length });
+  } catch (e) { next(e); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// GET/PATCH /copywriting-ads/hook-refresh-candidates — antrean "Hook Generator" (Chunk (g)
+// bagian 2, Fase 4). Baca dari AdFatigueRecord (diisi `ad_fatigue_radar.py` VPS45 lewat
+// /automation-sync/findings, source=ad_fatigue_radar) -- daftar ad yang frequency/CTR-decay/CPM-
+// creep-nya sudah lewat ambang fatigue, kandidat utk headline/primary-text baru.
+//
+// Generate hook barunya SENDIRI TIDAK bikin pipeline LLM baru di sini -- SENGAJA reuse
+// POST /generate yang sudah ada (proxy ke metaguard_service): frontend yang prefill
+// `product_or_keyword`/`extra_context` dari data record ini lalu panggil /generate seperti biasa
+// tab "Generate Ads". Endpoint di bawah ini murni baca antrean + tandai status (REFRESHED/
+// DISMISSED) supaya antrean tidak numpuk terus-menerus begitu user sudah menindaklanjuti.
+// ══════════════════════════════════════════════════════════════════════════
+
+const FATIGUE_SEVERITY_ORDER: Record<string, number> = { CRITICAL: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+
+router.get('/hook-refresh-candidates', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const limitParam = Number(req.query.limit);
+    const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 200) : 50;
+
+    const rows = await prisma.adFatigueRecord.findMany({
+      where: { businessId, status: 'DETECTED' },
+      orderBy: { createdAt: 'desc' },
+      take: limit,
+    });
+
+    rows.sort((a, b) => (FATIGUE_SEVERITY_ORDER[a.fatigueSeverity] ?? 9) - (FATIGUE_SEVERITY_ORDER[b.fatigueSeverity] ?? 9));
+
+    res.json({ items: rows, count: rows.length });
+  } catch (e) { next(e); }
+});
+
+const hookStatusSchema = z.object({
+  status: z.enum(['REFRESHED', 'DISMISSED']),
+});
+
+router.patch('/hook-refresh-candidates/:id', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const body = hookStatusSchema.parse(req.body);
+
+    const row = await prisma.adFatigueRecord.findFirst({ where: { id: req.params.id as string, businessId } });
+    if (!row) {
+      res.status(404).json({ error: { message: 'Record fatigue tidak ditemukan' } });
+      return;
+    }
+
+    const updated = await prisma.adFatigueRecord.update({
+      where: { id: row.id },
+      data: { status: body.status },
+    });
+    res.json({ ok: true, item: updated });
+  } catch (e) { next(e); }
+});
+
+export default router;

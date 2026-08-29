@@ -1,0 +1,137 @@
+# Penerapan SalesPintar di vps-upcloud (CentOS 7.9 + CWP + CSF, 62 vhost).
+# Alasan setiap keputusan ada di README.md sebelah. Ringkasnya:
+#   network_mode: host  — Docker dipasang dengan "iptables": false supaya tidak
+#                         menyentuh firewall CSF. Tanpa iptables, bridge tidak
+#                         berfungsi; jaringan host tidak membutuhkannya.
+# Semua port diikat 127.0.0.1. Yang menghadap publik hanya nginx HOST di :443
+# yang mem-proxy ke 127.0.0.1:3001.
+
+services:
+  postgres:
+    # pgvector/pgvector, BUKAN postgres:16-alpine.
+    # docker-compose.yml (bridge) memakai postgres:16-alpine yang TIDAK punya
+    # pgvector — pustaka pengetahuan memakai kolom vector, jadi migrasi akan
+    # gagal di situ. Laptop memakai image ini juga.
+    image: pgvector/pgvector:pg16
+    container_name: salespintar-db
+    restart: unless-stopped
+    network_mode: host
+    command: ["postgres", "-c", "listen_addresses=127.0.0.1", "-c", "port=5433"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5433 -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    # 5433, bukan 5432: kalau CWP suatu saat memasang PostgreSQL sendiri, port
+    # bawaannya tidak bertabrakan dengan basis data ini.
+    mem_limit: 768m
+
+  redis:
+    image: redis:7-alpine
+    container_name: salespintar-redis
+    restart: unless-stopped
+    network_mode: host
+    # maxmemory-policy noeviction WAJIB untuk BullMQ: kalau Redis boleh membuang
+    # kunci saat penuh, job antrean bisa lenyap diam-diam — persis kelas
+    # kehilangan-data senyap yang dibereskan Fase 63-71.
+    command:
+      - redis-server
+      - --bind
+      - 127.0.0.1
+      - --port
+      - "6380"
+      - --appendonly
+      - "yes"
+      - --save
+      - "300"
+      - "1"
+      - --maxmemory
+      - 192mb
+      - --maxmemory-policy
+      - noeviction
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-h", "127.0.0.1", "-p", "6380", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    mem_limit: 256m
+
+  api:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.backend
+      # network: host WAJIB di server ini.
+      # Docker dipasang dengan "iptables": false + "ip-forward": false supaya
+      # tidak menyentuh firewall CSF — dan itu membuat jaringan BRIDGE mati.
+      # `docker build` normalnya memakai bridge, jadi langkah `npm ci` dan
+      # `apk add` gagal dengan "DNS: transient error". Runtime tidak kena
+      # karena sudah network_mode: host; yang terlupa cuma tahap build.
+      network: host
+    container_name: salespintar-api
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TZ=Asia/Jakarta
+    env_file:
+      - ./api.env
+      # Kunci OpenRouter ditaruh di berkas SENDIRI, bukan digabung ke api.env.
+      # Sampai Fase 109 berkas ini cuma dimuat oleh skrip audit, jadi container
+      # yang melayani WhatsApp mencatat "Layanan tanpa kunci API: openrouter" —
+      # penyedia itu terdaftar di kode tapi tidak pernah bisa dipakai bot.
+      - ./openrouter.env
+    volumes:
+      # Kredensial WhatsApp. Bind mount, BUKAN named volume: 23 MB ini disalin
+      # dari laptop saat cutover, dan harus mudah dicadangkan. Hilang = keenam
+      # CS harus scan QR ulang.
+      - /opt/salespintar-data/wa_sessions:/app/wa_sessions
+      - /opt/salespintar-data/logs:/app/logs
+      - /opt/salespintar-data/uploads:/app/uploads
+      # Vault CS-Brain. RW, bukan RO: Shadow Mining MENULIS dokumen hasil tambang
+      # ke Draft_AI/ (writeToVault, shadow-mining.worker.ts:285).
+      - /opt/salespintar-data/cs-brain:/vault/cs-brain
+      # Cache model embedding (~130 MB). Tanpa ini, tiap container dibuat ulang
+      # modelnya diunduh lagi.
+      - hfcache:/app/.hf-cache
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    mem_limit: 1.5g
+
+  web:
+    build:
+      context: ../..
+      dockerfile: Dockerfile.frontend
+      # network: host WAJIB di server ini.
+      # Docker dipasang dengan "iptables": false + "ip-forward": false supaya
+      # tidak menyentuh firewall CSF — dan itu membuat jaringan BRIDGE mati.
+      # `docker build` normalnya memakai bridge, jadi langkah `npm ci` dan
+      # `apk add` gagal dengan "DNS: transient error". Runtime tidak kena
+      # karena sudah network_mode: host; yang terlupa cuma tahap build.
+      network: host
+    container_name: salespintar-web
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      - TZ=Asia/Jakarta
+    # Tidak ada mount nginx: sejak frontend berjalan sebagai server Next.js,
+    # /api dan /socket.io diteruskan oleh `rewrites()` di next.config.ts.
+    # nginx-host.conf sudah tidak dipakai (dipindah ke _to_delete/).
+    depends_on:
+      - api
+    # Next.js server butuh lebih banyak dari nginx statis.
+    mem_limit: 512m
+
+volumes:
+  pgdata:
+  redisdata:
+  hfcache:

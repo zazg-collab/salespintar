@@ -1,0 +1,426 @@
+'use client';
+
+import React, { useState } from 'react';
+import Link from 'next/link';
+import {
+  PenSquare,
+  Loader2,
+  ShieldCheck,
+  AlertTriangle,
+  ShieldAlert,
+  Sparkles,
+  Quote,
+  Settings,
+} from 'lucide-react';
+import { apiPost } from '../../../../lib/api';
+
+// ══════════════════════════════════════════════════════════════════════════
+// Tipe hasil -- HARUS sinkron dengan Pydantic schema di metaguard_service/copywriting.py
+// (CopywritingCheckResult / CopywritingGenerateResult), diteruskan apa adanya oleh Node proxy
+// (backend/src/routes/copywriting.routes.ts). Lihat blueprint
+// 20260826-blueprint-videoguard-media-analysis-copywriting.md Bagian 5.
+// ══════════════════════════════════════════════════════════════════════════
+
+type Platform = 'Meta' | 'TikTok' | 'Umum';
+type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
+
+interface CopyFlag {
+  quoted_phrase: string;
+  platform: Platform;
+  severity: RiskLevel;
+  reason: string;
+  reference: string;
+  safe_rewrite: string;
+}
+
+interface CopywritingCheckResult {
+  overall_verdict: 'AMAN' | 'PERLU_REVISI' | 'BERISIKO_TINGGI';
+  summary: string;
+  flags: CopyFlag[];
+  safe_rewrite_headline?: string | null;
+  safe_rewrite_primary_text?: string | null;
+  disclaimer: string;
+}
+
+interface AdCopyVariant {
+  angle: string;
+  platform: 'Meta' | 'TikTok';
+  headline: string;
+  primary_text: string;
+  cta_suggestion: string;
+  audience_idea: string;
+  disapproval_risk: RiskLevel;
+  risk_note?: string | null;
+}
+
+interface CopywritingGenerateResult {
+  product_or_keyword: string;
+  variants: AdCopyVariant[];
+  grounding_note: string;
+  disclaimer: string;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Badge helpers
+// ══════════════════════════════════════════════════════════════════════════
+
+function VerdictBadge({ verdict }: { verdict: CopywritingCheckResult['overall_verdict'] }) {
+  const config = {
+    AMAN: { icon: ShieldCheck, className: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+    PERLU_REVISI: { icon: AlertTriangle, className: 'bg-amber-50 text-amber-700 border-amber-200' },
+    BERISIKO_TINGGI: { icon: ShieldAlert, className: 'bg-rose-50 text-rose-700 border-rose-200' },
+  }[verdict];
+  const Icon = config.icon;
+  return (
+    <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-semibold border ${config.className}`}>
+      <Icon className="w-4 h-4" />
+      {verdict.replace('_', ' ')}
+    </span>
+  );
+}
+
+function SeverityBadge({ severity }: { severity: RiskLevel }) {
+  const className = {
+    LOW: 'bg-gray-100 text-gray-600',
+    MEDIUM: 'bg-amber-100 text-amber-700',
+    HIGH: 'bg-rose-100 text-rose-700',
+  }[severity];
+  return <span className={`px-2 py-0.5 rounded text-xs font-semibold ${className}`}>{severity}</span>;
+}
+
+function PlatformBadge({ platform }: { platform: string }) {
+  const className = platform === 'Meta'
+    ? 'bg-indigo-100 text-indigo-700'
+    : platform === 'TikTok'
+      ? 'bg-slate-800 text-white'
+      : 'bg-gray-100 text-gray-600';
+  return <span className={`px-2 py-0.5 rounded text-xs font-semibold ${className}`}>{platform}</span>;
+}
+
+function DisclaimerFooter({ text }: { text: string }) {
+  return (
+    <p className="text-xs text-gray-400 italic border-t border-gray-100 pt-3 mt-1">{text}</p>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Tab "Check Ads"
+// ══════════════════════════════════════════════════════════════════════════
+
+function CheckAdsTab() {
+  const [headline, setHeadline] = useState('');
+  const [primaryText, setPrimaryText] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<CopywritingCheckResult | null>(null);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+
+    if (!headline.trim() && !primaryText.trim()) {
+      setError('Minimal salah satu dari headline/primary text wajib diisi.');
+      return;
+    }
+
+    setSubmitting(true);
+    setResult(null);
+    try {
+      const res = await apiPost<CopywritingCheckResult>('/copywriting-ads/check', {
+        headline: headline.trim() || undefined,
+        primary_text: primaryText.trim() || undefined,
+      });
+      setResult(res);
+    } catch (e) {
+      setError((e as Error).message || 'Gagal mengecek copy.');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      {error && <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>}
+
+      <form onSubmit={handleSubmit} className="bg-white rounded-2xl border border-gray-200 p-6 space-y-5">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Headline</label>
+          <input
+            type="text"
+            value={headline}
+            onChange={(e) => setHeadline(e.target.value)}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="mis. Turunkan Berat Badan 10kg Dalam 3 Hari!"
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Primary Text</label>
+          <textarea
+            value={primaryText}
+            onChange={(e) => setPrimaryText(e.target.value)}
+            rows={5}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="Tempel isi primary text/body copy iklan di sini..."
+          />
+          <p className="text-xs text-gray-400 mt-1">Isi minimal salah satu dari Headline atau Primary Text.</p>
+        </div>
+
+        <button
+          type="submit"
+          disabled={submitting}
+          className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-colors shadow-sm"
+        >
+          {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <ShieldCheck className="w-4 h-4" />}
+          {submitting ? 'Mengecek…' : 'Cek Copy Ini'}
+        </button>
+      </form>
+
+      {result && (
+        <div className="bg-white rounded-2xl border border-gray-200 p-6 space-y-5">
+          <div className="flex items-center justify-between flex-wrap gap-2">
+            <h2 className="text-base font-bold text-gray-900">Hasil Pemeriksaan</h2>
+            <VerdictBadge verdict={result.overall_verdict} />
+          </div>
+
+          <p className="text-sm text-gray-700 leading-relaxed">{result.summary}</p>
+
+          {result.flags.length > 0 && (
+            <div className="space-y-3">
+              <h3 className="text-sm font-semibold text-gray-700">Frasa yang Ditandai ({result.flags.length})</h3>
+              {result.flags.map((flag, i) => (
+                <div key={i} className="border border-gray-200 rounded-xl p-4 space-y-2">
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <PlatformBadge platform={flag.platform} />
+                    <SeverityBadge severity={flag.severity} />
+                    <span className="text-xs text-gray-400">{flag.reference}</span>
+                  </div>
+                  <blockquote className="flex items-start gap-2 bg-gray-50 rounded-lg px-3 py-2 text-sm text-gray-800 italic">
+                    <Quote className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-gray-400" />
+                    &ldquo;{flag.quoted_phrase}&rdquo;
+                  </blockquote>
+                  <p className="text-sm text-gray-600">{flag.reason}</p>
+                  <div className="bg-emerald-50 border border-emerald-200 rounded-lg px-3 py-2 text-sm text-emerald-800">
+                    <span className="font-semibold">Saran aman: </span>{flag.safe_rewrite}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {(result.safe_rewrite_headline || result.safe_rewrite_primary_text) && (
+            <div className="space-y-2 bg-indigo-50 border border-indigo-200 rounded-xl p-4">
+              <h3 className="text-sm font-semibold text-indigo-800">Versi Rewrite yang Disarankan</h3>
+              {result.safe_rewrite_headline && (
+                <div>
+                  <p className="text-xs text-indigo-500 font-medium">Headline</p>
+                  <p className="text-sm text-indigo-900">{result.safe_rewrite_headline}</p>
+                </div>
+              )}
+              {result.safe_rewrite_primary_text && (
+                <div>
+                  <p className="text-xs text-indigo-500 font-medium">Primary Text</p>
+                  <p className="text-sm text-indigo-900 whitespace-pre-wrap">{result.safe_rewrite_primary_text}</p>
+                </div>
+              )}
+            </div>
+          )}
+
+          <DisclaimerFooter text={result.disclaimer} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Tab "Generate Ads"
+// ══════════════════════════════════════════════════════════════════════════
+
+function GenerateAdsTab() {
+  const [productOrKeyword, setProductOrKeyword] = useState('');
+  const [competitorUrl, setCompetitorUrl] = useState('');
+  const [extraContext, setExtraContext] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<CopywritingGenerateResult | null>(null);
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+
+    if (!productOrKeyword.trim()) {
+      setError('Produk/keyword wajib diisi.');
+      return;
+    }
+
+    setSubmitting(true);
+    setResult(null);
+    try {
+      const res = await apiPost<CopywritingGenerateResult>('/copywriting-ads/generate', {
+        product_or_keyword: productOrKeyword.trim(),
+        competitor_url: competitorUrl.trim() || undefined,
+        extra_context: extraContext.trim() || undefined,
+      });
+      setResult(res);
+    } catch (e) {
+      setError((e as Error).message || 'Gagal membuat variasi copy.');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="space-y-6">
+      {error && <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>}
+
+      <form onSubmit={handleSubmit} className="bg-white rounded-2xl border border-gray-200 p-6 space-y-5">
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Produk / Keyword *</label>
+          <input
+            type="text"
+            value={productOrKeyword}
+            onChange={(e) => setProductOrKeyword(e.target.value)}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="mis. Serum wajah anti-aging"
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">URL Kompetitor (opsional)</label>
+          <input
+            type="text"
+            value={competitorUrl}
+            onChange={(e) => setCompetitorUrl(e.target.value)}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="https://…"
+          />
+          <p className="text-xs text-gray-400 mt-1">Kalau diisi, halaman ini akan di-scrape sebagai konteks pasar (bukan untuk ditiru).</p>
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-gray-700 mb-1">Konteks Tambahan (opsional)</label>
+          <textarea
+            value={extraContext}
+            onChange={(e) => setExtraContext(e.target.value)}
+            rows={3}
+            className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            placeholder="mis. target audience ibu muda, harga promo 99rb"
+          />
+        </div>
+
+        <button
+          type="submit"
+          disabled={submitting}
+          className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-colors shadow-sm"
+        >
+          {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Sparkles className="w-4 h-4" />}
+          {submitting ? 'Membuat variasi…' : 'Generate Ads'}
+        </button>
+      </form>
+
+      {result && (
+        <div className="space-y-4">
+          <div className="bg-gray-50 border border-gray-200 rounded-xl px-4 py-3 text-sm text-gray-600">
+            {result.grounding_note}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {result.variants.map((v, i) => (
+              <div key={i} className="bg-white rounded-2xl border border-gray-200 p-5 space-y-3">
+                <div className="flex items-center justify-between flex-wrap gap-2">
+                  <span className="text-sm font-bold text-gray-900">{v.angle}</span>
+                  <div className="flex items-center gap-1.5">
+                    <PlatformBadge platform={v.platform} />
+                    <SeverityBadge severity={v.disapproval_risk} />
+                  </div>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 font-medium">Headline</p>
+                  <p className="text-sm font-semibold text-gray-900">{v.headline}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 font-medium">Primary Text</p>
+                  <p className="text-sm text-gray-700 whitespace-pre-wrap">{v.primary_text}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 font-medium">CTA</p>
+                  <p className="text-sm text-gray-700">{v.cta_suggestion}</p>
+                </div>
+                <div>
+                  <p className="text-xs text-gray-400 font-medium">Ide Audience</p>
+                  <p className="text-sm text-gray-700">{v.audience_idea}</p>
+                </div>
+                {v.risk_note && (
+                  <div className="bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 text-xs text-amber-800">
+                    {v.risk_note}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+
+          <div className="bg-white rounded-2xl border border-gray-200 p-4">
+            <DisclaimerFooter text={result.disclaimer} />
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// Halaman utama -- 2 tab persis pola blueprint Bagian 5.1
+// ══════════════════════════════════════════════════════════════════════════
+
+export default function CopywritingAdsPage() {
+  const [activeTab, setActiveTab] = useState<'check' | 'generate'>('check');
+
+  return (
+    <div className="max-w-3xl mx-auto space-y-6">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2">
+            <PenSquare className="w-5 h-5 text-fuchsia-600" />
+            Copywriting Ads
+          </h1>
+          <p className="text-xs text-gray-500 mt-1">
+            Cek copy iklan terhadap kebijakan Meta/TikTok &amp; risiko regulasi Indonesia, atau bikin
+            variasi copy baru dari keyword/produk.
+          </p>
+        </div>
+        <Link
+          href="/app/video-guard/copywriting-ads/pengaturan"
+          className="inline-flex items-center gap-1.5 text-xs font-semibold text-gray-500 hover:text-fuchsia-700 border border-gray-200 hover:border-fuchsia-300 rounded-lg px-3 py-2 transition-colors shrink-0"
+        >
+          <Settings className="w-3.5 h-3.5" /> Pengaturan Provider LLM
+        </Link>
+      </div>
+
+      <div className="flex gap-2 border-b border-gray-200">
+        <button
+          onClick={() => setActiveTab('check')}
+          className={`px-4 py-2.5 text-sm font-semibold border-b-2 transition-colors ${
+            activeTab === 'check'
+              ? 'border-indigo-600 text-indigo-700'
+              : 'border-transparent text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          Check Ads
+        </button>
+        <button
+          onClick={() => setActiveTab('generate')}
+          className={`px-4 py-2.5 text-sm font-semibold border-b-2 transition-colors ${
+            activeTab === 'generate'
+              ? 'border-indigo-600 text-indigo-700'
+              : 'border-transparent text-gray-500 hover:text-gray-700'
+          }`}
+        >
+          Generate Ads
+        </button>
+      </div>
+
+      {activeTab === 'check' ? <CheckAdsTab /> : <GenerateAdsTab />}
+    </div>
+  );
+}

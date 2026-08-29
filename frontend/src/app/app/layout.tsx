@@ -1,91 +1,332 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useState, useCallback } from 'react';
 import { useRouter, usePathname } from 'next/navigation';
 import Link from 'next/link';
 import { useAuthStore } from '../../stores/auth';
 import { useWebSocket } from '../../hooks/useWebSocket';
+import { apiGet } from '../../lib/api';
 import {
   LayoutDashboard,
-  MessageSquare,
-  Send,
-  Users,
+  Users2,
   Smartphone,
   LogOut,
   Menu,
   X,
+  BookOpen,
+  Brain,
+  HelpCircle,
+  SlidersHorizontal,
+  PauseCircle,
+  UserCheck,
+  Sparkles,
+  Megaphone,
+  BarChart3,
+  LayoutGrid,
+  UploadCloud,
+  Wand2,
+  History,
+  ShieldAlert,
+  PenSquare,
 } from 'lucide-react';
+import GlobalAgentWidget from '../../components/GlobalAgentWidget';
 
-const navItems = [
-  { href: '/app/dashboard', label: 'Dashboard', icon: LayoutDashboard },
-  { href: '/app/chat', label: 'Chat', icon: MessageSquare },
-  { href: '/app/broadcasts', label: 'Broadcast', icon: Send },
-  { href: '/app/contacts', label: 'Kontak', icon: Users },
-  { href: '/app/wa-setup', label: 'WhatsApp', icon: Smartphone },
+/**
+ * Panjang sisa jeda Human Learning dalam bahasa manusia. Dipakai spanduk di
+ * bawah — "23 jam lagi" jauh lebih cepat dibaca daripada timestamp ISO.
+ */
+function sisaWaktuJeda(pausedUntilIso: string): string {
+  const sisaMs = Date.parse(pausedUntilIso) - Date.now();
+  if (!Number.isFinite(sisaMs) || sisaMs <= 0) return 'segera berakhir';
+  const menit = Math.round(sisaMs / 60000);
+  if (menit < 1) return 'segera berakhir';
+  if (menit < 60) return `${menit} menit lagi`;
+  const jam = Math.floor(menit / 60);
+  const sisaMenit = menit % 60;
+  return sisaMenit > 0 ? `${jam} jam ${sisaMenit} menit lagi` : `${jam} jam lagi`;
+}
+
+function SpandukJedaHL() {
+  const [hlDijeda, setHlDijeda] = useState(false);
+  const [hlSampai, setHlSampai] = useState<string | null>(null);
+  const [crmDijeda, setCrmDijeda] = useState(false);
+  const [crmSampai, setCrmSampai] = useState<string | null>(null);
+
+  const cek = useCallback(async () => {
+    try {
+      const b = await apiGet<{
+        humanLearningPaused?: boolean;
+        humanLearningPausedUntil?: string | null;
+        crmIntelligencePaused?: boolean;
+        crmIntelligencePausedUntil?: string | null;
+      }>('/business');
+      setHlDijeda(typeof b?.humanLearningPaused === 'boolean' ? b.humanLearningPaused : false);
+      setHlSampai(typeof b?.humanLearningPausedUntil === 'string' ? b.humanLearningPausedUntil : null);
+      setCrmDijeda(typeof b?.crmIntelligencePaused === 'boolean' ? b.crmIntelligencePaused : false);
+      setCrmSampai(typeof b?.crmIntelligencePausedUntil === 'string' ? b.crmIntelligencePausedUntil : null);
+    } catch {
+      // Diamkan — spanduk gagal tidak boleh mematikan antarmuka.
+    }
+  }, []);
+
+  useEffect(() => {
+    void cek();
+    const interval = setInterval(cek, 30000);
+    return () => clearInterval(interval);
+  }, [cek]);
+
+  if (!hlDijeda && !crmDijeda) return null;
+
+  const pesan = [];
+  if (crmDijeda) {
+    pesan.push(`AI CRM Profiler dijeda${crmSampai ? ` (${sisaWaktuJeda(crmSampai)})` : ' permanen'}`);
+  }
+  if (hlDijeda) {
+    pesan.push(`Auto-Learning KB dijeda${hlSampai ? ` (${sisaWaktuJeda(hlSampai)})` : ' permanen'}`);
+  }
+
+  return (
+    <div className="bg-amber-500 text-amber-950 px-4 py-2 text-xs flex items-center justify-between font-medium shadow-sm">
+      <div className="flex items-center gap-2">
+        <PauseCircle className="w-4 h-4 flex-shrink-0 text-amber-950" />
+        <span>
+          <strong>Layanan AI Dijeda:</strong> {pesan.join(' & ')} — CS tetap melayani chat normal.
+        </span>
+      </div>
+      <Link
+        href="/app/settings"
+        className="text-[11px] underline font-semibold hover:text-white transition-colors ml-4 whitespace-nowrap"
+      >
+        Ubah di Pengaturan →
+      </Link>
+    </div>
+  );
+}
+
+const crmNavItems = [
+  { href: '/app/dashboard', label: 'Performa & Sales CS', icon: LayoutDashboard },
+  { href: '/app/meta-capi-dashboard', label: 'Dashboard Meta Ads', icon: BarChart3 },
+  { href: '/app/leads', label: 'Riwayat Pelanggan', icon: UserCheck },
+  { href: '/app/ai-ads', label: 'AI Command Center', icon: Sparkles },
+  { href: '/app/device-cs', label: 'Device & Sesi CS', icon: Users2 },
+  { href: '/app/settings', label: 'Pengaturan API dan AI', icon: SlidersHorizontal },
+  { href: '/app/meta-capi', label: 'Pengaturan Meta Ads', icon: Megaphone },
 ];
 
+const aiNavItems = [
+  { href: '/app/learning-radar', label: 'Knowledge & AI Radar', icon: Brain },
+  { href: '/app/knowledge', label: 'Pustaka Pengetahuan', icon: BookOpen },
+  { href: '/app/human-learning', label: 'Device & Sesi CS', icon: Users2 },
+  { href: '/app/question-miner', label: 'Klaster Pertanyaan', icon: HelpCircle },
+  { href: '/app/auto-learning', label: 'Impor & Kurasi Draf', icon: Sparkles },
+];
+
+const videoGuardNavItems = [
+  { href: '/app/video-guard', label: 'Dashboard', icon: LayoutGrid },
+  { href: '/app/video-guard/audit-baru', label: 'Audit Baru', icon: UploadCloud },
+  // [2026-08-26] fix miskom post-Batch-D (percakapan Bossfren): Copywriting Ads BUKAN workspace
+  // terpisah SEJAJAR Video Guard -- itu submenu DI DALAM Video Guard, ditaruh persis di bawah
+  // "Audit Baru". Sebelumnya sempat dibuat const copywritingNavItems + isCopywritingWorkspace
+  // flag sendiri di bawah (sudah dihapus semua), route pindah dari /app/copywriting-ads ke
+  // /app/video-guard/copywriting-ads.
+  { href: '/app/video-guard/copywriting-ads', label: 'Copywriting Ads', icon: PenSquare },
+  { href: '/app/video-guard/reinforcement', label: 'Video Cloaking', icon: Wand2 },
+  { href: '/app/video-guard/riwayat', label: 'Riwayat Audit', icon: History },
+  { href: '/app/video-guard/meta-rejected', label: 'Ads Creative', icon: ShieldAlert },
+  { href: '/app/video-guard/pengaturan', label: 'Pengaturan', icon: SlidersHorizontal },
+];
+
+function CsSocketStatusWidget({ isAiWorkspace }: { isAiWorkspace: boolean }) {
+  const [sessions, setSessions] = useState<{ id: string; csName: string; liveStatus: string }[]>([]);
+  const [loading, setLoading] = useState(true);
+
+  const fetchStatus = useCallback(async () => {
+    try {
+      const res = await apiGet<{ sessions?: { id: string; csName: string; liveStatus: string }[] }>('/human-learning/sessions');
+      if (res?.sessions) {
+        setSessions(res.sessions);
+      }
+    } catch {
+      // ignore
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchStatus();
+    const timer = setInterval(fetchStatus, 15000); // refresh otomatis tiap 15 detik
+    return () => clearInterval(timer);
+  }, [fetchStatus]);
+
+  if (loading && sessions.length === 0) return null;
+  if (sessions.length === 0) return null;
+
+  const connectedCount = sessions.filter(s => s.liveStatus === 'CONNECTED').length;
+  const totalCount = sessions.length;
+  const isAllConnected = connectedCount === totalCount && totalCount > 0;
+  const hasDisconnected = connectedCount < totalCount;
+  const disconnectedNames = sessions.filter(s => s.liveStatus !== 'CONNECTED').map(s => s.csName).join(', ');
+
+  return (
+    <div className="px-3 py-2">
+      <Link
+        href={isAiWorkspace ? "/app/human-learning" : "/app/device-cs"}
+        className={`block p-2.5 rounded-lg border transition-all duration-150 ${
+          isAllConnected
+            ? 'bg-emerald-50/70 border-emerald-200/80 hover:bg-emerald-100/70 text-emerald-900'
+            : hasDisconnected
+            ? 'bg-rose-50 border-rose-300 hover:bg-rose-100 text-rose-900 shadow-2xs'
+            : 'bg-amber-50 border-amber-200 text-amber-900'
+        }`}
+        title="Klik untuk melihat status perangkat CS & QR Code"
+      >
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="relative flex h-2.5 w-2.5">
+              {isAllConnected ? (
+                <>
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                </>
+              ) : (
+                <>
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-rose-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-rose-500"></span>
+                </>
+              )}
+            </span>
+            <span className="text-xs font-semibold">
+              {isAllConnected
+                ? `Socket Live (${connectedCount}/${totalCount} CS)`
+                : `Socket Putus (${connectedCount}/${totalCount} CS)`}
+            </span>
+          </div>
+          <span className="text-[10px] text-gray-500 font-medium hover:underline">
+            Cek →
+          </span>
+        </div>
+        <p className="text-[11px] text-gray-500 mt-1 truncate">
+          {isAllConnected
+            ? sessions.map(s => s.csName).join(', ')
+            : `Offline: ${disconnectedNames} (Klik hubungkan)`}
+        </p>
+      </Link>
+    </div>
+  );
+}
+
 export default function AppLayout({ children }: { children: React.ReactNode }) {
-  const { user, business, isAuthenticated, logout } = useAuthStore();
+  const { user, business, isAuthenticated, logout, fetchMe } = useAuthStore();
   const router = useRouter();
   const pathname = usePathname();
   const [sidebarOpen, setSidebarOpen] = useState(false);
+  const [mounted, setMounted] = useState(false);
 
   useWebSocket();
 
   useEffect(() => {
-    if (!isAuthenticated) {
+    setMounted(true);
+  }, []);
+
+  // Setelah refresh halaman, token masih ada tapi objek user hilang dari memori.
+  // Ambil ulang dari server supaya tombol-tombol yang bergantung pada role
+  // (Buat Broadcast, Ambil Alih) tidak diam-diam menghilang.
+  useEffect(() => {
+    if (mounted && isAuthenticated && !user) {
+      fetchMe();
+    }
+  }, [mounted, isAuthenticated, user, fetchMe]);
+
+  useEffect(() => {
+    if (mounted && !isAuthenticated) {
       router.push('/login');
     }
-  }, [isAuthenticated, router]);
+  }, [mounted, isAuthenticated, router]);
 
   const handleLogout = async () => {
     await logout();
     router.push('/login');
   };
 
-  if (!isAuthenticated) {
+  if (!mounted || !isAuthenticated) {
     return null;
   }
+
+  if (pathname === '/app/hub') {
+    return <div className="h-screen w-full bg-gray-50">{children}</div>;
+  }
+
+  const isVideoGuardWorkspace = pathname === '/app/video-guard' || pathname.startsWith('/app/video-guard/');
+  const isAiWorkspace = !isVideoGuardWorkspace && aiNavItems.some(item => pathname === item.href || pathname.startsWith(item.href + '/'));
+  const activeNavItems = isVideoGuardWorkspace ? videoGuardNavItems : isAiWorkspace ? aiNavItems : crmNavItems;
+  // Longest-prefix-wins: mencegah 2 item nav aktif bersamaan saat satu href adalah
+  // prefix path dari href lain (mis. "/app/video-guard" adalah prefix dari
+  // "/app/video-guard/reinforcement"). Tanpa ini, keduanya lolos cek startsWith.
+  const activeNavHref = activeNavItems.reduce<string | null>((best, item) => {
+    const matches = pathname === item.href || pathname.startsWith(item.href + '/');
+    if (!matches) return best;
+    if (best === null || item.href.length > best.length) return item.href;
+    return best;
+  }, null);
 
   return (
     <div className="flex h-screen bg-gray-50">
       <aside className={`
-        fixed inset-y-0 left-0 z-30 w-64 bg-white border-r border-gray-200 transform transition-transform duration-200
+        fixed inset-y-0 left-0 z-30 w-64 bg-white border-r border-gray-200 transform transition-transform duration-200 flex flex-col
         lg:relative lg:translate-x-0
         ${sidebarOpen ? 'translate-x-0' : '-translate-x-full'}
       `}>
-        <div className="flex items-center justify-between h-16 px-6 border-b border-gray-200">
-          <div>
-            <h1 className="text-lg font-bold text-indigo-600">SalesPintar</h1>
-            <p className="text-xs text-gray-500 truncate">{business?.name}</p>
+        <div className="flex items-start justify-between px-5 py-4 border-b border-gray-200 flex-shrink-0">
+          <div className="space-y-1">
+            <h1 className="text-base font-bold text-indigo-600 tracking-tight leading-none">
+              Cordova Inovasi
+            </h1>
+            <p className="text-[11px] text-gray-500 font-medium">
+              {isVideoGuardWorkspace ? 'Meta Video AI Guards' : isAiWorkspace ? 'AI Learning Center' : 'Ads & CRM Center'}
+            </p>
+            <div className="pt-1">
+              <Link
+                href="/app/hub"
+                className="text-[11px] text-indigo-600 hover:text-indigo-800 hover:underline inline-flex items-center gap-1 font-semibold transition-colors"
+              >
+                ← Kembali ke Portal
+              </Link>
+            </div>
           </div>
-          <button className="lg:hidden" onClick={() => setSidebarOpen(false)}>
+          <button className="lg:hidden p-1 text-gray-400 hover:text-gray-600" onClick={() => setSidebarOpen(false)}>
             <X className="w-5 h-5" />
           </button>
         </div>
 
-        <nav className="p-4 space-y-1">
-          {navItems.map((item) => {
-            const isActive = pathname.startsWith(item.href);
-            return (
-              <Link
-                key={item.href}
-                href={item.href}
-                onClick={() => setSidebarOpen(false)}
-                className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
-                  isActive
-                    ? 'bg-indigo-50 text-indigo-700'
-                    : 'text-gray-600 hover:bg-gray-100'
-                }`}
-              >
-                <item.icon className="w-5 h-5" />
-                {item.label}
-              </Link>
-            );
-          })}
-        </nav>
+        <div className="flex-1 flex flex-col overflow-y-auto">
+          <nav className="p-4 space-y-1">
+            {activeNavItems.map((item) => {
+              const isActive = activeNavHref === item.href;
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  onClick={() => setSidebarOpen(false)}
+                  className={`flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors ${
+                    isActive
+                      ? 'bg-indigo-50 text-indigo-700'
+                      : 'text-gray-600 hover:bg-gray-100'
+                  }`}
+                >
+                  <item.icon className="w-5 h-5" />
+                  {item.label}
+                </Link>
+              );
+            })}
+          </nav>
 
-        <div className="absolute bottom-0 left-0 right-0 p-4 border-t border-gray-200">
+          <div className="mt-auto pb-2">
+            {!isVideoGuardWorkspace && <CsSocketStatusWidget isAiWorkspace={isAiWorkspace} />}
+          </div>
+        </div>
+
+        <div className="p-4 border-t border-gray-200 flex-shrink-0">
           <div className="flex items-center justify-between">
             <div className="text-sm">
               <p className="font-medium">{user?.name}</p>
@@ -110,17 +351,21 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
       )}
 
       <div className="flex-1 flex flex-col min-w-0">
-        <header className="flex items-center h-16 px-4 bg-white border-b border-gray-200 lg:hidden">
-          <button onClick={() => setSidebarOpen(true)} className="p-2 -ml-2">
+        <SpandukJedaHL />
+
+        <header className="flex items-center h-14 px-4 bg-white border-b border-gray-200 lg:hidden">
+          <button onClick={() => setSidebarOpen(true)} className="p-2 -ml-2 text-gray-600">
             <Menu className="w-5 h-5" />
           </button>
-          <h1 className="ml-2 text-lg font-bold text-indigo-600">SalesPintar</h1>
+          <h1 className="ml-2 text-base font-bold text-indigo-600">Cordova Inovasi</h1>
         </header>
 
         <main className="flex-1 overflow-auto p-6">
           {children}
         </main>
       </div>
+
+      <GlobalAgentWidget />
     </div>
   );
 }

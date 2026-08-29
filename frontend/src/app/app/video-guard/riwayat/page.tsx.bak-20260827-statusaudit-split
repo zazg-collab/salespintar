@@ -1,0 +1,240 @@
+'use client';
+
+import React, { useEffect, useMemo, useState } from 'react';
+import Link from 'next/link';
+import {
+  ArrowLeft,
+  Loader2,
+  CheckCircle2,
+  XCircle,
+  AlertTriangle,
+  Clock,
+  History,
+  FileText,
+  Image as ImageIcon,
+  Video,
+  Link as LinkIcon,
+  Eye,
+} from 'lucide-react';
+import { apiGet } from '../../../../lib/api';
+
+interface AuditRow {
+  id: string;
+  adTitle: string;
+  adName: string | null;
+  description: string | null;
+  channels: string[];
+  overallScore: number | null;
+  verdict: string | null;
+  channelsCompleted: number;
+  channelsTotal: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+const VERDICT_STYLE: Record<string, { label: string; className: string; icon: React.ElementType }> = {
+  APPROVED: { label: 'Disetujui', className: 'bg-emerald-100 text-emerald-700', icon: CheckCircle2 },
+  NEEDS_MINOR_TWEAK: { label: 'Perlu Klarifikasi', className: 'bg-amber-100 text-amber-700', icon: AlertTriangle },
+  HIGH_RISK_REJECT: { label: 'Ditolak', className: 'bg-rose-100 text-rose-700', icon: XCircle },
+  MANUAL_REVIEW: { label: 'Review Manual', className: 'bg-gray-200 text-gray-700', icon: AlertTriangle },
+};
+
+function VerdictBadge({ verdict }: { verdict: string | null }) {
+  if (!verdict) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-100 text-indigo-700">
+        <Clock className="w-3.5 h-3.5" /> Diproses
+      </span>
+    );
+  }
+  const style = VERDICT_STYLE[verdict] ?? VERDICT_STYLE.MANUAL_REVIEW;
+  const Icon = style.icon;
+  return (
+    <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold ${style.className}`}>
+      <Icon className="w-3.5 h-3.5" /> {style.label}
+    </span>
+  );
+}
+
+/** Risk tag di kolom "Skor Risiko" -- threshold PERSIS sama dgn score_to_verdict() Python
+ * (engine.py): >=80 Low, 60-79 Medium, <60 High. Ini murni presentasi skor yg sudah dihitung
+ * backend, bukan skor baru. */
+function riskTag(score: number | null): { label: string; className: string } {
+  if (score === null) return { label: '—', className: 'bg-gray-100 text-gray-400' };
+  if (score >= 80) return { label: 'Risiko Rendah', className: 'bg-emerald-50 text-emerald-700 border border-emerald-200' };
+  if (score >= 60) return { label: 'Risiko Sedang', className: 'bg-amber-50 text-amber-700 border border-amber-200' };
+  return { label: 'Risiko Tinggi', className: 'bg-rose-50 text-rose-700 border border-rose-200' };
+}
+
+/** Baris icon Text/Image/Video/Link (feedback Bossfren 2026-08-25, referensi AdGuardAI): 5 channel
+ * mentah backend (visual_motion/audio_speech/text_copy/thumbnail_image/landing_page) dipetakan ke 4
+ * tipe konten yg dilihat user. Video HIDUP kalau visual_motion ATAU audio_speech ada -- gabungan
+ * sengaja, krn dari sisi user "video dianalisis" itu satu konsep, bukan 2 baris terpisah. Icon abu +
+ * tooltip kalau channel itu TIDAK ada di rawReportJson (bukan sekadar "tidak ada asset" tapi juga
+ * mencakup video yg gagal diambil dari Meta -- root cause investigasi hari ini) -- ini pengganti
+ * kolom "Status" terpisah dari lanjutan #14, sekarang melebur ke baris icon ini sesuai referensi.
+ */
+function ContentTypeIcons({ channels }: { channels: string[] }) {
+  const has = (k: string) => channels.includes(k);
+  const items: { key: string; label: string; active: boolean; Icon: React.ElementType }[] = [
+    { key: 'text', label: 'Teks/Caption', active: has('text_copy_score'), Icon: FileText },
+    { key: 'image', label: 'Thumbnail/Gambar', active: has('thumbnail_image_score'), Icon: ImageIcon },
+    {
+      key: 'video',
+      label: 'Video (visual + audio)',
+      active: has('visual_motion_score') || has('audio_speech_score'),
+      Icon: Video,
+    },
+    { key: 'link', label: 'Landing Page', active: has('landing_page_score'), Icon: LinkIcon },
+  ];
+  return (
+    <div className="flex items-center gap-1.5 mt-1.5">
+      {items.map(({ key, label, active, Icon }) => (
+        <span
+          key={key}
+          title={active ? `${label} -- berhasil dianalisis` : `${label} -- TIDAK dianalisis (asset gagal diambil/tidak dilampirkan)`}
+          className={`inline-flex items-center justify-center w-5 h-5 rounded ${
+            active ? 'bg-indigo-100 text-indigo-600' : 'bg-gray-100 text-gray-300'
+          }`}
+        >
+          <Icon className="w-3 h-3" />
+        </span>
+      ))}
+    </div>
+  );
+}
+
+export default function RiwayatAuditPage() {
+  const [audits, setAudits] = useState<AuditRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [filter, setFilter] = useState<string>('ALL');
+
+  useEffect(() => {
+    apiGet<{ audits: AuditRow[] }>('/video-guard/history?take=200')
+      .then((res) => setAudits(res.audits))
+      .catch((e) => setError(e.message || 'Gagal memuat riwayat audit'));
+  }, []);
+
+  const stats = useMemo(() => {
+    if (!audits) return null;
+    const byVerdict: Record<string, number> = {};
+    for (const a of audits) {
+      const key = a.verdict ?? 'PROCESSING';
+      byVerdict[key] = (byVerdict[key] ?? 0) + 1;
+    }
+    return byVerdict;
+  }, [audits]);
+
+  const filtered = useMemo(() => {
+    if (!audits) return [];
+    if (filter === 'ALL') return audits;
+    if (filter === 'PROCESSING') return audits.filter((a) => !a.verdict);
+    return audits.filter((a) => a.verdict === filter);
+  }, [audits, filter]);
+
+  return (
+    <div className="max-w-6xl mx-auto space-y-6">
+      <Link href="/app/video-guard" className="inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700">
+        <ArrowLeft className="w-4 h-4" /> Kembali ke Dashboard
+      </Link>
+
+      <div>
+        <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2">
+          <History className="w-6 h-6 text-indigo-600" /> Riwayat Audit
+        </h1>
+        <p className="text-xs text-gray-500 mt-1">Semua audit video yang pernah dijalankan untuk business ini.</p>
+      </div>
+
+      {error && <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>}
+
+      {stats && (
+        <div className="flex flex-wrap gap-2">
+          {[
+            { key: 'ALL', label: `Semua (${audits?.length ?? 0})` },
+            { key: 'APPROVED', label: `Disetujui (${stats.APPROVED ?? 0})` },
+            { key: 'NEEDS_MINOR_TWEAK', label: `Perlu Klarifikasi (${stats.NEEDS_MINOR_TWEAK ?? 0})` },
+            { key: 'HIGH_RISK_REJECT', label: `Ditolak (${stats.HIGH_RISK_REJECT ?? 0})` },
+            { key: 'PROCESSING', label: `Diproses (${stats.PROCESSING ?? 0})` },
+          ].map((f) => (
+            <button
+              key={f.key}
+              onClick={() => setFilter(f.key)}
+              className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors ${
+                filter === f.key ? 'bg-indigo-600 border-indigo-600 text-white' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              {f.label}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {audits === null && !error && (
+        <div className="flex items-center gap-2 text-gray-500 text-sm py-12 justify-center">
+          <Loader2 className="w-4 h-4 animate-spin" /> Memuat riwayat…
+        </div>
+      )}
+
+      {audits !== null && (
+        <div className="bg-white rounded-2xl border border-gray-200 overflow-hidden">
+          {filtered.length === 0 ? (
+            <p className="text-sm text-gray-400 text-center py-10">Tidak ada audit pada kategori ini.</p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead className="bg-gray-50 text-gray-500 text-xs uppercase">
+                  <tr>
+                    <th className="text-left px-4 py-3 font-medium">Iklan</th>
+                    <th className="text-left px-4 py-3 font-medium">Status AI</th>
+                    <th className="text-left px-4 py-3 font-medium">Skor Risiko</th>
+                    <th className="text-left px-4 py-3 font-medium">Dibuat</th>
+                    <th className="text-left px-4 py-3 font-medium">Aksi</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {filtered.map((a) => {
+                    const risk = riskTag(a.overallScore);
+                    return (
+                      <tr key={a.id} className="hover:bg-gray-50">
+                        <td className="px-4 py-3 max-w-sm">
+                          <Link
+                            href={`/app/video-guard/audit/${a.id}`}
+                            className="block font-medium text-gray-800 hover:text-emerald-600 transition-colors truncate"
+                          >
+                            {a.adName || a.adTitle}
+                          </Link>
+                          {a.description && (
+                            <p className="text-xs text-gray-400 mt-0.5 truncate">{a.description}</p>
+                          )}
+                          <ContentTypeIcons channels={a.channels} />
+                        </td>
+                        <td className="px-4 py-3"><VerdictBadge verdict={a.verdict} /></td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <span className="text-gray-700 font-semibold">{a.overallScore ?? '—'}</span>
+                            <span className={`inline-flex px-2 py-0.5 rounded-full text-[10px] font-semibold ${risk.className}`}>
+                              {risk.label}
+                            </span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-gray-400 text-xs">{new Date(a.createdAt).toLocaleString('id-ID')}</td>
+                        <td className="px-4 py-3">
+                          <Link
+                            href={`/app/video-guard/audit/${a.id}`}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-lg text-xs font-semibold bg-indigo-50 text-indigo-700 hover:bg-indigo-100 transition-colors"
+                          >
+                            <Eye className="w-3.5 h-3.5" /> Lihat
+                          </Link>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}

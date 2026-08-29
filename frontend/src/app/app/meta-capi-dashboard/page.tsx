@@ -1,0 +1,3987 @@
+'use client';
+
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import Link from 'next/link';
+import { getJakartaTodayStr, getJakartaOffsetStr, getJakartaFirstDayOfMonthStr } from '../../../lib/date';
+import { apiGet, apiPost, apiPatch } from '../../../lib/api';
+import BudgetWasteEmqCard from '../../../components/meta-capi/BudgetWasteEmqCard';
+import { openGlobalAgentWithMessage } from '../../../lib/globalAgentBus';
+import { useAuthStore } from '../../../stores/auth';
+import {
+  BarChart3,
+  Users,
+  MessageCircle,
+  ShoppingCart,
+  BadgeDollarSign,
+  TrendingUp,
+  RefreshCw,
+  Calendar,
+  AlertCircle,
+  Target,
+  Megaphone,
+  CheckCircle2,
+  ArrowRight,
+  ShieldCheck,
+  Layers,
+  Search,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  Filter,
+  X,
+  Building2,
+  CreditCard,
+  MapPin,
+  LayoutGrid,
+  Bot,
+  Send,
+  Loader2,
+  Play,
+  Image as ImageIcon,
+  Video,
+  ExternalLink,
+  Sparkles,
+  Flame,
+  Pencil,
+} from 'lucide-react';
+
+interface CampaignPerformance {
+  campaignId: string;
+  campaignName: string;
+  accountName?: string;
+  accountId?: string;
+  bmId?: string | null;
+  picName: string;
+  status: string;
+  spend: number;
+  dailyBudget?: number | null;
+  clicks: number;
+  ctr: number;
+  frequency: number;
+  impressions: number;
+  leads: number;
+  closing: number;
+  omset: number;
+  roas: number;
+  cpr?: number;
+  cpp?: number;
+  objective?: string;
+  actions?: { action_type: string; value: string }[];
+  cost_per_action_type?: { action_type: string; value: string }[];
+  // [2026-08-26] Dihitung backend (meta-result-resolver.service.ts) -- satu sumber kebenaran,
+  // JANGAN dihitung ulang di frontend. Optional krn payload lama/cache transisi mungkin belum punya ini.
+  resultValue?: number;
+  cprValue?: number;
+  resultLabel?: string;
+  badgeLabel?: string;
+  matchedType?: 'purchase' | 'addToCart' | 'lead' | 'msg' | 'click' | 'engage';
+  resultSource?: 'ground_truth' | 'heuristic_objective';
+}
+
+interface BestDayData {
+  days: any[];
+  bestDay: string | null;
+  lowDayName: string | null;
+  recommendation: string;
+}
+
+interface TopCreative {
+  adId: string;
+  adName: string;
+  campaignName: string;
+  spend: number;
+  ctr: number;
+  impressions: number;
+  qualityRanking: string;
+  engagementRanking: string;
+  conversionRanking: string;
+  thumbnailUrl: string | null;
+  mediaType?: 'VIDEO' | 'IMAGE';
+  adTitle?: string;
+  adBody?: string;
+  previewIframe?: string | null;
+}
+
+
+interface FatigueAd {
+  adId: string;
+  adName: string;
+  campaignName: string;
+  qualityRanking: string;
+  engagementRanking: string;
+  conversionRanking: string;
+  currentFrequency: number;
+  totalImpressions: number;
+  totalClicks: number;
+  totalSpend: number;
+  weekCount: number;
+  computedDecay: { reachDecay: string; ctrDecay: string; cpmCreep: string; notes: string };
+  signals: {
+    frequency: { score: number; reading: string; thresholdBreached: boolean };
+    ctrDecay: { score: number; reading: string; thresholdBreached: boolean };
+    cpmIncrease: { score: number; reading: string; thresholdBreached: boolean };
+    creativeLifespan: { score: number; reading: string; thresholdBreached: boolean };
+  };
+  severityOverall: 'none' | 'mild' | 'moderate' | 'severe';
+  severityReason: string;
+  thumbnailUrl: string | null;
+  mediaType?: 'VIDEO' | 'IMAGE';
+  adTitle?: string;
+  adBody?: string;
+  previewIframe?: string | null;
+  daysRunning?: number | null;
+}
+
+
+interface CampaignAdCtr extends TopCreative {
+  deltaFromAvgPct: number;
+}
+
+interface BudgetFacts {
+  campaignId: string;
+  campaignName: string;
+  status: string;
+  objective: string;
+  budgetLevel: 'CBO' | 'ABO' | 'UNKNOWN';
+  targetObjectId: string | null;
+  targetLevel: 'CAMPAIGN' | 'ADSET' | null;
+  currentDailyBudget: number | null;
+  bidStrategy: { raw: string | null; label: string };
+  editableBudget: boolean;
+  editableReason: string;
+  today: { date: string; spend: number; clicks: number; impressions: number; ctr: number; frequency: number; cpr: number; result: number; resultLabel: string; badgeLabel: string };
+  avg7d: { spend: number; clicks: number; impressions: number; ctr: number; frequency: number; cpr: number; result: number; weeklyConversions: number; resultLabel: string; badgeLabel: string };
+  roas: { today: number; avg7d: number } | null;
+  cprDeltaPct: number | null;
+  ctrDeltaPct: number | null;
+  frequencyFlag: boolean;
+  verdict: string;
+  verdictReason: string;
+  suggestedDailyBudget: number | null;
+  fetchedAt: string;
+  warnings: string[];
+}
+
+
+interface BreakdownsData {
+  geographic: { location: string; spend: number; clicks: number; ctr?: number; cpc?: number }[];
+  placement: { placement: string; spend: number; clicks: number; ctr?: number; cpc?: number }[];
+}
+
+interface MetaAdsPerformance {
+  execSummary: {
+    totalOmset: number;
+    totalSpend: number;
+    realRoas: number;
+    accountStatus: string;
+    totalBm?: number;
+    activeBm?: number;
+    errorBm?: number;
+    bmSummaryText?: string;
+  };
+  picScorecard: {
+    picName: string;
+    spend: number;
+    omset: number;
+    closing: number;
+    roas: number;
+    cpp: number;
+    cpr: number;
+    result: number;
+  }[];
+  campaignTable: CampaignPerformance[];
+  funnelStats: {
+    eventLabels?: {
+      step1: string;
+      step2: string;
+      step3: string;
+      step4: string;
+    };
+    viewContent: number;
+    lead: number;
+    hot?: number;
+    addToCart: number;
+    purchase: number;
+  };
+}
+
+interface CampaignAuditToday {
+  date: string;
+  spend: number;
+  clicks: number;
+  impressions: number;
+  ctr: number;
+  frequency: number;
+  leads: number;
+  closing: number;
+  omset: number;
+  roas: number;
+  cpr: number;
+  cpp: number;
+  result: number;
+  resultLabel: string;
+  badgeLabel: string;
+}
+
+interface CampaignAuditFacts {
+  campaignName: string;
+  status: string;
+  today: CampaignAuditToday;
+  avg7d: CampaignAuditToday;
+  funnel: {
+    todayClickToLeadRatePct: number;
+    avg7dClickToLeadRatePct: number;
+    todayLeadToCloseRatePct: number;
+    avg7dLeadToCloseRatePct: number;
+    weakestStage: 'ads' | 'landing_lead' | 'cs_closing' | 'none';
+  };
+  delivery: {
+    dailyBudget: number | null;
+    spendTodayPct: number | null;
+    learningPhase: 'LEARNING' | 'FAIL' | 'ACTIVE' | 'UNKNOWN';
+    frequencyFlag: boolean;
+  };
+  verdict: 'SCALE' | 'MAINTAIN' | 'ATTENTION' | 'BELUM_CUKUP_DATA';
+  verdictReason: string;
+  fetchedAt: string;
+  warnings: string[];
+}
+
+const VERDICT_BADGE: Record<string, { emoji: string; label: string; className: string }> = {
+  SCALE: { emoji: '🚀', label: 'Layak Scale', className: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
+  MAINTAIN: { emoji: '🟢', label: 'Sehat, Pertahankan', className: 'bg-blue-50 text-blue-700 border-blue-200' },
+  ATTENTION: { emoji: '⚠️', label: 'Perlu Perhatian', className: 'bg-rose-50 text-rose-700 border-rose-200' },
+  BELUM_CUKUP_DATA: { emoji: 'ℹ️', label: 'Data Belum Cukup', className: 'bg-gray-50 text-gray-600 border-gray-200' },
+};
+
+const WEAKEST_LABEL: Record<string, string> = {
+  ads: 'Kualitas Iklan/Audiens',
+  landing_lead: 'Landing Page / Form',
+  cs_closing: 'Follow-up CS',
+  none: 'Tidak ada tahap yang menonjol turun',
+};
+
+const LEARNING_LABEL: Record<string, string> = {
+  LEARNING: 'Masih Learning Phase',
+  FAIL: 'Gagal Keluar Learning Phase (perlu perhatian)',
+  ACTIVE: 'Sudah Keluar Learning (Stabil)',
+  UNKNOWN: 'Status Learning Tidak Diketahui',
+};
+
+function formatRp(n: number): string {
+  return `Rp${Math.round(n).toLocaleString('id-ID')}`;
+}
+
+// [2026-08-25] Dipakai HealthScorePopup & CampaignAuditModal (Lapis 2) -- format jam "terakhir
+// update" utk cache Health Score / Audit AI supaya Bossfren tau kapan hasil ini dihitung, TIDAK
+// dikira live/baru dihitung ulang tiap popup dibuka.
+function formatLastUpdated(iso: string | null | undefined): string {
+  if (!iso) return '-';
+  try {
+    return new Date(iso).toLocaleString('id-ID', { dateStyle: 'medium', timeStyle: 'short' });
+  } catch {
+    return iso;
+  }
+}
+
+/**
+ * Parser inline utk teks Markdown ringan dari AI (agy): **bold**, *italic*, `code`.
+ * BUKAN library CommonMark penuh -- cukup utk pola yang konsisten dipakai output agy
+ * (heading/bold/italic/list/hr), dipakai bareng AiMarkdown() di bawah.
+ */
+function renderInlineMarkdown(text: string, keyPrefix: string): React.ReactNode[] {
+  const parts = text.split(/(\*\*[^*]+\*\*|`[^`]+`|\*[^*]+\*)/g);
+  return parts.filter((p) => p !== '').map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**')) {
+      return <strong key={`${keyPrefix}-b-${i}`} className="font-bold">{part.slice(2, -2)}</strong>;
+    }
+    if (part.startsWith('`') && part.endsWith('`')) {
+      return <code key={`${keyPrefix}-c-${i}`} className="bg-indigo-100 text-indigo-900 rounded px-1 py-0.5 font-mono text-[11px]">{part.slice(1, -1)}</code>;
+    }
+    if (part.startsWith('*') && part.endsWith('*') && part.length > 2) {
+      return <em key={`${keyPrefix}-i-${i}`}>{part.slice(1, -1)}</em>;
+    }
+    return part;
+  });
+}
+
+/**
+ * [2026-08-26] Bossfren lapor styling "Analisa Senior Media Buyer (AI)" berantakan --
+ * teks Markdown dari agy (###, **bold**, ---, list) sebelumnya ditumpahkan mentah lewat
+ * <p whitespace-pre-wrap>, jadi tanda Markdown-nya kelihatan literal di layar bukannya
+ * dirender. Renderer ringan ini (bukan library CommonMark, sengaja kecil+self-contained
+ * biar nggak nambah dependency npm) menangani heading #-######, hr ---/===, list (bullet -, angka 1.)
+ * (termasuk baris lanjutan yang menempel ke item terakhir), dan paragraf biasa.
+ */
+function AiMarkdown({ text, className }: { text: string; className?: string }) {
+  const lines = text.split('\n');
+  const blocks: React.ReactNode[] = [];
+  let i = 0;
+  let paraBuf: string[] = [];
+  const flushPara = () => {
+    if (paraBuf.length) {
+      blocks.push(
+        <p key={`p-${blocks.length}`} className="mb-2 last:mb-0">
+          {renderInlineMarkdown(paraBuf.join(' '), `p-${blocks.length}`)}
+        </p>
+      );
+      paraBuf = [];
+    }
+  };
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    if (line === '') {
+      flushPara();
+      i++;
+      continue;
+    }
+    const headingMatch = line.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      flushPara();
+      const level = headingMatch[1].length;
+      blocks.push(
+        <h4 key={`h-${blocks.length}`} className={`font-bold text-indigo-950 mt-3 mb-1 first:mt-0 ${level <= 2 ? 'text-sm' : 'text-xs'}`}>
+          {renderInlineMarkdown(headingMatch[2], `h-${blocks.length}`)}
+        </h4>
+      );
+      i++;
+      continue;
+    }
+    if (/^-{3,}$/.test(line) || /^={3,}$/.test(line)) {
+      flushPara();
+      blocks.push(<hr key={`hr-${blocks.length}`} className="border-indigo-200 my-2" />);
+      i++;
+      continue;
+    }
+    const bulletMatch = line.match(/^[*-]\s+(.*)$/);
+    const numberedMatch = line.match(/^\d+\.\s+(.*)$/);
+    if (bulletMatch || numberedMatch) {
+      flushPara();
+      const isOrdered = Boolean(numberedMatch);
+      const items: string[] = [(bulletMatch || numberedMatch)![1]];
+      i++;
+      while (i < lines.length) {
+        const cur = lines[i].trim();
+        const curBullet = cur.match(/^[*-]\s+(.*)$/);
+        const curNumbered = cur.match(/^\d+\.\s+(.*)$/);
+        if (isOrdered && curNumbered) {
+          items.push(curNumbered[1]);
+          i++;
+        } else if (!isOrdered && curBullet) {
+          items.push(curBullet[1]);
+          i++;
+        } else if (cur !== '' && !curBullet && !curNumbered && !/^(#{1,6})\s/.test(cur) && !/^-{3,}$/.test(cur)) {
+          items[items.length - 1] += ' ' + cur;
+          i++;
+        } else {
+          break;
+        }
+      }
+      const ListTag = isOrdered ? 'ol' : 'ul';
+      blocks.push(
+        <ListTag key={`l-${blocks.length}`} className={`${isOrdered ? 'list-decimal' : 'list-disc'} pl-4 space-y-1 mb-2`}>
+          {items.map((it, idx) => (
+            <li key={idx}>{renderInlineMarkdown(it, `li-${blocks.length}-${idx}`)}</li>
+          ))}
+        </ListTag>
+      );
+      continue;
+    }
+    paraBuf.push(line);
+    i++;
+  }
+  flushPara();
+  return <div className={className}>{blocks}</div>;
+}
+
+// [2026-08-27] Loading indicator custom: grid titik 3x3 biru berkedip gantian (request Bossfren,
+// pengganti Loader2 muter di teks "Memuat data leaderboard..." / "Memuat data kampanye...").
+function DotGridLoader({ className = '' }: { className?: string }) {
+  return (
+    <span className={`inline-grid grid-cols-3 gap-0.5 w-3.5 h-3.5 shrink-0 ${className}`}>
+      {Array.from({ length: 9 }).map((_, i) => (
+        <span
+          key={i}
+          className="w-1 h-1 rounded-[1px] bg-blue-600 animate-pulse"
+          style={{ animationDelay: `${((i % 3) + Math.floor(i / 3)) * 90}ms`, animationDuration: '900ms' }}
+        />
+      ))}
+    </span>
+  );
+}
+
+function MetricCell({ label, today, avg, flag }: { label: string; today: string; avg: string; flag?: boolean }) {
+  return (
+    <div className={`rounded-lg p-2 border ${flag ? 'bg-amber-50 border-amber-200' : 'bg-gray-50 border-gray-100'}`}>
+      <div className="text-[10px] text-gray-500">{label}</div>
+      <div className="font-bold text-gray-900">{today}</div>
+      <div className="text-[10px] text-gray-400">rata2 7hr: {avg}</div>
+    </div>
+  );
+}
+
+/**
+ * Popup "Audit AI" per campaign (Fase 3 Langkah 3 redesign, 2026-08-24).
+ *
+ * Awalnya dibangun sebagai drawer chat kosong (advertiser harus mikir mau
+ * nanya apa duluan) -- setelah didiskusikan ulang, urutannya dibalik: klik
+ * tombol LANGSUNG audit instan (Lapis 1, fakta murni Node+Meta API+DB,
+ * <2 detik) diikuti analisa AI gaya senior media buyer (Lapis 2, lewat agy,
+ * bisa 1-5 menit) yang menafsirkan fakta yang SAMA yang sudah ditampilkan.
+ * Chat bebas (Copilot) jadi fitur SEKUNDER di bagian bawah popup, buat
+ * follow-up kalau audit otomatisnya belum cukup jelas.
+ */
+function CampaignAuditModal({ campaign, onClose }: { campaign: CampaignPerformance; onClose: () => void }) {
+  const [facts, setFacts] = useState<CampaignAuditFacts | null>(null);
+  const [factsLoading, setFactsLoading] = useState(true);
+  const [factsError, setFactsError] = useState('');
+
+  // [2026-08-25] Redesign Bossfren: Lapis 2 (agy) sekarang cache+refresh, bukan compute-tiap-buka.
+  // Lapis 1 (facts) di atas TETAP live/tidak berubah sama sekali, sesuai instruksi eksplisit Bossfren.
+  const [insightCache, setInsightCache] = useState<{
+    status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+    insight: string | null;
+    errorMessage: string | null;
+    lastRequestedAt: string | null;
+    lastCompletedAt: string | null;
+  } | null>(null);
+  const [insightAgyBusy, setInsightAgyBusy] = useState(false);
+  const [insightCooldownSec, setInsightCooldownSec] = useState(0);
+  const [insightRefreshMsg, setInsightRefreshMsg] = useState('');
+  const [insightLoading, setInsightLoading] = useState(false);
+  const [insightError, setInsightError] = useState('');
+
+  const fetchInsightCache = useCallback(async () => {
+    try {
+      const res = await apiGet<{
+        cache: {
+          status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+          insight: string | null;
+          errorMessage: string | null;
+          lastRequestedAt: string | null;
+          lastCompletedAt: string | null;
+        } | null;
+        agyBusy: boolean;
+        cooldownRemainingSec: number;
+      }>(`/ai-ads/campaign-audit-insight/cache?campaignId=${encodeURIComponent(campaign.campaignId)}`);
+      setInsightCache(res.cache);
+      setInsightAgyBusy(res.agyBusy);
+      setInsightCooldownSec(res.cooldownRemainingSec);
+      return res.cache;
+    } catch (e: any) {
+      setInsightError(e?.message || 'Gagal memuat cache analisa AI.');
+      return null;
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [campaign.campaignId]);
+
+  async function triggerInsight(factsForPrompt: CampaignAuditFacts) {
+    try {
+      const res = await apiPost<{ queued: boolean; busy?: boolean; cooldown?: boolean; message: string }>(
+        '/ai-ads/campaign-audit-insight',
+        { objectId: campaign.campaignId, objectName: campaign.campaignName, facts: factsForPrompt }
+      );
+      setInsightRefreshMsg(res.message);
+      fetchInsightCache();
+    } catch (e: any) {
+      setInsightError(e?.message || 'Gagal memicu analisa AI.');
+    }
+  }
+
+  function handleInsightRefreshClick() {
+    if (!facts) return;
+    setInsightRefreshMsg('');
+    setInsightError('');
+    triggerInsight(facts);
+  }
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      setFactsLoading(true);
+      setFactsError('');
+      try {
+        const res = await apiPost<{ facts: CampaignAuditFacts }>('/ai-ads/campaign-audit-facts', {
+          objectId: campaign.campaignId,
+          objectName: campaign.campaignName,
+        });
+        if (cancelled) return;
+        setFacts(res.facts);
+        setFactsLoading(false);
+
+        setInsightLoading(true);
+        const cache = await fetchInsightCache();
+        if (cancelled) return;
+        setInsightLoading(false);
+        // [2026-08-25] Belum PERNAH ada cache -- auto-trigger SEKALI biar popup gak kosong
+        // melompong selamanya. Kalau cache SUDAH ada, TIDAK auto-refresh -- Bossfren yang pencet
+        // tombol Refresh manual (desain: "baru selanjutnya kalau dibuka lagi langsung nongol cache").
+        if (!cache) {
+          triggerInsight(res.facts);
+        }
+      } catch (e: any) {
+        if (!cancelled) {
+          setFactsError(e?.message || 'Gagal memuat data audit.');
+          setFactsLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [campaign.campaignId]);
+
+  // Poll selagi status RUNNING -- popup update otomatis begitu job background selesai.
+  useEffect(() => {
+    if (insightCache?.status !== 'RUNNING') return;
+    const interval = setInterval(fetchInsightCache, 6000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [insightCache?.status]);
+
+  /**
+   * [Langkah C] Susun pesan pembuka berisi ringkasan Audit AI campaign ini (verdict, funnel,
+   * metrik hari-ini-vs-rata7hari, analisa AI yang sudah ada) untuk di-suntik sebagai pesan
+   * pertama ke Agent Workspace global -- ganti mini-chat Copilot yang dulu nempel di modal ini.
+   */
+  function buildCampaignContextMessage(): string {
+    if (!facts) return `Lanjut ngobrol soal campaign "${campaign.campaignName}".`;
+    const v = VERDICT_BADGE[facts.verdict];
+    const lines = [
+      `Lanjut ngobrol soal hasil Audit AI campaign "${facts.campaignName}":`,
+      '',
+      `Verdict: ${v.emoji} ${v.label} -- ${facts.verdictReason}`,
+      `Funnel hari ini: Impresi ${facts.today.impressions.toLocaleString('id-ID')}, Klik ${facts.today.clicks.toLocaleString('id-ID')}, Leads ${facts.today.leads}, Closing ${facts.today.closing}`,
+      `Metrik hari ini: Spend ${formatRp(facts.today.spend)}, CPR ${formatRp(facts.today.cpr)}, ROAS ${facts.today.roas.toFixed(2)}x, CTR ${facts.today.ctr.toFixed(2)}%`,
+      `Status: ${LEARNING_LABEL[facts.delivery.learningPhase]}`,
+    ];
+    if (insightCache?.insight) {
+      lines.push('', 'Analisa Senior Media Buyer (AI) sebelumnya:', insightCache.insight);
+    }
+    lines.push('', 'Pertanyaan saya: ');
+    return lines.join('\n');
+  }
+
+  function lanjutNgobrol() {
+    openGlobalAgentWithMessage(buildCampaignContextMessage());
+    onClose();
+  }
+
+  const verdictInfo = facts ? VERDICT_BADGE[facts.verdict] : null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/40 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto border border-gray-200">
+        <div className="p-4 border-b border-gray-100 flex justify-between items-start gap-2 sticky top-0 bg-white z-10">
+          <div>
+            <h3 className="font-bold text-gray-900 text-sm flex items-center gap-2">
+              <span className="text-xl">🔍</span> Audit AI
+            </h3>
+            <p className="text-xs text-gray-500 mt-0.5">{campaign.campaignName}</p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-5 space-y-5">
+          {factsLoading && (
+            <div className="text-sm text-gray-400 flex items-center gap-2 py-6 justify-center">
+              <Loader2 className="w-4 h-4 animate-spin" /> Menarik data live dari Meta &amp; funnel CS...
+            </div>
+          )}
+          {factsError && <p className="text-sm text-red-600">{factsError}</p>}
+
+          {facts && (
+            <>
+              {verdictInfo && (
+                <div className={`rounded-xl border p-3 flex items-start gap-2 ${verdictInfo.className}`}>
+                  <span className="text-xl leading-none">{verdictInfo.emoji}</span>
+                  <div>
+                    <div className="font-bold text-sm">{verdictInfo.label}</div>
+                    <div className="text-xs mt-0.5">{facts.verdictReason}</div>
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-2">Funnel Hari Ini</h4>
+                <div className="grid grid-cols-4 gap-2 text-center">
+                  <div className="bg-gray-50 rounded-lg p-2 border border-gray-100">
+                    <div className="text-[10px] text-gray-500">Impresi</div>
+                    <div className="font-bold text-sm text-gray-900">{new Intl.NumberFormat('id-ID').format(facts.today.impressions)}</div>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-2 border border-gray-100">
+                    <div className="text-[10px] text-gray-500">Klik ({facts.today.ctr.toFixed(2)}%)</div>
+                    <div className="font-bold text-sm text-gray-900">{new Intl.NumberFormat('id-ID').format(facts.today.clicks)}</div>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-2 border border-gray-100">
+                    <div className="text-[10px] text-gray-500">Leads ({facts.funnel.todayClickToLeadRatePct.toFixed(1)}%)</div>
+                    <div className="font-bold text-sm text-gray-900">{facts.today.leads}</div>
+                  </div>
+                  <div className="bg-gray-50 rounded-lg p-2 border border-gray-100">
+                    <div className="text-[10px] text-gray-500">Closing ({facts.funnel.todayLeadToCloseRatePct.toFixed(1)}%)</div>
+                    <div className="font-bold text-sm text-gray-900">{facts.today.closing}</div>
+                  </div>
+                </div>
+                {facts.funnel.weakestStage !== 'none' && (
+                  <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded p-2 mt-2">
+                    Tahap paling melemah: <strong>{WEAKEST_LABEL[facts.funnel.weakestStage]}</strong> (dibanding rata-rata 7 hari)
+                  </p>
+                )}
+              </div>
+
+              <div>
+                <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-2">
+                  Hari Ini vs Rata-rata 7 Hari
+                </h4>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
+                  <MetricCell label="Spend" today={formatRp(facts.today.spend)} avg={formatRp(facts.avg7d.spend)} />
+                  <MetricCell
+                    label={facts.today.resultLabel && facts.today.resultLabel !== '-' ? `Result (${facts.today.resultLabel})` : 'Result'}
+                    today={`${Math.round(facts.today.result)}`}
+                    avg={facts.avg7d.result.toFixed(1)}
+                  />
+                  <MetricCell
+                    label={facts.today.badgeLabel && facts.today.badgeLabel !== '-' ? `CPR (${facts.today.badgeLabel})` : 'CPR'}
+                    today={formatRp(facts.today.cpr)}
+                    avg={formatRp(facts.avg7d.cpr)}
+                  />
+                  <MetricCell label="Closing (WA)" today={`${facts.today.closing}`} avg={facts.avg7d.closing.toFixed(1)} />
+                  <MetricCell label="CPP (Closing WA)" today={formatRp(facts.today.cpp)} avg={formatRp(facts.avg7d.cpp)} />
+                  <MetricCell label="ROAS" today={`${facts.today.roas.toFixed(2)}x`} avg={`${facts.avg7d.roas.toFixed(2)}x`} />
+                  <MetricCell label="CTR" today={`${facts.today.ctr.toFixed(2)}%`} avg={`${facts.avg7d.ctr.toFixed(2)}%`} />
+                  <MetricCell
+                    label="Frequency"
+                    today={`${facts.today.frequency.toFixed(2)}x`}
+                    avg={`${facts.avg7d.frequency.toFixed(2)}x`}
+                    flag={facts.delivery.frequencyFlag}
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap gap-2 text-xs">
+                <span className="px-2 py-1 rounded-full bg-gray-100 text-gray-700 border border-gray-200">
+                  {LEARNING_LABEL[facts.delivery.learningPhase]}
+                </span>
+                {facts.delivery.spendTodayPct !== null && (
+                  <span className="px-2 py-1 rounded-full bg-gray-100 text-gray-700 border border-gray-200">
+                    Pacing: {facts.delivery.spendTodayPct.toFixed(0)}% budget harian
+                  </span>
+                )}
+              </div>
+
+              {facts.warnings.length > 0 && <p className="text-[11px] text-gray-400">{facts.warnings.join(' ')}</p>}
+
+              <div className="bg-indigo-50 rounded-xl border border-indigo-100 p-3">
+                <div className="flex items-center justify-between gap-2 mb-1 flex-wrap">
+                  <h4 className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
+                    <Bot className="w-3.5 h-3.5" /> Analisa Senior Media Buyer (AI)
+                  </h4>
+                  <button
+                    onClick={handleInsightRefreshClick}
+                    disabled={insightAgyBusy || insightCooldownSec > 0 || insightCache?.status === 'RUNNING' || !facts}
+                    className="flex items-center gap-1 text-[10px] font-semibold text-indigo-700 hover:text-indigo-900 disabled:opacity-40 disabled:cursor-not-allowed border border-indigo-200 hover:border-indigo-300 rounded-full px-2 py-0.5 transition-colors"
+                    title="Hitung ulang analisa AI (ada jeda antar refresh)"
+                  >
+                    <RefreshCw className="w-3 h-3" /> Refresh
+                  </button>
+                </div>
+                <p className="text-[10px] text-indigo-400 mb-1.5">
+                  Terakhir update:{' '}
+                  {insightCache?.lastCompletedAt
+                    ? formatLastUpdated(insightCache.lastCompletedAt)
+                    : insightCache?.status === 'RUNNING'
+                    ? 'sedang dianalisa...'
+                    : '-'}
+                </p>
+                {insightLoading && (
+                  <div className="text-xs text-indigo-700 flex items-center gap-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Memuat cache analisa AI...
+                  </div>
+                )}
+                {!insightLoading && insightCache?.status === 'RUNNING' && (
+                  <div className="text-xs text-indigo-700 flex items-center gap-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Sedang menganalisa di server (bisa sampai beberapa
+                    menit) -- popup ini update otomatis begitu selesai.
+                  </div>
+                )}
+                {insightCache?.status === 'ERROR' && (
+                  <p className="text-xs text-red-600">Percobaan terakhir gagal: {insightCache.errorMessage || 'Tidak diketahui.'}</p>
+                )}
+                {insightError && <p className="text-xs text-red-600">{insightError}</p>}
+                {insightCache?.insight && (
+                  <AiMarkdown text={insightCache.insight} className="text-xs text-indigo-900 leading-relaxed" />
+                )}
+                {insightAgyBusy && (
+                  <p className="text-[10px] text-amber-600 mt-1">Masih ada proses lain jalan di server -- tunggu dulu.</p>
+                )}
+                {!insightAgyBusy && insightCooldownSec > 0 && (
+                  <p className="text-[10px] text-indigo-400 mt-1">Bisa refresh lagi dalam ~{Math.ceil(insightCooldownSec / 60)} menit.</p>
+                )}
+                {insightRefreshMsg && <p className="text-[10px] text-indigo-500 mt-1">{insightRefreshMsg}</p>}
+              </div>
+
+              <div>
+                <h4 className="text-xs font-bold text-gray-500 uppercase tracking-wide mb-2">Masih Ada Pertanyaan?</h4>
+                <button
+                  onClick={lanjutNgobrol}
+                  disabled={!facts}
+                  className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold py-2.5 rounded-lg transition-colors"
+                  title="Buka Agent Workspace dengan konteks audit campaign ini sudah otomatis ke-suntik"
+                >
+                  <Send className="w-3.5 h-3.5" />
+                  Lanjut Ngobrol di Agent Workspace
+                </button>
+                <p className="text-[10px] text-gray-400 mt-1.5 text-center">
+                  Ringkasan audit campaign ini otomatis dikirim sebagai pesan pembuka di Agent Workspace (widget pojok kanan bawah).
+                </p>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// [2026-08-25] Popup Health Score & Quick Wins -- pindahan dari Blok 3 halaman standalone
+// /app/ai-ads (brainstorming Bossfren: satu popup per akun iklan, dipicu klik kolom "Akun Iklan"
+// di tabel campaign, dibagi bareng semua campaign di akun itu). Cache-first: baca hasil terakhir +
+// jam update langsung pas dibuka, TIDAK compute ulang tiap kali. Refresh manual dgn cooldown +
+// deteksi busy instan (lihat REFRESH_COOLDOWN_MS & busy-tracker di ai-ads.routes.ts).
+function HealthScorePopup({ campaign, onClose }: { campaign: CampaignPerformance; onClose: () => void }) {
+  const [cacheData, setCacheData] = useState<{
+    status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+    result: any;
+    errorMessage: string | null;
+    lastRequestedAt: string | null;
+    lastCompletedAt: string | null;
+  } | null>(null);
+  const [agyBusy, setAgyBusy] = useState(false);
+  const [cooldownRemainingSec, setCooldownRemainingSec] = useState(0);
+  const [loadingCache, setLoadingCache] = useState(true);
+  const [refreshMsg, setRefreshMsg] = useState('');
+  const [refreshError, setRefreshError] = useState('');
+
+  const bmId = campaign.bmId || '';
+  const adAccountId = campaign.accountId || '';
+
+  const fetchCache = useCallback(async () => {
+    if (!bmId || !adAccountId) return;
+    try {
+      const res = await apiGet<{
+        cache: {
+          status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+          result: any;
+          errorMessage: string | null;
+          lastRequestedAt: string | null;
+          lastCompletedAt: string | null;
+        } | null;
+        agyBusy: boolean;
+        cooldownRemainingSec: number;
+      }>(`/ai-ads/health-score/cache?bmId=${encodeURIComponent(bmId)}&platform=meta&adAccountId=${encodeURIComponent(adAccountId)}`);
+      setCacheData(res.cache);
+      setAgyBusy(res.agyBusy);
+      setCooldownRemainingSec(res.cooldownRemainingSec);
+    } catch (e) {
+      // Diamkan -- popup tetap tampil dgn state terakhir yg berhasil dimuat.
+    } finally {
+      setLoadingCache(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bmId, adAccountId]);
+
+  useEffect(() => {
+    fetchCache();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [bmId, adAccountId]);
+
+  // Poll selagi status RUNNING -- popup update otomatis begitu job background selesai.
+  useEffect(() => {
+    if (cacheData?.status !== 'RUNNING') return;
+    const interval = setInterval(fetchCache, 6000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cacheData?.status]);
+
+  async function handleRefresh() {
+    setRefreshError('');
+    setRefreshMsg('');
+    try {
+      const res = await apiPost<{ queued: boolean; busy?: boolean; cooldown?: boolean; retryAfterSec?: number; message: string }>(
+        '/ai-ads/health-score',
+        { bmId, platform: 'meta', adAccountId }
+      );
+      setRefreshMsg(res.message);
+      fetchCache();
+    } catch (e: any) {
+      setRefreshError(e?.message || 'Gagal memicu refresh.');
+    }
+  }
+
+  const isRunning = cacheData?.status === 'RUNNING';
+  const canRefresh = !agyBusy && cooldownRemainingSec <= 0 && !isRunning && !!bmId;
+  const result = cacheData?.result;
+  const score = result?.score;
+  const scoreColor =
+    typeof score === 'number' ? (score >= 80 ? 'text-emerald-600' : score >= 60 ? 'text-amber-600' : 'text-red-600') : 'text-gray-400';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/40 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-xl max-w-2xl w-full max-h-[90vh] overflow-y-auto border border-gray-200">
+        <div className="p-4 border-b border-gray-100 flex justify-between items-start gap-2 sticky top-0 bg-white z-10">
+          <div>
+            <h3 className="font-bold text-gray-900 text-sm flex items-center gap-2">
+              <Building2 className="w-4 h-4 text-indigo-600" /> Health Score &amp; Quick Wins
+            </h3>
+            <p className="text-xs text-gray-500 mt-0.5">
+              {campaign.accountName} ({adAccountId})
+            </p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="p-5 space-y-4">
+          {!bmId && (
+            <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded p-3">
+              Akun iklan ini belum punya data bmId (baris lama sebelum kolom ini ditambahkan) -- refresh
+              halaman dashboard-nya dulu.
+            </p>
+          )}
+
+          {loadingCache && (
+            <div className="text-sm text-gray-400 flex items-center gap-2 py-6 justify-center">
+              <Loader2 className="w-4 h-4 animate-spin" /> Memuat cache Health Score...
+            </div>
+          )}
+
+          {!loadingCache && !cacheData && bmId && (
+            <p className="text-sm text-gray-500 py-4 text-center">
+              Belum pernah dihitung. Klik Refresh di bawah buat mulai perhitungan pertama (bisa sampai ~15
+              menit).
+            </p>
+          )}
+
+          {cacheData && (
+            <>
+              <p className="text-xs text-gray-500">
+                Terakhir update:{' '}
+                <strong className="text-gray-700">
+                  {cacheData.lastCompletedAt
+                    ? formatLastUpdated(cacheData.lastCompletedAt)
+                    : cacheData.status === 'RUNNING'
+                    ? 'sedang dihitung...'
+                    : '-'}
+                </strong>
+              </p>
+
+              {isRunning && (
+                <p className="text-xs text-indigo-600 flex items-center gap-1.5 bg-indigo-50 border border-indigo-100 rounded p-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  Sedang dihitung di server (bisa sampai ~15 menit kalau lagi antre) -- popup ini update
+                  otomatis begitu selesai, boleh ditutup &amp; dibuka lagi kapan saja.
+                </p>
+              )}
+
+              {cacheData.status === 'ERROR' && (
+                <p className="text-xs text-red-600 bg-red-50 border border-red-200 rounded p-2">
+                  Percobaan terakhir gagal: {cacheData.errorMessage || 'Tidak diketahui.'}
+                </p>
+              )}
+
+              {result && (
+                <>
+                  <div className="flex items-center gap-4">
+                    <div className={`text-4xl font-black ${scoreColor}`}>{typeof score === 'number' ? score : '-'}</div>
+                    <div className="text-sm text-gray-500">dari 100</div>
+                  </div>
+                  {(result.coverageStatus || typeof result.evidenceCoveragePct === 'number') && (
+                    <p className="text-xs text-gray-500">
+                      Cakupan evidence: {typeof result.evidenceCoveragePct === 'number' ? `${result.evidenceCoveragePct.toFixed(1)}%` : '-'}
+                      {result.coverageStatus ? ` (${result.coverageStatus})` : ''}
+                      {result.coverageStatus === 'insufficient_evidence' &&
+                        ' -- skor di atas mungkin belum representatif, evidence dari akun ini terlalu sedikit.'}
+                    </p>
+                  )}
+                  {Array.isArray(result.quickWins) && result.quickWins.length > 0 && (
+                    <div>
+                      <h3 className="text-sm font-semibold flex items-center gap-1.5 mb-1">
+                        <TrendingUp className="w-4 h-4 text-indigo-600" /> Quick Wins
+                      </h3>
+                      <ul className="text-sm text-gray-700 space-y-2">
+                        {result.quickWins.map((q: any, i: number) => {
+                          if (typeof q === 'string') {
+                            return (
+                              <li key={i} className="flex gap-1.5">
+                                <span className="text-gray-400">•</span>
+                                <span>{q}</span>
+                              </li>
+                            );
+                          }
+                          if (q && typeof q === 'object' && (q.title || q.reason)) {
+                            const prio = Number(q.priority);
+                            const badge =
+                              prio === 1
+                                ? { label: 'Kritis', cls: 'bg-red-100 text-red-700' }
+                                : prio === 2
+                                ? { label: 'Tinggi', cls: 'bg-amber-100 text-amber-700' }
+                                : { label: 'Info', cls: 'bg-gray-100 text-gray-600' };
+                            const reasonText =
+                              typeof q.reason === 'string' ? q.reason.replace(/^Severity\s+\S+\s*[—-]\s*FAIL:\s*/i, '') : '';
+                            return (
+                              <li key={q.id ?? i} className="border-l-2 border-gray-200 pl-3 py-0.5">
+                                <div className="flex items-center gap-2 flex-wrap">
+                                  <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded ${badge.cls}`}>
+                                    {badge.label}
+                                  </span>
+                                  {q.category && <span className="text-[10px] text-gray-400">{q.category}</span>}
+                                </div>
+                                <div className="text-sm font-medium text-gray-800">{q.title ?? q.id ?? 'Quick win'}</div>
+                                {reasonText && <div className="text-xs text-gray-600 mt-0.5">{reasonText}</div>}
+                              </li>
+                            );
+                          }
+                          return (
+                            <li key={i} className="text-xs text-gray-500">
+                              {JSON.stringify(q)}
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    </div>
+                  )}
+                  {result.structured === false && result.rawText && (
+                    <div className="text-xs text-gray-600 bg-gray-50 border border-gray-200 rounded p-2 whitespace-pre-wrap max-h-64 overflow-y-auto">
+                      {result.rawText}
+                    </div>
+                  )}
+                </>
+              )}
+            </>
+          )}
+
+          <div className="pt-2 border-t border-gray-100">
+            <button
+              onClick={handleRefresh}
+              disabled={!canRefresh}
+              className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 disabled:cursor-not-allowed text-white text-xs font-semibold py-2.5 rounded-lg transition-colors"
+            >
+              <RefreshCw className="w-3.5 h-3.5" />
+              Refresh Health Score
+            </button>
+            {agyBusy && (
+              <p className="text-[11px] text-amber-600 mt-1.5 text-center">
+                Masih ada proses lain sedang jalan di server -- tunggu dulu sebelum refresh.
+              </p>
+            )}
+            {!agyBusy && cooldownRemainingSec > 0 && (
+              <p className="text-[11px] text-gray-400 mt-1.5 text-center">
+                Baru saja di-refresh. Bisa refresh lagi dalam ~{Math.ceil(cooldownRemainingSec / 60)} menit.
+              </p>
+            )}
+            {refreshMsg && <p className="text-[11px] text-indigo-600 mt-1.5 text-center">{refreshMsg}</p>}
+            {refreshError && <p className="text-[11px] text-red-600 mt-1.5 text-center">{refreshError}</p>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function getMetaResultAndCpr(c: CampaignPerformance) {
+  if (c.campaignId === 'ORGANIC') {
+    return { cprValue: 0, badgeLabel: '-', resultValue: 0, resultLabel: '-' };
+  }
+
+  // [2026-08-26] Satu sumber kebenaran (Opsi 1): backend (GET /business/meta-ads-performance)
+  // SUDAH menghitung resultValue/cprValue/resultLabel/badgeLabel/matchedType per campaign lewat
+  // meta-result-resolver.service.ts (ground truth optimization_goal/custom_event_type dari Meta,
+  // fallback ke heuristik objective). WAJIB pakai field ini LANGSUNG, JANGAN hitung ulang di
+  // browser -- itu penyebab insiden 2026-08-26 (dashboard ini masih punya heuristik lokal sendiri
+  // yang ketinggalan zaman, ga ikut fix Add To Cart / ground truth, Result tampil "-" walau
+  // backend udah benar).
+  if (typeof c.resultValue === 'number' && typeof c.resultLabel === 'string' && typeof c.badgeLabel === 'string') {
+    return {
+      resultValue: c.resultValue,
+      cprValue: typeof c.cprValue === 'number' ? c.cprValue : 0,
+      resultLabel: c.resultLabel,
+      badgeLabel: c.badgeLabel,
+    };
+  }
+
+  // --- Fallback heuristik lokal di bawah ini DIPERTAHANKAN cuma utk payload lama/cache transisi
+  // yang belum punya field di atas -- BUKAN dimaksudkan jadi jalur utama lagi ke depannya. ---
+  const findAction = (arr: { action_type: string; value: string }[] | undefined, predicate: (t: string) => boolean) => {
+    if (!arr || !Array.isArray(arr)) return null;
+    return arr.find(a => predicate(a.action_type));
+  };
+
+  const getActionNum = (arr: { action_type: string; value: string }[] | undefined, predicate: (t: string) => boolean) => {
+    const item = findAction(arr, predicate);
+    return item ? parseFloat(item.value) || 0 : 0;
+  };
+
+  const obj = (c.objective || '').toUpperCase();
+  const isSales = obj.includes('SALES') || obj.includes('CONVERSION') || obj.includes('PURCHASE');
+  const isTraffic = obj.includes('TRAFFIC') || obj.includes('LINK_CLICK');
+  const isLead = obj.includes('LEAD');
+  const isEngagement = obj.includes('ENGAGEMENT') || obj.includes('MESSAG') || obj.includes('INTERACTION');
+
+  const purchasePred = (t: string) => t.includes('purchase') || t === 'omni_purchase' || t.includes('fb_pixel_purchase');
+  // [2026-08-26, fix bug "Result kosong padahal Meta ada Add To Cart"] campaign Sales-objective yg
+  // optimasinya di funnel Add To Cart (bukan Purchase penuh) sebelumnya SELALU dipaksa ke
+  // purchasePred (cabang isSales) tanpa fallback -- kalau purchase-nya genuinely 0, Result tampil
+  // "-" walau Meta sendiri nyatet Add To Cart asli (banyak sinonim action_type: add_to_cart,
+  // onsite_web_app_add_to_cart, omni_add_to_cart, dst -- semua mengandung substring "add_to_cart").
+  const addToCartPred = (t: string) => t.includes('add_to_cart');
+  const leadPred = (t: string) => t === 'lead' || t.includes('fb_pixel_lead') || t.includes('lead_grouped') || t.includes('contact');
+  const msgPred = (t: string) => t.includes('messaging') || t.includes('message');
+  const clickPred = (t: string) => t === 'link_click' || t === 'outbound_click' || t.includes('click');
+  const engagePred = (t: string) => t.includes('engagement') || t.includes('interaction') || t.includes('like') || t.includes('comment');
+
+  let matchedType: 'purchase' | 'addToCart' | 'lead' | 'msg' | 'click' | 'engage' = 'purchase';
+
+  if (isSales) {
+    if (getActionNum(c.actions, purchasePred) > 0 || getActionNum(c.cost_per_action_type, purchasePred) > 0) {
+      matchedType = 'purchase';
+    } else if (getActionNum(c.actions, addToCartPred) > 0 || getActionNum(c.cost_per_action_type, addToCartPred) > 0) {
+      matchedType = 'addToCart';
+    } else {
+      matchedType = 'purchase';
+    }
+  } else if (isLead) matchedType = 'lead';
+  else if (isTraffic) matchedType = 'click';
+  else if (isEngagement) matchedType = 'engage';
+  else {
+    if (getActionNum(c.actions, purchasePred) > 0 || getActionNum(c.cost_per_action_type, purchasePred) > 0) {
+      matchedType = 'purchase';
+    } else if (getActionNum(c.actions, addToCartPred) > 0 || getActionNum(c.cost_per_action_type, addToCartPred) > 0) {
+      matchedType = 'addToCart';
+    } else if (getActionNum(c.actions, msgPred) > 0 || getActionNum(c.cost_per_action_type, msgPred) > 0) {
+      matchedType = 'msg';
+    } else if (getActionNum(c.actions, leadPred) > 0 || getActionNum(c.cost_per_action_type, leadPred) > 0) {
+      matchedType = 'lead';
+    } else if (getActionNum(c.actions, clickPred) > 0 || getActionNum(c.cost_per_action_type, clickPred) > 0) {
+      matchedType = 'click';
+    } else if (getActionNum(c.actions, engagePred) > 0 || getActionNum(c.cost_per_action_type, engagePred) > 0) {
+      matchedType = 'engage';
+    }
+  }
+
+  let resultValue = 0;
+  let cprValue = 0;
+  let resultLabel = 'Pembelian Situs Web';
+  let badgeLabel = 'Per Purchase';
+
+  if (matchedType === 'purchase') {
+    resultValue = getActionNum(c.actions, purchasePred);
+    cprValue = getActionNum(c.cost_per_action_type, purchasePred);
+    resultLabel = 'Pembelian Situs Web';
+    badgeLabel = 'Per Purchase';
+  } else if (matchedType === 'addToCart') {
+    resultValue = getActionNum(c.actions, addToCartPred);
+    cprValue = getActionNum(c.cost_per_action_type, addToCartPred);
+    resultLabel = 'Tambah ke Keranjang';
+    badgeLabel = 'Per Tambah ke Keranjang';
+  } else if (matchedType === 'lead') {
+    resultValue = getActionNum(c.actions, leadPred);
+    cprValue = getActionNum(c.cost_per_action_type, leadPred);
+    resultLabel = 'Prospek';
+    badgeLabel = 'Per Lead';
+  } else if (matchedType === 'msg') {
+    resultValue = getActionNum(c.actions, msgPred);
+    cprValue = getActionNum(c.cost_per_action_type, msgPred);
+    resultLabel = 'Pesan Baru';
+    badgeLabel = 'Per Pesan';
+  } else if (matchedType === 'click') {
+    resultValue = getActionNum(c.actions, clickPred);
+    cprValue = getActionNum(c.cost_per_action_type, clickPred);
+    resultLabel = 'Klik Tautan';
+    badgeLabel = 'Per Klik';
+  } else if (matchedType === 'engage') {
+    resultValue = getActionNum(c.actions, engagePred);
+    cprValue = getActionNum(c.cost_per_action_type, engagePred);
+    resultLabel = 'Interaksi';
+    badgeLabel = 'Per Engagement';
+  }
+
+  if (resultValue > 0 && cprValue === 0 && c.spend > 0) {
+    cprValue = c.spend / resultValue;
+  } else if (cprValue > 0 && resultValue === 0 && c.spend > 0) {
+    resultValue = Math.round(c.spend / cprValue);
+  }
+
+  return { resultValue, resultLabel, cprValue, badgeLabel };
+}
+
+const CREATIVE_VERDICT_LABEL: Record<string, string> = {
+  scale_up: 'Scale Up',
+  maintain_watch: 'Maintain & Pantau',
+  needs_refresh: 'Perlu Refresh',
+  consider_kill: 'Pertimbangkan Stop',
+};
+
+const BUDGET_VERDICT_LABEL: Record<string, string> = {
+  SCALE_UP: 'Scale Up',
+  MAINTAIN: 'Maintain',
+  PANTAU: 'Pantau Dulu',
+  PERHATIAN: 'Perlu Perhatian',
+  TURUNKAN_BUDGET: 'Turunkan Budget',
+  PERTIMBANGKAN_STOP: 'Pertimbangkan Stop',
+  BELUM_CUKUP_DATA: 'Data Belum Cukup',
+};
+const BUDGET_VERDICT_STYLE: Record<string, string> = {
+  SCALE_UP: 'bg-emerald-100 text-emerald-700',
+  MAINTAIN: 'bg-blue-100 text-blue-700',
+  PANTAU: 'bg-amber-100 text-amber-700',
+  PERHATIAN: 'bg-orange-100 text-orange-700',
+  TURUNKAN_BUDGET: 'bg-rose-100 text-rose-700',
+  PERTIMBANGKAN_STOP: 'bg-rose-100 text-rose-700',
+  BELUM_CUKUP_DATA: 'bg-gray-100 text-gray-600',
+};
+
+function formatMetaRanking(ranking?: string) {
+  if (!ranking || ranking === 'UNKNOWN' || ranking === 'DATA_INSUFFICIENT') {
+    return {
+      label: '⚪ Tidak Dievaluasi Meta',
+      className: 'bg-gray-100 text-gray-600 border border-gray-200',
+      desc: 'Meta tidak menghasilkan skor ini karena iklan dioptimasi untuk tujuan tertentu atau belum mencapai threshold perbandingan audiens.'
+    };
+  }
+  if (ranking === 'ABOVE_AVERAGE') {
+    return {
+      label: '🟢 Di Atas Rata-rata',
+      className: 'bg-emerald-50 text-emerald-700 border border-emerald-200',
+      desc: 'Kualitas creative dinilai berada di sepertiga teratas (Top 33%) dibanding iklan kompetitor sejenis.'
+    };
+  }
+  if (ranking === 'AVERAGE') {
+    return {
+      label: '🔵 Rata-rata',
+      className: 'bg-blue-50 text-blue-700 border border-blue-200',
+      desc: 'Kualitas creative berada pada level rata-rata kompetitor sejenis.'
+    };
+  }
+  if (ranking === 'BELOW_AVERAGE_35') {
+    return {
+      label: '🟠 35% Bawah',
+      className: 'bg-amber-50 text-amber-700 border border-amber-200',
+      desc: 'Kualitas creative berada di 35% terbawah. Disarankan perbaiki hook/headline.'
+    };
+  }
+  if (ranking === 'BELOW_AVERAGE_20') {
+    return {
+      label: '🔴 20% Bawah',
+      className: 'bg-rose-50 text-rose-700 border border-rose-200',
+      desc: 'Kualitas creative berada di 20% terbawah. Perlu revisi menyeluruh materi visual.'
+    };
+  }
+  if (ranking === 'BELOW_AVERAGE_10') {
+    return {
+      label: '🔴 10% Terbawah',
+      className: 'bg-rose-100 text-rose-800 border border-rose-300 font-bold',
+      desc: 'Kualitas creative berada di 10% terendah. Disarankan ganti materi iklan.'
+    };
+  }
+  return {
+    label: ranking.replace(/_/g, ' '),
+    className: 'bg-gray-100 text-gray-700 border border-gray-200',
+    desc: ''
+  };
+}
+
+export default function MetaCapiDashboardPage() {
+  const { business } = useAuthStore();
+  const [data, setData] = useState<MetaAdsPerformance | null>(null);
+  const [bestDayData, setBestDayData] = useState<BestDayData | null>(null);
+  const [topCreatives, setTopCreatives] = useState<TopCreative[]>([]);
+  const [breakdowns, setBreakdowns] = useState<BreakdownsData | null>(null);
+  const [creativesLimit, setCreativesLimit] = useState<number>(10);
+  // [2026-08-26] Toggle "Top Creative" / "Top Ad Fatigue" -- kartu yang sama, dua mode. Data
+  // fatigue di-fetch LAZY (baru dipanggil pas tab fatigue dibuka), krn insights time_increment
+  // (weekly buckets) lebih berat drpd snapshot biasa milik /meta-top-creatives.
+  const [creativeViewMode, setCreativeViewMode] = useState<'ctr' | 'fatigue'>('ctr');
+  const [fatigueAds, setFatigueAds] = useState<FatigueAd[]>([]);
+  const [fatigueLoading, setFatigueLoading] = useState(false);
+  const [fatigueError, setFatigueError] = useState('');
+
+  // [2026-08-26] "Jembatan" CTR campaign -> ad -- klik kolom CTR di tabel drill-down campaign
+  // buka panel ringan MURNI Node (nol agy) yang nunjukin ad-ad mana yang nyeret CTR campaign
+  // turun/naik. Dari sini user lanjut klik ke popup Preview & Insight (insightAd) yang sudah ada.
+  // `campaignCtrPanelCampaign` non-null = panel terbuka (pola sama kayak insightAd/auditCampaign).
+  const [campaignCtrPanelCampaign, setCampaignCtrPanelCampaign] = useState<{ campaignId: string; campaignName: string } | null>(null);
+  const [campaignCtrPanelData, setCampaignCtrPanelData] = useState<{ campaignId: string; campaignName: string; campaignAvgCtr: number; ads: CampaignAdCtr[] } | null>(null);
+  const [campaignCtrPanelLoading, setCampaignCtrPanelLoading] = useState(false);
+  const [campaignCtrPanelError, setCampaignCtrPanelError] = useState('');
+
+  const openCampaignAdsCtrPanel = (c: CampaignPerformance) => {
+    if (c.campaignId === 'ORGANIC') return;
+    setCampaignCtrPanelCampaign({ campaignId: c.campaignId, campaignName: c.campaignName });
+  };
+  const [insightAd, setInsightAd] = useState<TopCreative | null>(null);
+  // [2026-08-27] Video preview di popup "Preview & Insight" suka reset hitam abis beberapa
+  // detik -- dugaan kuat krn signed token `d=` punya Meta di HTML iframe (previewIframe) yang
+  // sudah kecache /meta-top-creatives sampai 20 menit itu keburu basi pas user beneran nonton.
+  // Fix: tiap popup dibuka, MINTA ULANG preview segar lewat endpoint kecil GET /ad-preview/:adId
+  // (bukan nunggu cache 20 menit lama). Gak menjamin 100% -- itu perilaku iframe preview Meta
+  // sendiri di luar kendali kita -- makanya juga dikasih tombol reload manual di UI.
+  const [previewRefreshing, setPreviewRefreshing] = useState(false);
+  const fetchFreshAdPreview = useCallback(async (adId: string) => {
+    setPreviewRefreshing(true);
+    try {
+      const res = await apiGet<{ previewIframe: string | null }>(`/business/ad-preview/${encodeURIComponent(adId)}`);
+      if (res?.previewIframe) {
+        setInsightAd(prev => (prev && prev.adId === adId ? { ...prev, previewIframe: res.previewIframe } : prev));
+      }
+    } catch (e) {
+      // Diamkan -- fallback tetap pakai previewIframe lama dari hasil /meta-top-creatives.
+    } finally {
+      setPreviewRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (insightAd?.adId) {
+      fetchFreshAdPreview(insightAd.adId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [insightAd?.adId]);
+  // [2026-08-26] Analisa Copy (AI) utk popup Top Creative -- pola cache/refresh/cooldown SAMA
+  // PERSIS dgn Audit AI Lapis 2 & Health Score, tapi kolam agy SENDIRI ('ai-ads-creative') biar
+  // gak antre sama fitur lain (permintaan eksplisit Bossfren).
+  const [creativeInsightCache, setCreativeInsightCache] = useState<{
+    status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+    result: any;
+    errorMessage: string | null;
+    lastRequestedAt: string | null;
+    lastCompletedAt: string | null;
+  } | null>(null);
+  const [creativeInsightAgyBusy, setCreativeInsightAgyBusy] = useState(false);
+  const [creativeInsightCooldownSec, setCreativeInsightCooldownSec] = useState(0);
+  const [creativeInsightRefreshMsg, setCreativeInsightRefreshMsg] = useState('');
+  const [creativeInsightLoading, setCreativeInsightLoading] = useState(false);
+  const [creativeInsightError, setCreativeInsightError] = useState('');
+
+  const fetchCreativeInsightCache = useCallback(async (adId: string) => {
+    try {
+      const res = await apiGet<{
+        cache: {
+          status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+          result: any;
+          errorMessage: string | null;
+          lastRequestedAt: string | null;
+          lastCompletedAt: string | null;
+        } | null;
+        agyBusy: boolean;
+        cooldownRemainingSec: number;
+      }>(`/ai-ads/creative-insight/cache?adId=${encodeURIComponent(adId)}`);
+      setCreativeInsightCache(res.cache);
+      setCreativeInsightAgyBusy(res.agyBusy);
+      setCreativeInsightCooldownSec(res.cooldownRemainingSec);
+      return res.cache;
+    } catch (e: any) {
+      setCreativeInsightError(e?.message || 'Gagal memuat cache analisa AI.');
+      return null;
+    }
+  }, []);
+
+  async function triggerCreativeInsight(ad: TopCreative) {
+    try {
+      const res = await apiPost<{ queued: boolean; busy?: boolean; cooldown?: boolean; message: string }>(
+        '/ai-ads/creative-insight',
+        {
+          adId: ad.adId,
+          adName: ad.adName,
+          campaignName: ad.campaignName,
+          adTitle: ad.adTitle || '',
+          adBody: ad.adBody || '',
+          ctr: ad.ctr,
+          spend: ad.spend,
+          impressions: ad.impressions,
+          qualityRanking: ad.qualityRanking,
+          engagementRanking: ad.engagementRanking,
+          conversionRanking: ad.conversionRanking,
+        }
+      );
+      setCreativeInsightRefreshMsg(res.message);
+      fetchCreativeInsightCache(ad.adId);
+    } catch (e: any) {
+      setCreativeInsightError(e?.message || 'Gagal memicu analisa AI.');
+    }
+  }
+
+  function handleCreativeInsightRefreshClick() {
+    if (!insightAd) return;
+    setCreativeInsightRefreshMsg('');
+    setCreativeInsightError('');
+    triggerCreativeInsight(insightAd);
+  }
+
+  // Popup Top Creative dibuka -- muat cache, auto-trigger SEKALI kalau belum pernah ada cache
+  // sama sekali (pola sama kayak Audit AI Lapis 2 & Health Score).
+  useEffect(() => {
+    if (!insightAd) return;
+    let cancelled = false;
+    setCreativeInsightCache(null);
+    setCreativeInsightRefreshMsg('');
+    setCreativeInsightError('');
+    (async () => {
+      setCreativeInsightLoading(true);
+      const cache = await fetchCreativeInsightCache(insightAd.adId);
+      if (cancelled) return;
+      setCreativeInsightLoading(false);
+      if (!cache) {
+        triggerCreativeInsight(insightAd);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [insightAd?.adId]);
+
+  // Poll selagi status RUNNING -- popup update otomatis begitu job background selesai.
+  useEffect(() => {
+    if (!insightAd || creativeInsightCache?.status !== 'RUNNING') return;
+    const interval = setInterval(() => fetchCreativeInsightCache(insightAd.adId), 6000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [insightAd?.adId, creativeInsightCache?.status]);
+
+  // [2026-08-26] Rekomendasi AI (Layer 2) utk popup "Top Ad Fatigue" -- decay%/severity/skor
+  // sinyal SUDAH dihitung Node murni matematika (Layer 1, GET /business/meta-ad-fatigue), bagian
+  // ini CUMA minta agy resepin refresh_options/new_angles/kill_threshold. Pola cache/refresh/
+  // cooldown/self-heal SAMA PERSIS dgn Analisa Copy (AI) Top Creative, kolam SENDIRI
+  // ('ai-ads-fatigue') biar gak antre sama fitur agy lain. Isi popup ini SENGAJA beda struktur
+  // total dari popup Top Creative (permintaan eksplisit Bossfren).
+  const [fatigueInsightAd, setFatigueInsightAd] = useState<FatigueAd | null>(null);
+  const [fatigueInsightCache, setFatigueInsightCache] = useState<{
+    status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+    result: any;
+    errorMessage: string | null;
+    lastRequestedAt: string | null;
+    lastCompletedAt: string | null;
+  } | null>(null);
+  const [fatigueInsightAgyBusy, setFatigueInsightAgyBusy] = useState(false);
+  const [fatigueInsightCooldownSec, setFatigueInsightCooldownSec] = useState(0);
+  const [fatigueInsightRefreshMsg, setFatigueInsightRefreshMsg] = useState('');
+  const [fatigueInsightLoading, setFatigueInsightLoading] = useState(false);
+  const [fatigueInsightError, setFatigueInsightError] = useState('');
+
+  const fetchFatigueInsightCache = useCallback(async (adId: string) => {
+    try {
+      const res = await apiGet<{
+        cache: {
+          status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+          result: any;
+          errorMessage: string | null;
+          lastRequestedAt: string | null;
+          lastCompletedAt: string | null;
+        } | null;
+        agyBusy: boolean;
+        cooldownRemainingSec: number;
+      }>(`/ai-ads/fatigue-insight/cache?adId=${encodeURIComponent(adId)}`);
+      setFatigueInsightCache(res.cache);
+      setFatigueInsightAgyBusy(res.agyBusy);
+      setFatigueInsightCooldownSec(res.cooldownRemainingSec);
+      return res.cache;
+    } catch (e: any) {
+      setFatigueInsightError(e?.message || 'Gagal memuat cache rekomendasi AI.');
+      return null;
+    }
+  }, []);
+
+  async function triggerFatigueInsight(ad: FatigueAd) {
+    try {
+      const res = await apiPost<{ queued: boolean; busy?: boolean; cooldown?: boolean; message: string }>(
+        '/ai-ads/fatigue-insight',
+        {
+          adId: ad.adId,
+          adName: ad.adName,
+          campaignName: ad.campaignName,
+          adTitle: ad.adTitle || '',
+          adBody: ad.adBody || '',
+          platform: 'Meta Feed',
+          daysRunning: ad.daysRunning ?? 0,
+          currentFrequency: ad.currentFrequency,
+          computedDecay: ad.computedDecay,
+          severityOverall: ad.severityOverall,
+          severityReason: ad.severityReason,
+          signals: ad.signals,
+        }
+      );
+      setFatigueInsightRefreshMsg(res.message);
+      fetchFatigueInsightCache(ad.adId);
+    } catch (e: any) {
+      setFatigueInsightError(e?.message || 'Gagal memicu analisa AI.');
+    }
+  }
+
+  function handleFatigueInsightRefreshClick() {
+    if (!fatigueInsightAd) return;
+    setFatigueInsightRefreshMsg('');
+    setFatigueInsightError('');
+    triggerFatigueInsight(fatigueInsightAd);
+  }
+
+  useEffect(() => {
+    if (!fatigueInsightAd) return;
+    let cancelled = false;
+    setFatigueInsightCache(null);
+    setFatigueInsightRefreshMsg('');
+    setFatigueInsightError('');
+    (async () => {
+      setFatigueInsightLoading(true);
+      const cache = await fetchFatigueInsightCache(fatigueInsightAd.adId);
+      if (cancelled) return;
+      setFatigueInsightLoading(false);
+      if (!cache) {
+        triggerFatigueInsight(fatigueInsightAd);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fatigueInsightAd?.adId]);
+
+  useEffect(() => {
+    if (!fatigueInsightAd || fatigueInsightCache?.status !== 'RUNNING') return;
+    const interval = setInterval(() => fetchFatigueInsightCache(fatigueInsightAd.adId), 6000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fatigueInsightAd?.adId, fatigueInsightCache?.status]);
+
+  const [auditCampaign, setAuditCampaign] = useState<CampaignPerformance | null>(null);
+  const [healthScoreCampaign, setHealthScoreCampaign] = useState<CampaignPerformance | null>(null);
+
+  const [loading, setLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  
+  const [datePreset, setDatePreset] = useState<'today' | 'yesterday' | '7d' | '30d' | 'this_month' | 'custom'>('today');
+  const [customStart, setCustomStart] = useState(() => getJakartaOffsetStr(-6));
+  const [customEnd, setCustomEnd] = useState(() => getJakartaTodayStr());
+  const [selectedPic, setSelectedPic] = useState<string | null>(null);
+
+  // ── FILTER & SORT TABLE STATES ──
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedAccount, setSelectedAccount] = useState<string>('ALL');
+  // [2026-08-27] Default 'Active' (bukan 'ALL') biar tabel drill-down gak kebanyakan baris pas dibuka pertama kali -- Bossfren tetap bisa ganti ke 'Semua Status' manual.
+  const [selectedStatus, setSelectedStatus] = useState<string>('Active');
+  // [2026-08-27] Filter spend/gak-spend -- request Bossfren biar gampang lihat campaign yang
+  // aktif tapi budgetnya kepakai (spend > 0) vs yang gak jalan sama sekali (spend = 0).
+  const [selectedSpendFilter, setSelectedSpendFilter] = useState<'ALL' | 'SPEND' | 'NO_SPEND'>('ALL');
+  // [2026-08-27] Default 'result' (bukan 'spend') -- campaign yang sudah ada hasil (Purchase/ATC dll) naik ke atas duluan. Campaign yang result-nya masih kosong (dianggap 0 oleh comparator di bawah) otomatis fallback ke tiebreaker spend desc (sudah ada di comparator generik filteredCampaigns).
+  const [sortField, setSortField] = useState<'omset' | 'spend' | 'closing' | 'roas' | 'campaignName' | 'accountName' | 'clicks' | 'ctr' | 'frequency' | 'cpr' | 'cpp' | 'result'>('result');
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
+
+  const { startDate, endDate, dateRangeLabel } = useMemo(() => {
+    const todayStr = getJakartaTodayStr();
+    if (datePreset === 'today') return { startDate: todayStr, endDate: todayStr, dateRangeLabel: 'Hari Ini' };
+    if (datePreset === 'yesterday') {
+      const yesterdayStr = getJakartaOffsetStr(-1);
+      return { startDate: yesterdayStr, endDate: yesterdayStr, dateRangeLabel: 'Kemarin' };
+    }
+    if (datePreset === '7d') return { startDate: getJakartaOffsetStr(-6), endDate: todayStr, dateRangeLabel: '7 Hari Terakhir' };
+    if (datePreset === '30d') return { startDate: getJakartaOffsetStr(-29), endDate: todayStr, dateRangeLabel: '30 Hari Terakhir' };
+    if (datePreset === 'this_month') return { startDate: getJakartaFirstDayOfMonthStr(), endDate: todayStr, dateRangeLabel: 'Bulan Ini' };
+    return { startDate: customStart || todayStr, endDate: customEnd || todayStr, dateRangeLabel: `${customStart} s/d ${customEnd}` };
+  }, [datePreset, customStart, customEnd]);
+
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const fetchData = useCallback(async (forceRefresh = false) => {
+    setLoading(true);
+    if (forceRefresh === true) setIsRefreshing(true);
+    setErrorMsg(null);
+    try {
+      const queryParams = `startDate=${startDate}&endDate=${endDate}${forceRefresh === true ? '&forceRefresh=true' : ''}`;
+      const [res, bestDayRes, topRes, breakdownsRes] = await Promise.all([
+        apiGet<MetaAdsPerformance>(`/business/meta-ads-performance?${queryParams}`),
+        apiGet<BestDayData>(`/business/meta-ads-best-day?${queryParams}`).catch(() => null),
+        apiGet<{data: TopCreative[]}>(`/business/meta-top-creatives?${queryParams}&limit=${creativesLimit}`).catch(() => null),
+        apiGet<BreakdownsData>(`/business/meta-ads-breakdowns?${queryParams}`).catch(() => null)
+      ]);
+      setData(res);
+      setBestDayData(bestDayRes || null);
+      setTopCreatives(topRes ? topRes.data : []);
+      setBreakdowns(breakdownsRes || null);
+    } catch (err: any) {
+      console.error('Failed to fetch meta ads performance', err);
+      setErrorMsg(err?.message || 'Gagal memuat data performa Meta Ads.');
+    } finally {
+      setLoading(false);
+      setIsRefreshing(false);
+    }
+  }, [startDate, endDate, creativesLimit]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  // [2026-08-26] Fetch list "Top Ad Fatigue" -- LAZY, cuma jalan pas tab fatigue dibuka (bukan
+  // ikut Promise.all fetchData di atas), krn /meta-ad-fatigue pakai time_increment weekly
+  // buckets yang lebih berat dari snapshot biasa /meta-top-creatives.
+  // [2026-08-26] FIX: fatigue butuh MINIMAL 2 minggu data (time_increment=7, week1 vs latest)
+  // buat bisa hitung decay -- kalau ikut filter tanggal global (defaultnya "Hari Ini" = 1 hari),
+  // Meta cuma balikin 1 bucket mingguan dan decay SELALU "tidak bisa dihitung". Jendela fatigue
+  // SENGAJA dibikin TETAP 28 hari terakhir, terpisah dari filter tanggal di atas (yang tetap
+  // dipakai widget lain spt Top Creative/performa), biar user gak perlu gonta-ganti filter
+  // dashboard cuma buat lihat fatigue.
+  const fatigueStartDate = getJakartaOffsetStr(-27);
+  const fatigueEndDate = getJakartaTodayStr();
+
+  const fetchFatigueAds = useCallback(async (forceRefresh = false) => {
+    setFatigueLoading(true);
+    setFatigueError('');
+    try {
+      const queryParams = `startDate=${fatigueStartDate}&endDate=${fatigueEndDate}${forceRefresh ? '&forceRefresh=true' : ''}`;
+      const res = await apiGet<{ data: FatigueAd[] }>(`/business/meta-ad-fatigue?${queryParams}&limit=${creativesLimit}`);
+      setFatigueAds(res.data || []);
+    } catch (e: any) {
+      setFatigueError(e?.message || 'Gagal memuat data ad fatigue.');
+    } finally {
+      setFatigueLoading(false);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [creativesLimit]);
+
+  useEffect(() => {
+    if (creativeViewMode === 'fatigue') {
+      fetchFatigueAds();
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [creativeViewMode, creativesLimit]);
+
+  // [2026-08-26] Fetch panel jembatan CTR campaign->ad -- ditaruh di sini (bukan deket state-nya
+  // di atas) krn butuh startDate/endDate dari useMemo yang baru dideklarasi barusan di atas.
+  useEffect(() => {
+    if (!campaignCtrPanelCampaign) {
+      setCampaignCtrPanelData(null);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      setCampaignCtrPanelLoading(true);
+      setCampaignCtrPanelError('');
+      try {
+        const queryParams = `campaignId=${encodeURIComponent(campaignCtrPanelCampaign.campaignId)}&campaignName=${encodeURIComponent(campaignCtrPanelCampaign.campaignName)}&startDate=${startDate}&endDate=${endDate}`;
+        const res = await apiGet<{ campaignId: string; campaignName: string; campaignAvgCtr: number; ads: CampaignAdCtr[] }>(`/business/campaign-ads-ctr?${queryParams}`);
+        if (!cancelled) setCampaignCtrPanelData(res);
+      } catch (e: any) {
+        if (!cancelled) setCampaignCtrPanelError(e?.message || 'Gagal memuat data ads campaign ini.');
+      } finally {
+        if (!cancelled) setCampaignCtrPanelLoading(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [campaignCtrPanelCampaign?.campaignId, startDate, endDate]);
+
+  // [2026-08-26] Fitur "Rekomendasi Budget" (kolom Budget baru di drill-down Campaign, Stage A
+  // read-only). Layer 1 (fakta: CPR/CTR/frekuensi/ROAS/bid status/budget level/saran angka) MURNI
+  // Node, GET /business/budget-facts. Layer 2 (narasi kualitatif) agy kolam 'ai-ads-budget', pola
+  // cache/refresh/cooldown SAMA PERSIS dgn fatigue-insight/creative-insight -- BEDANYA Layer 2 di
+  // sini baru bisa jalan SETELAH Layer 1 selesai load (butuh fakta Layer 1 sebagai payload prompt).
+  const [budgetPanelCampaign, setBudgetPanelCampaign] = useState<{ campaignId: string; campaignName: string } | null>(null);
+  const [budgetFacts, setBudgetFacts] = useState<BudgetFacts | null>(null);
+  const [budgetFactsLoading, setBudgetFactsLoading] = useState(false);
+  const [budgetFactsError, setBudgetFactsError] = useState('');
+  // [2026-08-27] Stage B -- edit manual budget harian, independen dari rekomendasi AI.
+  const [budgetEditOpen, setBudgetEditOpen] = useState(false);
+  const [budgetEditValue, setBudgetEditValue] = useState('');
+  const [budgetEditSubmitting, setBudgetEditSubmitting] = useState(false);
+  const [budgetEditError, setBudgetEditError] = useState('');
+
+  const [budgetInsightCache, setBudgetInsightCache] = useState<{
+    status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+    result: any;
+    errorMessage: string | null;
+    lastRequestedAt: string | null;
+    lastCompletedAt: string | null;
+  } | null>(null);
+  const [budgetInsightAgyBusy, setBudgetInsightAgyBusy] = useState(false);
+  const [budgetInsightCooldownSec, setBudgetInsightCooldownSec] = useState(0);
+  const [budgetInsightRefreshMsg, setBudgetInsightRefreshMsg] = useState('');
+  const [budgetInsightError, setBudgetInsightError] = useState('');
+
+  const openBudgetPanel = (c: CampaignPerformance) => {
+    if (c.campaignId === 'ORGANIC') return;
+    setBudgetPanelCampaign({ campaignId: c.campaignId, campaignName: c.campaignName });
+  };
+
+  const fetchBudgetFacts = useCallback(async (campaignId: string, campaignName: string, forceRefresh = false) => {
+    try {
+      setBudgetFactsError('');
+      // [2026-08-27] forceRefresh dipakai KHUSUS abis save budget manual -- GET /budget-facts
+      // nge-cache hasil hitungnya sendiri 20 menit, jadi kalau re-fetch pasca-edit ini kena race
+      // sesaat (mis. Meta belum sepenuhnya "settle" balikin data terbaru) hasil yang salah itu bakal
+      // KEBEKUKAN di cache 20 menit -- pensil edit ilang & warning "tidak terbaca" nyangkut walau
+      // datanya di Meta sendiri sebenarnya sudah benar. forceRefresh=true bikin server SELALU hitung
+      // ulang langsung dari Meta buat panggilan ini, bukan modal-open biasa (biar gak boros API call).
+      const qs = `campaignId=${encodeURIComponent(campaignId)}&campaignName=${encodeURIComponent(campaignName)}${forceRefresh ? '&forceRefresh=true' : ''}`;
+      const res = await apiGet<BudgetFacts>(`/business/budget-facts?${qs}`);
+      setBudgetFacts(res);
+      return res;
+    } catch (e: any) {
+      setBudgetFactsError(e?.message || 'Gagal memuat data budget.');
+      return null;
+    }
+  }, []);
+
+  // [2026-08-27] Stage B -- kirim budget manual ke endpoint baru, TIDAK lewat jalur rekomendasi AI.
+  const handleBudgetEditSubmit = useCallback(async () => {
+    if (!budgetPanelCampaign) return;
+    const newVal = parseFloat(budgetEditValue);
+    if (!Number.isFinite(newVal) || newVal < 1000) {
+      setBudgetEditError('Masukkan angka budget yang valid (minimal Rp1.000).');
+      return;
+    }
+    setBudgetEditSubmitting(true);
+    setBudgetEditError('');
+    try {
+      await apiPatch(`/business/campaigns/${encodeURIComponent(budgetPanelCampaign.campaignId)}/budget`, { newDailyBudget: newVal });
+      setBudgetEditOpen(false);
+      await fetchBudgetFacts(budgetPanelCampaign.campaignId, budgetPanelCampaign.campaignName, true);
+      // [2026-08-27] Fix: tabel campaign & widget lain di belakang modal ini dipasok dari
+      // fetchData() (endpoint /meta-ads-performance) yang sebelumnya cuma jalan sekali pas mount /
+      // ganti tanggal -- abis edit budget manual sukses, data itu jadi basi sampai user reload
+      // browser manual. Cache server-side sudah dibersihkan (lihat delCachePattern di backend),
+      // tinggal trigger re-fetch-nya di sini biar keliatan update tanpa reload sama sekali.
+      void fetchData(true);
+    } catch (e: any) {
+      setBudgetEditError(e?.message || 'Gagal menyimpan budget baru.');
+    } finally {
+      setBudgetEditSubmitting(false);
+    }
+  }, [budgetPanelCampaign, budgetEditValue, fetchBudgetFacts, fetchData]);
+
+  useEffect(() => {
+    setBudgetEditOpen(false);
+    setBudgetEditValue('');
+    setBudgetEditError('');
+    if (!budgetPanelCampaign) return;
+    let cancelled = false;
+    setBudgetFacts(null);
+    setBudgetInsightCache(null);
+    setBudgetInsightRefreshMsg('');
+    setBudgetInsightError('');
+    (async () => {
+      setBudgetFactsLoading(true);
+      await fetchBudgetFacts(budgetPanelCampaign.campaignId, budgetPanelCampaign.campaignName);
+      if (cancelled) return;
+      setBudgetFactsLoading(false);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [budgetPanelCampaign?.campaignId]);
+
+  const fetchBudgetInsightCache = useCallback(async (campaignId: string) => {
+    try {
+      const res = await apiGet<{
+        cache: {
+          status: 'IDLE' | 'RUNNING' | 'DONE' | 'ERROR';
+          result: any;
+          errorMessage: string | null;
+          lastRequestedAt: string | null;
+          lastCompletedAt: string | null;
+        } | null;
+        agyBusy: boolean;
+        cooldownRemainingSec: number;
+      }>(`/ai-ads/budget-insight/cache?campaignId=${encodeURIComponent(campaignId)}`);
+      setBudgetInsightCache(res.cache);
+      setBudgetInsightAgyBusy(res.agyBusy);
+      setBudgetInsightCooldownSec(res.cooldownRemainingSec);
+      return res.cache;
+    } catch (e: any) {
+      setBudgetInsightError(e?.message || 'Gagal memuat cache analisa AI.');
+      return null;
+    }
+  }, []);
+
+  async function triggerBudgetInsight(facts: BudgetFacts) {
+    try {
+      const res = await apiPost<{ queued: boolean; busy?: boolean; cooldown?: boolean; message: string }>(
+        '/ai-ads/budget-insight',
+        {
+          campaignId: facts.campaignId,
+          campaignName: facts.campaignName,
+          objective: facts.objective,
+          budgetLevel: facts.budgetLevel,
+          currentDailyBudget: facts.currentDailyBudget,
+          bidStrategyLabel: facts.bidStrategy?.label || 'Tidak diketahui',
+          verdict: facts.verdict,
+          verdictReason: facts.verdictReason,
+          suggestedDailyBudget: facts.suggestedDailyBudget,
+          today: facts.today,
+          avg7d: facts.avg7d,
+          roas: facts.roas,
+          cprDeltaPct: facts.cprDeltaPct,
+          frequencyFlag: facts.frequencyFlag,
+        }
+      );
+      setBudgetInsightRefreshMsg(res.message);
+      fetchBudgetInsightCache(facts.campaignId);
+    } catch (e: any) {
+      setBudgetInsightError(e?.message || 'Gagal memicu analisa AI.');
+    }
+  }
+
+  function handleBudgetInsightRefreshClick() {
+    if (!budgetFacts) return;
+    setBudgetInsightRefreshMsg('');
+    setBudgetInsightError('');
+    triggerBudgetInsight(budgetFacts);
+  }
+
+  // Layer 2 baru bisa mulai SETELAH Layer 1 (budgetFacts) selesai load -- beda dgn fatigue/creative
+  // yang datanya udah lengkap dari awal popup dibuka.
+  useEffect(() => {
+    if (!budgetFacts) return;
+    let cancelled = false;
+    (async () => {
+      const cache = await fetchBudgetInsightCache(budgetFacts.campaignId);
+      if (cancelled) return;
+      if (!cache) {
+        triggerBudgetInsight(budgetFacts);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [budgetFacts?.campaignId]);
+
+  useEffect(() => {
+    if (!budgetFacts || budgetInsightCache?.status !== 'RUNNING') return;
+    const interval = setInterval(() => fetchBudgetInsightCache(budgetFacts.campaignId), 6000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [budgetFacts?.campaignId, budgetInsightCache?.status]);
+
+  const formatCurrency = (val: number) => {
+    return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(val);
+  };
+
+  const handleSort = (field: 'omset' | 'spend' | 'closing' | 'roas' | 'campaignName' | 'accountName' | 'clicks' | 'ctr' | 'frequency' | 'cpr' | 'cpp' | 'result') => {
+    if (sortField === field) {
+      setSortDirection(prev => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      setSortDirection('desc');
+    }
+  };
+
+  const availableStatuses = useMemo(() => {
+    if (!data?.campaignTable) return [];
+    const setStatus = new Set<string>();
+    data.campaignTable.forEach(c => {
+      if (c.status && c.status !== '-') setStatus.add(c.status);
+    });
+    return Array.from(setStatus).sort();
+  }, [data]);
+
+  const availableAccounts = useMemo(() => {
+    if (!data?.campaignTable) return [];
+    const setAcc = new Set<string>();
+    data.campaignTable.forEach(c => {
+      if (c.accountName && c.accountName !== '-') setAcc.add(c.accountName);
+    });
+    return Array.from(setAcc);
+  }, [data]);
+
+  const filteredCampaigns = useMemo(() => {
+    if (!data?.campaignTable) return [];
+    
+    let result = data.campaignTable;
+
+    // Filter PIC
+    if (selectedPic) {
+      result = result.filter(c => c.picName === selectedPic);
+    }
+
+    // Filter Ad Account
+    if (selectedAccount !== 'ALL') {
+      result = result.filter(c => c.accountName === selectedAccount);
+    }
+
+    // Filter Status
+    if (selectedStatus !== 'ALL') {
+      result = result.filter(c => c.status === selectedStatus);
+    }
+
+    // Filter Spend / Tidak Spend
+    if (selectedSpendFilter === 'SPEND') {
+      result = result.filter(c => (c.spend || 0) > 0);
+    } else if (selectedSpendFilter === 'NO_SPEND') {
+      result = result.filter(c => !(c.spend > 0));
+    }
+
+    // Search Query (Campaign Name, Account Name, PIC, ID)
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      result = result.filter(c =>
+        (c.campaignName && c.campaignName.toLowerCase().includes(q)) ||
+        (c.accountName && c.accountName.toLowerCase().includes(q)) ||
+        (c.picName && c.picName.toLowerCase().includes(q)) ||
+        (c.campaignId && c.campaignId.toLowerCase().includes(q))
+      );
+    }
+
+    // Sort
+    return [...result].sort((a, b) => {
+      let valA: any = (a as any)[sortField];
+      let valB: any = (b as any)[sortField];
+
+      if (sortField === 'cpr') {
+        valA = getMetaResultAndCpr(a).cprValue;
+        valB = getMetaResultAndCpr(b).cprValue;
+      }
+      if (sortField === 'result') {
+        valA = getMetaResultAndCpr(a).resultValue || 0;
+        valB = getMetaResultAndCpr(b).resultValue || 0;
+      }
+      if (sortField === 'cpp') {
+        valA = a.closing > 0 ? a.spend / a.closing : 0;
+        valB = b.closing > 0 ? b.spend / b.closing : 0;
+      }
+
+      if (typeof valA === 'string') {
+        const comp = (valA || '').localeCompare(valB || '');
+        if (comp !== 0) return sortDirection === 'asc' ? comp : -comp;
+      } else {
+        valA = Number(valA) || 0;
+        valB = Number(valB) || 0;
+        if (valA !== valB) {
+          return sortDirection === 'asc' ? valA - valB : valB - valA;
+        }
+      }
+
+      // Tiebreaker: spend desc
+      return (b.spend || 0) - (a.spend || 0);
+    });
+  }, [data, selectedPic, selectedAccount, selectedStatus, selectedSpendFilter, searchQuery, sortField, sortDirection]);
+
+  // [2026-08-27] Sinkronisasi filter PIC (leaderboard) ke widget Top Creative & Top Ad Fatigue.
+  // TopCreative/FatigueAd dari Meta cuma bawa `campaignName` (bukan campaignId), jadi dicocokkan
+  // lewat nama campaign yang sudah dipetakan ke PIC di data.campaignTable (satu-satunya sumber
+  // pemetaan PIC yang ada). Resiko kecil: dua campaign beda PIC kebetulan nama sama persis --
+  // diterima krn tabel drill-down campaign juga sudah pakai pola pencocokan nama yang sama.
+  const picCampaignNames = useMemo(() => {
+    if (!selectedPic || !data?.campaignTable) return null;
+    return new Set(data.campaignTable.filter(c => c.picName === selectedPic).map(c => c.campaignName));
+  }, [data, selectedPic]);
+
+  const filteredTopCreatives = useMemo(() => {
+    if (!picCampaignNames) return topCreatives;
+    return topCreatives.filter(ad => picCampaignNames.has(ad.campaignName));
+  }, [topCreatives, picCampaignNames]);
+
+  const filteredFatigueAds = useMemo(() => {
+    if (!picCampaignNames) return fatigueAds;
+    return fatigueAds.filter(ad => picCampaignNames.has(ad.campaignName));
+  }, [fatigueAds, picCampaignNames]);
+
+  const summaryCards = [
+    {
+      label: 'Total Omset CS',
+      value: formatCurrency(data?.execSummary.totalOmset || 0),
+      sub: 'Omset closing dari lead iklan',
+      icon: Target,
+      color: 'text-emerald-600',
+      bg: 'bg-emerald-50',
+      badge: 'Revenue',
+      highlight: (data?.execSummary.totalOmset || 0) > 0,
+    },
+    {
+      label: 'Total Spend Meta',
+      value: formatCurrency(data?.execSummary.totalSpend || 0),
+      sub: `CPR: ${formatCurrency(data?.funnelStats?.lead ? (data.execSummary.totalSpend / data.funnelStats.lead) : 0)} | CPP: ${formatCurrency(data?.funnelStats?.purchase ? (data.execSummary.totalSpend / data.funnelStats.purchase) : 0)}`,
+      icon: CreditCard,
+      color: 'text-rose-600',
+      bg: 'bg-rose-50',
+      badge: 'Ad Spend',
+      highlight: (data?.execSummary.totalSpend || 0) > 0,
+    },
+    {
+      label: 'Real ROAS Gabungan',
+      value: `${(data?.execSummary.realRoas || 0).toFixed(2)}x`,
+      sub: 'Total Omset ÷ Total Spend',
+      icon: TrendingUp,
+      color: 'text-indigo-600',
+      bg: 'bg-indigo-50',
+      badge: 'Efficiency',
+      highlight: (data?.execSummary.realRoas || 0) > 0,
+    },
+    {
+      label: 'Status Akun Meta',
+      value: data?.execSummary.accountStatus || 'Belum Ada BM',
+      sub: data?.execSummary.bmSummaryText || (data?.execSummary.totalBm !== undefined ? `${data.execSummary.activeBm || 0} BM Aktif, ${data.execSummary.errorBm || 0} Diskonek` : 'Koneksi Meta Business Manager'),
+      icon: Megaphone,
+      color: (data?.execSummary.errorBm || 0) > 0 ? 'text-rose-600' : 'text-blue-600',
+      bg: (data?.execSummary.errorBm || 0) > 0 ? 'bg-rose-50' : 'bg-blue-50',
+      badge: 'Account',
+      highlight: false,
+    },
+  ];
+
+  return (
+    <div className="space-y-4 pb-8 max-w-7xl mx-auto">
+      {/* ── HEADER UTAMA ── */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-gray-200 pb-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider bg-indigo-50 text-indigo-700 border border-indigo-100">
+              GROWTH & PAID TRAFFIC VIEW
+            </span>
+          </div>
+          <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2 mt-0.5">
+            <BarChart3 className="w-5 h-5 text-indigo-600" />
+            Dashboard Meta Ads
+          </h1>
+          <p className="text-xs text-gray-500">
+            Pantau performa kampanye, ROAS, funnel konversi CAPI, dan leaderboard PIC secara real-time.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Link
+            href="/app/meta-capi"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition-colors shadow-xs"
+          >
+            <Megaphone className="w-3.5 h-3.5" />
+            Pengaturan Meta Ads
+          </Link>
+        </div>
+      </div>
+
+      {/* ── FILTER TANGGAL ── */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5 bg-white p-2.5 rounded-xl border border-gray-200 shadow-xs">
+        <div className="flex items-center gap-1.5 text-xs text-gray-600 font-semibold">
+          <Calendar className="w-3.5 h-3.5 text-gray-400" />
+          <span>Periode Analisis:</span>
+          <span className="text-gray-900 font-bold bg-gray-100 px-2 py-0.5 rounded text-xs">{dateRangeLabel}</span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1 bg-gray-100 p-1 rounded-lg">
+          {['today', 'yesterday', '7d', '30d', 'this_month', 'custom'].map((preset) => (
+            <button
+              key={preset}
+              onClick={() => setDatePreset(preset as any)}
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
+                datePreset === preset ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
+              }`}
+            >
+              {preset === 'today' ? 'Hari Ini' : preset === 'yesterday' ? 'Kemarin' : preset === '7d' ? '7 Hari' : preset === '30d' ? '30 Hari' : preset === 'this_month' ? 'Bulan Ini' : 'Custom'}
+            </button>
+          ))}
+          <button
+            onClick={() => fetchData(true)}
+            disabled={loading || isRefreshing}
+            className="p-1 ml-0.5 text-gray-500 hover:text-indigo-600 bg-white border border-gray-200 rounded-md hover:bg-indigo-50 transition-colors disabled:opacity-50"
+            title="Segarkan Data"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${isRefreshing ? 'animate-spin text-indigo-600' : ''}`} />
+          </button>
+        </div>
+
+        {datePreset === 'custom' && (
+          <div className="flex items-center gap-1 bg-gray-50 border border-gray-200 px-2 py-1 rounded-lg">
+            <input
+              type="date"
+              value={customStart}
+              onChange={(e) => setCustomStart(e.target.value)}
+              className="px-1.5 py-0.5 text-xs bg-white border border-gray-200 rounded text-gray-700 focus:outline-none"
+            />
+            <span className="text-xs text-gray-400">-</span>
+            <input
+              type="date"
+              value={customEnd}
+              onChange={(e) => setCustomEnd(e.target.value)}
+              className="px-1.5 py-0.5 text-xs bg-white border border-gray-200 rounded text-gray-700 focus:outline-none"
+            />
+          </div>
+        )}
+      </div>
+
+      {errorMsg && (
+        <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="font-bold">⚠️ Error:</span>
+            <span>{errorMsg}</span>
+          </div>
+          <button
+            onClick={() => fetchData()}
+            className="px-2.5 py-1 bg-red-100 hover:bg-red-200 text-red-800 font-semibold rounded-md transition-colors"
+          >
+            Coba Lagi
+          </button>
+        </div>
+      )}
+
+      {/* ── 1. TOP SUMMARY SCORECARDS (4 KARTU EKSEKUTIF METRIK IKLAN) ── */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+        {summaryCards.map((card) => (
+          <div
+            key={card.label}
+            className={`bg-white p-2.5 rounded-xl border transition-all hover:shadow-xs hover:border-indigo-200 group ${
+              card.highlight ? 'border-amber-300 ring-2 ring-amber-100' : 'border-gray-200'
+            }`}
+          >
+            <div className="flex items-center justify-between mb-1.5">
+              <div className={`w-6 h-6 ${card.bg} rounded-lg flex items-center justify-center`}>
+                <card.icon className={`w-3.5 h-3.5 ${card.color}`} />
+              </div>
+              <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+                {card.badge}
+              </span>
+            </div>
+            <p className="text-base md:text-lg font-bold text-gray-900 leading-tight">
+              {loading ? '...' : card.value}
+            </p>
+            <p className="text-[11px] font-semibold text-gray-700 mt-0.5 truncate">{card.label}</p>
+            <p className="text-[10px] text-gray-400 mt-0.5 truncate">{card.sub}</p>
+          </div>
+        ))}
+      </div>
+
+
+      {/* ── 1B. BUDGET WASTE & CAPI EMQ 9.3+ (Chunk (g) bagian 3, Fase 4, 2026-08-28) ── */}
+      <BudgetWasteEmqCard />
+            {/* ── 2. FUNNEL EVENT CAPI (SERVER-SIDE TRACKING FLOW) ── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+        <div className="border-b border-gray-100 px-4 py-3 flex items-center justify-between bg-white">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600">
+              <TrendingUp className="w-3.5 h-3.5" />
+            </div>
+            <div>
+              <h2 className="text-xs font-bold text-gray-900">Funnel Event CAPI</h2>
+              <p className="text-[10px] text-gray-500">Pelacakan alur konversi server-side ke Meta Events Manager</p>
+            </div>
+          </div>
+          <span className="text-[10px] font-semibold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full border border-indigo-100">
+            Server-Side Tracking
+          </span>
+        </div>
+
+        <div className="p-3 bg-gray-50/50">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+            {/* Step 1: Pesan Masuk */}
+            <div className="bg-white p-2.5 rounded-xl border border-gray-200 shadow-2xs relative">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="w-6 h-6 bg-blue-50 text-blue-600 rounded-lg flex items-center justify-center">
+                  <MessageCircle className="w-3.5 h-3.5" />
+                </div>
+                <span className="font-mono text-[10px] bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded font-semibold border border-blue-100">
+                  {data?.funnelStats?.eventLabels?.step1 || 'ViewContent'}
+                </span>
+              </div>
+              <p className="text-base md:text-lg font-bold text-gray-900 leading-tight">
+                {loading ? '...' : data?.funnelStats?.viewContent || 0}
+              </p>
+              <p className="text-[11px] font-semibold text-gray-700 mt-0.5">Tahap 1: Pesan Masuk</p>
+              <p className="text-[10px] text-gray-400 mt-0.5">Chat pertama terkirim</p>
+            </div>
+
+            {/* Step 2: WARM */}
+            <div className="bg-white p-2.5 rounded-xl border border-gray-200 shadow-2xs relative">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="w-6 h-6 bg-amber-50 text-amber-600 rounded-lg flex items-center justify-center">
+                  <Users className="w-3.5 h-3.5" />
+                </div>
+                <span className="font-mono text-[10px] bg-amber-50 text-amber-700 px-1.5 py-0.5 rounded font-semibold border border-amber-100">
+                  {data?.funnelStats?.eventLabels?.step2 || 'Lead'}
+                </span>
+              </div>
+              <p className="text-base md:text-lg font-bold text-gray-900 leading-tight">
+                {loading ? '...' : data?.funnelStats?.lead || 0}
+              </p>
+              <p className="text-[11px] font-semibold text-gray-700 mt-0.5">Tahap 2: WARM</p>
+              <p className="text-[10px] text-gray-400 mt-0.5">Pembeli membalas pesan CS</p>
+            </div>
+
+            {/* Step 3: HOT */}
+            <div className="bg-white p-2.5 rounded-xl border border-gray-200 shadow-2xs relative">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="w-6 h-6 bg-purple-50 text-purple-600 rounded-lg flex items-center justify-center">
+                  <ShoppingCart className="w-3.5 h-3.5" />
+                </div>
+                <span className="font-mono text-[10px] bg-purple-50 text-purple-700 px-1.5 py-0.5 rounded font-semibold border border-purple-100">
+                  {data?.funnelStats?.eventLabels?.step3 || 'AddToCart'}
+                </span>
+              </div>
+              <p className="text-base md:text-lg font-bold text-gray-900 leading-tight">
+                {loading ? '...' : data?.funnelStats?.hot ?? data?.funnelStats?.addToCart ?? 0}
+              </p>
+              <p className="text-[11px] font-semibold text-gray-700 mt-0.5">Tahap 3: HOT</p>
+              <p className="text-[10px] text-gray-400 mt-0.5">Masuk ke form order / mau bayar</p>
+            </div>
+
+            {/* Step 4: CLOSING */}
+            <div className="bg-white p-2.5 rounded-xl border border-emerald-300 ring-2 ring-emerald-100 shadow-2xs relative">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="w-6 h-6 bg-emerald-50 text-emerald-600 rounded-lg flex items-center justify-center">
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                </div>
+                <span className="font-mono text-[10px] bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded font-semibold border border-emerald-200">
+                  {data?.funnelStats?.eventLabels?.step4 || 'Purchase'}
+                </span>
+              </div>
+              <p className="text-base md:text-lg font-bold text-emerald-700 leading-tight">
+                {loading ? '...' : data?.funnelStats?.purchase || 0}
+              </p>
+              <p className="text-[11px] font-semibold text-emerald-900 mt-0.5">Tahap 4: CLOSING</p>
+              <p className="text-[10px] text-emerald-600 mt-0.5">Deal / Transfer / COD disetujui</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── 3. LEADERBOARD PIC MARKETING ── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+        <div className="border-b border-gray-100 px-4 py-3 flex items-center justify-between bg-white">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600">
+              <Users className="w-3.5 h-3.5" />
+            </div>
+            <div>
+              <h2 className="text-xs font-bold text-gray-900">Leaderboard PIC Marketing</h2>
+              <p className="text-[10px] text-gray-500">Evaluasi efisiensi budget & closing rate per pengiklan</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="p-3 bg-gray-50/50">
+          {loading ? (
+            <div className="flex items-center justify-center gap-1.5 py-6 text-gray-500 text-xs bg-white rounded-xl border border-dashed">
+              <DotGridLoader /> Memuat data leaderboard...
+            </div>
+          ) : !data?.picScorecard || data.picScorecard.length === 0 ? (
+            <div className="text-center py-6 text-gray-400 text-xs bg-white rounded-xl border border-dashed">
+              Belum ada data performa PIC pada periode ini.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+              {data.picScorecard.map((pic, idx) => (
+                <div
+                  key={idx}
+                  onClick={() => setSelectedPic(selectedPic === pic.picName ? null : pic.picName)}
+                  className={`bg-white p-2.5 rounded-xl border transition-all cursor-pointer hover:shadow-xs hover:border-indigo-300 ${
+                    selectedPic === pic.picName ? 'border-indigo-500 ring-2 ring-indigo-100' : 'border-gray-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-[10px] font-bold">
+                        {pic.picName.charAt(0).toUpperCase()}
+                      </div>
+                      <h3 className="font-bold text-gray-900 text-xs truncate max-w-[110px]">{pic.picName}</h3>
+                    </div>
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                      pic.roas >= 3.5 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                      pic.roas >= 2.5 ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                      'bg-rose-50 text-rose-700 border-rose-200'
+                    }`}>
+                      {pic.roas >= 3.5 ? '🚀 ' : pic.roas >= 2.5 ? '🟢 ' : '⚠️ '}
+                      {pic.roas.toFixed(2)}x
+                    </span>
+                  </div>
+
+                  <div className="space-y-0.5 text-[11px] pt-1 border-t border-gray-100">
+                    <div className="flex justify-between text-gray-500">
+                      <span>Spend:</span>
+                      <span className="font-semibold text-gray-700">{formatCurrency(pic.spend)}</span>
+                    </div>
+                    <div className="flex justify-between text-gray-500">
+                      <span>Omset:</span>
+                      <span className="font-semibold text-emerald-600">{formatCurrency(pic.omset)}</span>
+                    </div>
+                    <div className="flex justify-between text-gray-500">
+                      <span>Closing:</span>
+                      <span className="font-semibold text-indigo-600">{pic.closing} leads</span>
+                    </div>
+                    <div className="flex justify-between text-gray-500">
+                      <span>CPP:</span>
+                      <span className="font-semibold text-gray-700">{pic.cpp > 0 ? formatCurrency(pic.cpp) : '-'}</span>
+                    </div>
+                    <div className="flex justify-between text-gray-500">
+                      <span>CPR:</span>
+                      <span className="font-semibold text-gray-700">{pic.cpr > 0 ? formatCurrency(pic.cpr) : '-'}</span>
+                    </div>
+                    <div className="flex justify-between text-gray-500">
+                      <span>Result:</span>
+                      <span className="font-semibold text-gray-700">{new Intl.NumberFormat('id-ID').format(pic.result || 0)}</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── BEST DAY TO RUN ADS WIDGET ── */}
+      {bestDayData && (
+        <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+          <div className="border-b border-gray-100 px-4 py-3 flex items-center justify-between bg-white">
+            <div className="flex items-center gap-2">
+              <div className="w-6 h-6 rounded-lg bg-amber-50 flex items-center justify-center text-amber-600">
+                <Calendar className="w-3.5 h-3.5" />
+              </div>
+              <div>
+                <h2 className="text-xs font-bold text-gray-900">Best Day to Run Ads</h2>
+                <p className="text-[10px] text-gray-500">Analisis performa harian berdasarkan ROAS dan Konversi CS</p>
+              </div>
+            </div>
+            {bestDayData.bestDay && (
+              <span className="text-[10px] font-semibold bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full border border-amber-200 flex items-center gap-1">
+                ⭐ Peak Day: {bestDayData.bestDay}
+              </span>
+            )}
+          </div>
+          
+          <div className="p-4 bg-gray-50/50">
+            <div className="grid grid-cols-2 md:grid-cols-7 gap-2">
+              {['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'].map((dayName, idx) => {
+                const dayData = bestDayData.days.find(d => d.dayOfWeek === idx);
+                const isBest = bestDayData.bestDay === dayName;
+                const isLow = bestDayData.lowDayName === dayName;
+                
+                return (
+                  <div key={dayName} className={`bg-white p-3 rounded-xl border ${isBest ? 'border-amber-400 ring-2 ring-amber-100 shadow-md relative' : isLow ? 'border-gray-200 opacity-60' : 'border-gray-200'}`}>
+                    {isBest && <div className="absolute -top-2 -right-2 bg-amber-400 text-white text-[9px] font-bold px-1.5 py-0.5 rounded shadow-sm">#1 JUARA</div>}
+                    <h3 className="font-bold text-gray-900 text-sm mb-2 text-center">{dayName}</h3>
+                    
+                    <div className="space-y-1.5 text-[10px]">
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-500">Spend</span>
+                        <span className="font-mono font-semibold text-gray-700">{dayData ? formatCurrency(dayData.spend) : '-'}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-500">Omset</span>
+                        <span className="font-mono font-semibold text-emerald-600">{dayData ? formatCurrency(dayData.omset) : '-'}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-500">ROAS</span>
+                        <span className={`font-mono font-bold ${(dayData?.roas || 0) > 2 ? 'text-indigo-600' : 'text-gray-600'}`}>
+                          {dayData && dayData.spend > 0 ? `${dayData.roas.toFixed(2)}x` : '-'}
+                        </span>
+                      </div>
+                    </div>
+                    
+                    {/* Score Bar */}
+                    <div className="mt-3 h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                      <div 
+                        className={`h-full ${isBest ? 'bg-amber-400' : 'bg-indigo-400'}`} 
+                        style={{ width: `${Math.min(100, (dayData?.score || 0) * 100)}%` }} 
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="mt-4 p-3 bg-indigo-50 border border-indigo-100 rounded-lg text-xs text-indigo-800 flex items-start gap-2">
+              <span className="text-lg">💡</span>
+              <p>{bestDayData.recommendation}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── TOP CREATIVES WIDGET ── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+          <div className="border-b border-gray-100 px-4 py-3 flex items-center justify-between bg-white">
+            <div className="flex items-center gap-2">
+              <div className={`w-6 h-6 rounded-lg flex items-center justify-center ${creativeViewMode === 'fatigue' ? 'bg-rose-50 text-rose-600' : 'bg-emerald-50 text-emerald-600'}`}>
+                {creativeViewMode === 'fatigue' ? <Flame className="w-3.5 h-3.5" /> : <ArrowUp className="w-3.5 h-3.5" />}
+              </div>
+              <div>
+                <h2 className="text-xs font-bold text-gray-900 flex items-center gap-2">
+                  {creativeViewMode === 'fatigue' ? 'Top Ad Fatigue' : 'Top Creatives by CTR'}
+                  {selectedPic && (
+                    <span className="px-1.5 py-0.5 text-[9px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-md">
+                      PIC: {selectedPic}
+                    </span>
+                  )}
+                </h2>
+                <p className="text-[10px] text-gray-500">{creativeViewMode === 'fatigue' ? 'Berdasar 28 hari terakhir (terpisah dari filter tanggal di atas) -- perlu min. 2 minggu data' : 'Materi iklan dengan click-through-rate tertinggi'}</p>
+              </div>
+            </div>
+            <div className="flex items-center gap-2">
+              <div className="flex items-center bg-gray-100 rounded-lg p-0.5 text-[10px] font-semibold">
+                <button
+                  onClick={() => setCreativeViewMode('ctr')}
+                  className={`px-2.5 py-1 rounded-md transition-colors ${creativeViewMode === 'ctr' ? 'bg-white text-gray-900 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}
+                >
+                  Top Creative
+                </button>
+                <button
+                  onClick={() => setCreativeViewMode('fatigue')}
+                  className={`px-2.5 py-1 rounded-md transition-colors ${creativeViewMode === 'fatigue' ? 'bg-white text-rose-600 shadow-xs' : 'text-gray-500 hover:text-gray-700'}`}
+                >
+                  Top Ad Fatigue
+                </button>
+              </div>
+              <select
+                value={creativesLimit}
+                onChange={(e) => setCreativesLimit(Number(e.target.value))}
+                className="px-2 py-1 text-[11px] bg-gray-50 border border-gray-200 rounded-md text-gray-700"
+              >
+                <option value={5}>Top 5</option>
+                <option value={10}>Top 10</option>
+                <option value={20}>Top 20</option>
+              </select>
+            </div>
+          </div>
+          
+          <div className="p-4 bg-gray-50/50">
+          {creativeViewMode === 'fatigue' ? (
+            <>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3">
+              {filteredFatigueAds.map((ad, idx) => {
+                const sevStyle: Record<string, string> = {
+                  severe: 'bg-red-600 text-white',
+                  moderate: 'bg-amber-500 text-white',
+                  mild: 'bg-yellow-400 text-gray-900',
+                  none: 'bg-gray-300 text-gray-700',
+                };
+                const sevLabel: Record<string, string> = {
+                  severe: 'Parah',
+                  moderate: 'Moderat',
+                  mild: 'Ringan',
+                  none: 'Aman',
+                };
+                return (
+                <div key={ad.adId} className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-xs hover:shadow-md transition-all flex flex-col group relative">
+                  <div className="absolute top-2 left-2 bg-black/70 text-white text-[10px] font-bold px-1.5 py-0.5 rounded backdrop-blur-sm z-10">
+                    #{idx + 1}
+                  </div>
+                  <div className={`absolute top-2 right-2 text-[9px] font-bold px-1.5 py-0.5 rounded shadow-sm flex items-center gap-1 z-10 backdrop-blur-xs ${sevStyle[ad.severityOverall] || sevStyle.none}`}>
+                    <Flame className="w-2.5 h-2.5" /> {sevLabel[ad.severityOverall] || 'Aman'}
+                  </div>
+
+                  <div
+                    onClick={() => setFatigueInsightAd(ad)}
+                    className="w-full h-36 bg-gray-950 relative flex items-center justify-center overflow-hidden border-b border-gray-100 cursor-pointer"
+                  >
+                    {ad.thumbnailUrl ? (
+                      <img
+                        src={ad.thumbnailUrl}
+                        alt={ad.adName}
+                        className="object-cover w-full h-full group-hover:scale-105 transition-transform duration-300"
+                      />
+                    ) : (
+                      <div className="flex flex-col items-center justify-center text-gray-500 text-center p-2">
+                        <ImageIcon className="w-6 h-6 mb-1 opacity-40" />
+                        <span className="text-[10px]">No Thumbnail</span>
+                      </div>
+                    )}
+                  </div>
+
+                  <div className="p-2.5 flex flex-col flex-grow">
+                    <h3 className="font-bold text-gray-900 text-xs truncate" title={ad.adName}>{ad.adName}</h3>
+                    <p className="text-[9px] text-gray-500 truncate mb-2" title={ad.campaignName}>{ad.campaignName}</p>
+
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-[10px] text-gray-500">Frekuensi</span>
+                      <span className="font-mono text-xs font-bold text-gray-800">{ad.currentFrequency.toFixed(2)}x</span>
+                    </div>
+
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-[10px] text-gray-500">CTR decay</span>
+                      <span className={`font-mono text-[10px] font-semibold ${ad.computedDecay.ctrDecay.startsWith('-') ? 'text-red-600' : 'text-gray-700'}`}>{ad.computedDecay.ctrDecay}</span>
+                    </div>
+
+                    <div className="flex justify-between items-center mb-3">
+                      <span className="text-[10px] text-gray-500">CPM creep</span>
+                      <span className="font-mono text-[10px] font-semibold text-gray-700">{ad.computedDecay.cpmCreep}</span>
+                    </div>
+
+                    <button
+                      onClick={() => setFatigueInsightAd(ad)}
+                      className="mt-auto w-full py-1.5 text-[10px] font-semibold text-rose-600 bg-rose-50 hover:bg-rose-100 rounded-lg transition-colors border border-rose-100 flex items-center justify-center gap-1"
+                    >
+                      <Flame className="w-3 h-3" /> Detail &amp; Rekomendasi
+                    </button>
+                  </div>
+                </div>
+                );
+              })}
+            </div>
+            {filteredFatigueAds.length === 0 && !fatigueLoading && (
+              <div className="text-center py-8 text-gray-400 text-xs border-t border-dashed rounded-b-xl">
+                Tidak ada ads terindikasi fatigue pada rentang tanggal ini (atau datanya di bawah ambang minimum 1.000 impresi/50 klik).
+              </div>
+            )}
+            {fatigueLoading && (
+              <div className="text-center py-8 text-gray-400 text-xs flex items-center justify-center gap-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin" /> Menganalisa sinyal fatigue (frekuensi/CTR/CPM mingguan)...
+              </div>
+            )}
+            {fatigueError && (
+              <div className="text-center py-4 text-red-500 text-xs">{fatigueError}</div>
+            )}
+            </>
+          ) : (
+            <>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3">
+              {filteredTopCreatives.map((ad, idx) => (
+                <div key={ad.adId} className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-xs hover:shadow-md transition-all flex flex-col group relative">
+                  <div className="absolute top-2 left-2 bg-black/70 text-white text-[10px] font-bold px-1.5 py-0.5 rounded backdrop-blur-sm z-10">
+                    #{idx + 1}
+                  </div>
+
+                  {/* Media Type Badge */}
+                  {ad.mediaType === 'VIDEO' ? (
+                    <div className="absolute top-2 right-2 bg-rose-600/90 text-white text-[9px] font-bold px-1.5 py-0.5 rounded shadow-sm flex items-center gap-1 z-10 backdrop-blur-xs">
+                      <Play className="w-2.5 h-2.5 fill-current" /> Video
+                    </div>
+                  ) : (
+                    <div className="absolute top-2 right-2 bg-blue-600/90 text-white text-[9px] font-bold px-1.5 py-0.5 rounded shadow-sm flex items-center gap-1 z-10 backdrop-blur-xs">
+                      <ImageIcon className="w-2.5 h-2.5" /> Gambar
+                    </div>
+                  )}
+                  
+                  {/* Thumbnail Container */}
+                  <div 
+                    onClick={() => setInsightAd(ad)}
+                    className="w-full h-36 bg-gray-950 relative flex items-center justify-center overflow-hidden border-b border-gray-100 cursor-pointer"
+                  >
+                    {ad.thumbnailUrl ? (
+                      <img 
+                        src={ad.thumbnailUrl} 
+                        alt={ad.adName} 
+                        className="object-cover w-full h-full group-hover:scale-105 transition-transform duration-300" 
+                      />
+                    ) : (
+                      <div className="flex flex-col items-center justify-center text-gray-500 text-center p-2">
+                        <ImageIcon className="w-6 h-6 mb-1 opacity-40" />
+                        <span className="text-[10px]">No Thumbnail</span>
+                      </div>
+                    )}
+
+                    {/* Play Button Overlay for Video */}
+                    {ad.mediaType === 'VIDEO' && (
+                      <div className="absolute inset-0 flex items-center justify-center bg-black/25 group-hover:bg-black/40 transition-colors">
+                        <div className="w-9 h-9 rounded-full bg-white/90 shadow-md flex items-center justify-center text-rose-600 group-hover:scale-110 transition-transform">
+                          <Play className="w-4 h-4 fill-current ml-0.5" />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                  
+                  <div className="p-2.5 flex flex-col flex-grow">
+                    <h3 className="font-bold text-gray-900 text-xs truncate" title={ad.adName}>{ad.adName}</h3>
+                    <p className="text-[9px] text-gray-500 truncate mb-2" title={ad.campaignName}>{ad.campaignName}</p>
+                    
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-[10px] text-gray-500">CTR</span>
+                      <span className="font-mono text-xs font-bold text-emerald-600">{ad.ctr.toFixed(2)}%</span>
+                    </div>
+                    
+                    <div className="flex justify-between items-center mb-3">
+                      <span className="text-[10px] text-gray-500">Spend</span>
+                      <span className="font-mono text-[10px] font-semibold text-gray-700">{formatCurrency(ad.spend)}</span>
+                    </div>
+                    
+                    <div className="mt-auto">
+                      {(() => {
+                        const info = formatMetaRanking(ad.qualityRanking);
+                        return (
+                          <div className={`text-[9px] font-bold px-1.5 py-1 rounded text-center truncate ${info.className}`} title={`Quality Ranking: ${info.label}`}>
+                            {info.label}
+                          </div>
+                        );
+                      })()}
+                    </div>
+                    
+                    <button 
+                      onClick={() => setInsightAd(ad)}
+                      className="mt-2 w-full py-1.5 text-[10px] font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors border border-indigo-100 flex items-center justify-center gap-1"
+                    >
+                      {ad.mediaType === 'VIDEO' ? <Play className="w-3 h-3 fill-current text-rose-500" /> : <ImageIcon className="w-3 h-3 text-blue-500" />}
+                      Preview & Insight
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {/* [2026-08-27] Loading state ditambahkan -- sebelumnya widget ini kosong total pas awal buka (beda dari tab Top Ad Fatigue yang sudah punya fatigueLoading + spinner).
+                [2026-08-27, fix] HARUS dibarengi `filteredTopCreatives.length === 0` -- widget ini sengaja stale-while-revalidate
+                (grid lama TETAP tampil pas refresh/ganti limit/tanggal biar gak flicker kosong), jadi spinner cuma boleh nongol pas
+                BENERAN belum pernah ada data (initial load), bukan tiap kali `loading` true (klik Refresh dkk) -- kalau kagak, dulu
+                sempat kejadian spinner nongol BARENGAN sama card lama yang masih kepampang. */}
+            {loading && filteredTopCreatives.length === 0 && (
+              <div className="text-center py-8 text-gray-400 text-xs flex items-center justify-center gap-2 border-t border-dashed rounded-b-xl">
+                <DotGridLoader /> Memuat data top creative...
+              </div>
+            )}
+            {filteredTopCreatives.length === 0 && !loading && (
+              <div className="text-center py-8 text-gray-400 text-xs border-t border-dashed rounded-b-xl">
+                Belum ada data creative dengan tayangan memadai (min. 100 imp).
+              </div>
+            )}
+            </>
+          )}
+          </div>
+        </div>
+
+{/* ── BREAKDOWNS (GEOGRAPHIC & PLACEMENT) ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        {/* Geographic */}
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-sm">
+          <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between bg-gray-50/50">
+            <div>
+              <h3 className="font-bold text-gray-900 text-sm">Geographic Performance</h3>
+              <p className="text-xs text-gray-500 mt-0.5">Top 10 lokasi dengan spend terbanyak</p>
+            </div>
+            <MapPin className="w-4 h-4 text-gray-400" />
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-gray-50 text-gray-500 uppercase font-semibold text-[10px]">
+                <tr>
+                  <th className="px-4 py-2">Location</th>
+                  <th className="px-4 py-2 text-right">Spend</th>
+                  <th className="px-4 py-2 text-right">CTR</th>
+                  <th className="px-4 py-2 text-right">CPC</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {!breakdowns ? (
+                  <tr><td colSpan={4} className="px-4 py-4 text-center text-gray-400">
+                    <span className="inline-flex items-center justify-center gap-1.5">
+                      <DotGridLoader /> Memuat data...
+                    </span>
+                  </td></tr>
+                ) : breakdowns.geographic.length === 0 ? (
+                  <tr><td colSpan={4} className="px-4 py-4 text-center text-gray-400">Tidak ada data lokasi</td></tr>
+                ) : (
+                  breakdowns.geographic.map((geo, i) => (
+                    <tr key={i} className="hover:bg-gray-50">
+                      <td className="px-4 py-2 font-medium text-gray-700">{geo.location}</td>
+                      <td className="px-4 py-2 text-right tabular-nums text-gray-600">{formatCurrency(geo.spend)}</td>
+                      <td className="px-4 py-2 text-right tabular-nums text-gray-600">{(geo.ctr || 0).toFixed(2)}%</td>
+                      <td className="px-4 py-2 text-right tabular-nums font-medium text-indigo-600">{formatCurrency(geo.cpc || 0)}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+
+        {/* Placement */}
+        <div className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-sm">
+          <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between bg-gray-50/50">
+            <div>
+              <h3 className="font-bold text-gray-900 text-sm">Placement Performance</h3>
+              <p className="text-xs text-gray-500 mt-0.5">Distribusi performa antar platform (FB, IG, dll)</p>
+            </div>
+            <LayoutGrid className="w-4 h-4 text-gray-400" />
+          </div>
+          <div className="overflow-x-auto">
+            <table className="w-full text-left text-xs">
+              <thead className="bg-gray-50 text-gray-500 uppercase font-semibold text-[10px]">
+                <tr>
+                  <th className="px-4 py-2">Platform</th>
+                  <th className="px-4 py-2 text-right">Spend</th>
+                  <th className="px-4 py-2 text-right">CTR</th>
+                  <th className="px-4 py-2 text-right">CPC</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-gray-100">
+                {!breakdowns ? (
+                  <tr><td colSpan={4} className="px-4 py-4 text-center text-gray-400">
+                    <span className="inline-flex items-center justify-center gap-1.5">
+                      <DotGridLoader /> Memuat data...
+                    </span>
+                  </td></tr>
+                ) : breakdowns.placement.length === 0 ? (
+                  <tr><td colSpan={4} className="px-4 py-4 text-center text-gray-400">Tidak ada data placement</td></tr>
+                ) : (
+                  breakdowns.placement.map((pl, i) => (
+                    <tr key={i} className="hover:bg-gray-50">
+                      <td className="px-4 py-2 font-medium text-gray-700">{pl.placement}</td>
+                      <td className="px-4 py-2 text-right tabular-nums text-gray-600">{formatCurrency(pl.spend)}</td>
+                      <td className="px-4 py-2 text-right tabular-nums text-gray-600">{(pl.ctr || 0).toFixed(2)}%</td>
+                      <td className="px-4 py-2 text-right tabular-nums font-medium text-indigo-600">{formatCurrency(pl.cpc || 0)}</td>
+                    </tr>
+                  ))
+                )}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      {/* ── 4. TABEL DRILL-DOWN CAMPAIGN (SEARCH, FILTER AKUN, & MULTI-SORT) ── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+        {/* Header & Controls */}
+        <div className="border-b border-gray-100 p-3 bg-white space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <div className="w-6 h-6 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600">
+                <Layers className="w-3.5 h-3.5" />
+              </div>
+              <div>
+                <h2 className="text-xs font-bold text-gray-900 flex items-center gap-2">
+                  Drill-down Campaign
+                  {selectedPic && (
+                    <span className="px-2 py-0.5 text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-md">
+                      PIC: {selectedPic}
+                    </span>
+                  )}
+                  {selectedAccount !== 'ALL' && (
+                    <span className="px-2 py-0.5 text-[10px] font-semibold bg-sky-50 text-sky-700 border border-sky-200 rounded-md">
+                      Akun: {selectedAccount}
+                    </span>
+                  )}
+                  {selectedSpendFilter !== 'ALL' && (
+                    <span className="px-2 py-0.5 text-[10px] font-semibold bg-amber-50 text-amber-700 border border-amber-200 rounded-md">
+                      {selectedSpendFilter === 'SPEND' ? 'Ada Spend' : 'Tidak Ada Spend'}
+                    </span>
+                  )}
+                </h2>
+                <p className="text-[10px] text-gray-500">
+                  Menampilkan {filteredCampaigns.length} kampanye (klik header kolom untuk mengurutkan data)
+                </p>
+              </div>
+            </div>
+
+            {(selectedPic || selectedAccount !== 'ALL' || selectedStatus !== 'ALL' || selectedSpendFilter !== 'ALL' || searchQuery) && (
+              <button
+                onClick={() => {
+                  setSelectedPic(null);
+                  setSelectedAccount('ALL');
+                  setSelectedStatus('ALL');
+                  setSelectedSpendFilter('ALL');
+                  setSearchQuery('');
+                }}
+                className="inline-flex items-center gap-1 text-[11px] text-rose-600 hover:text-rose-700 font-semibold bg-rose-50 hover:bg-rose-100 px-2 py-1 rounded-md transition-colors w-fit"
+              >
+                <X className="w-3 h-3" />
+                Reset Semua Filter
+              </button>
+            )}
+          </div>
+
+          {/* Search Bar & Dropdown Filter */}
+          <div className="flex flex-col sm:flex-row items-center gap-2 pt-1">
+            {/* Search Input */}
+            <div className="relative flex-1 w-full">
+              <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Cari nama campaign, akun iklan, PIC, atau ID..."
+                className="w-full pl-8 pr-8 py-1.5 text-xs bg-gray-50/50 border border-gray-200 rounded-lg text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:bg-white transition-all"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* Filter Status */}
+            <div className="flex items-center gap-1.5 w-full sm:w-auto">
+              <select
+                value={selectedStatus}
+                onChange={(e) => setSelectedStatus(e.target.value)}
+                className="w-full sm:w-32 px-2.5 py-1.5 text-xs bg-gray-50/50 border border-gray-200 rounded-lg text-gray-700 font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:bg-white"
+              >
+                <option value="ALL">Semua Status</option>
+                {availableStatuses.map((st) => (
+                  <option key={st} value={st}>
+                    {st}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* Filter Akun Iklan */}
+            <div className="flex items-center gap-1.5 w-full sm:w-auto">
+              <Filter className="w-3.5 h-3.5 text-gray-400 hidden sm:block" />
+              <select
+                value={selectedAccount}
+                onChange={(e) => setSelectedAccount(e.target.value)}
+                className="w-full sm:w-48 px-2.5 py-1.5 text-xs bg-gray-50/50 border border-gray-200 rounded-lg text-gray-700 font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:bg-white"
+              >
+                <option value="ALL">Semua Akun Iklan ({availableAccounts.length})</option>
+                {availableAccounts.map((acc) => (
+                  <option key={acc} value={acc}>
+                    {acc}
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            {/* [2026-08-27] Filter Spend / Tidak Spend */}
+            <div className="flex items-center gap-1.5 w-full sm:w-auto">
+              <select
+                value={selectedSpendFilter}
+                onChange={(e) => setSelectedSpendFilter(e.target.value as 'ALL' | 'SPEND' | 'NO_SPEND')}
+                className="w-full sm:w-40 px-2.5 py-1.5 text-xs bg-gray-50/50 border border-gray-200 rounded-lg text-gray-700 font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:bg-white"
+              >
+                <option value="ALL">Semua (Spend & Tidak)</option>
+                <option value="SPEND">Ada Spend</option>
+                <option value="NO_SPEND">Tidak Ada Spend</option>
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs text-gray-600">
+            <thead className="bg-gray-50/90 text-gray-700 text-[11px] uppercase font-bold border-b border-gray-200 select-none">
+              <tr>
+                {/* Campaign */}
+                <th
+                  onClick={() => handleSort('campaignName')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100 transition-colors sticky left-0 bg-gray-50 z-10 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.1)]"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Campaign</span>
+                    {sortField === 'campaignName' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Akun Iklan */}
+                <th
+                  onClick={() => handleSort('accountName')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Akun Iklan</span>
+                    {sortField === 'accountName' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* PIC */}
+                <th className="px-4 py-2.5 whitespace-nowrap">
+                  <span>PIC</span>
+                </th>
+
+                {/* Budget -- [2026-08-26] klik buka popup "Rekomendasi Budget"; nilai nominal budget
+                    harian ditampilkan langsung (bukan cuma tombol label) */}
+                <th className="px-4 py-2.5 whitespace-nowrap">
+                  <span>Budget</span>
+                </th>
+
+                {/* Spend */}
+                <th
+                  onClick={() => handleSort('spend')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Spend</span>
+                    {sortField === 'spend' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Result */}
+                <th
+                  onClick={() => handleSort('result')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Result</span>
+                    {sortField === 'result' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* CPR */}
+                <th
+                  onClick={() => handleSort('cpr')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>CPR</span>
+                    {sortField === 'cpr' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* CPP */}
+                <th
+                  onClick={() => handleSort('cpp')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>CPP</span>
+                    {sortField === 'cpp' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Clicks */}
+                <th
+                  onClick={() => handleSort('clicks')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Clicks</span>
+                    {sortField === 'clicks' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* CTR */}
+                <th
+                  onClick={() => handleSort('ctr')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>CTR</span>
+                    {sortField === 'ctr' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Frequency */}
+                <th
+                  onClick={() => handleSort('frequency')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Freq</span>
+                    {sortField === 'frequency' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Omset CS */}
+                <th
+                  onClick={() => handleSort('omset')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Omset CS</span>
+                    {sortField === 'omset' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Closing */}
+                <th
+                  onClick={() => handleSort('closing')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Closing</span>
+                    {sortField === 'closing' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* ROAS */}
+                <th
+                  onClick={() => handleSort('roas')}
+                  className="px-4 py-2.5 text-right cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center justify-end gap-1">
+                    <span>ROAS</span>
+                    {sortField === 'roas' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Audit AI */}
+                <th className="px-4 py-2.5 whitespace-nowrap text-center">
+                  <span>Audit AI</span>
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {loading ? (
+                <tr><td colSpan={15} className="px-4 py-8 text-center text-gray-400">
+                  <span className="inline-flex items-center gap-1.5">
+                    <DotGridLoader /> Memuat data kampanye...
+                  </span>
+                </td></tr>
+              ) : filteredCampaigns.length === 0 ? (
+                <tr>
+                  <td colSpan={15} className="px-4 py-8 text-center text-gray-400">
+                    {searchQuery || selectedAccount !== 'ALL' || selectedStatus !== 'ALL' || selectedSpendFilter !== 'ALL' || selectedPic
+                      ? 'Tidak ada kampanye yang cocok dengan filter / pencarian.'
+                      : 'Tidak ada kampanye pada periode ini.'}
+                  </td>
+                </tr>
+              ) : (
+                filteredCampaigns.map((c, idx) => (
+                  <tr key={idx} className="hover:bg-indigo-50/30 transition-colors group">
+                    {/* Campaign Name & Status */}
+                    <td className="px-4 py-2.5 font-medium text-gray-900 sticky left-0 bg-white z-10 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)] group-hover:bg-indigo-50 whitespace-nowrap">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                          c.status === 'Active' ? 'bg-emerald-500' : 'bg-gray-400'
+                        }`} />
+                        <span className="font-semibold text-gray-900 group-hover:text-indigo-600 transition-colors">
+                          {c.campaignName}
+                        </span>
+                        {c.status && c.status !== '-' && (
+                          <span className={`text-[9px] px-1.5 py-0.2 rounded font-semibold ${
+                            c.status === 'Active'
+                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                              : 'bg-gray-100 text-gray-600 border border-gray-200'
+                          }`}>
+                            {c.status}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Akun Iklan -- klik = buka popup Health Score akun ini (2026-08-25, pindahan dari
+                        Blok 3 /app/ai-ads sesuai brainstorming Bossfren) */}
+                    <td className="px-4 py-2.5 text-gray-700 whitespace-nowrap">
+                      {c.campaignId !== 'ORGANIC' && c.accountId && c.accountId !== '-' && c.bmId ? (
+                        <button
+                          onClick={() => setHealthScoreCampaign(c)}
+                          className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-gray-100 text-gray-800 border border-gray-200 hover:bg-indigo-50 hover:border-indigo-300 hover:text-indigo-700 whitespace-nowrap transition-colors"
+                          title="Lihat Health Score & Quick Wins akun iklan ini"
+                        >
+                          <Building2 className="w-3 h-3 text-gray-500" />
+                          <span>{c.accountName || '-'}</span>
+                        </button>
+                      ) : (
+                        <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-gray-100 text-gray-800 border border-gray-200 whitespace-nowrap">
+                          <Building2 className="w-3 h-3 text-gray-500" />
+                          <span>{c.accountName || '-'}</span>
+                        </div>
+                      )}
+                    </td>
+
+                    {/* PIC */}
+                    <td className="px-4 py-2.5 text-gray-600 whitespace-nowrap">
+                      <span className="font-medium">{c.picName || '-'}</span>
+                    </td>
+
+                    {/* Budget -- [2026-08-26] klik buka popup "Rekomendasi Budget" (Layer 1 fakta +
+                        Layer 2 narasi AI). Nilai nominal budget harian campaign (CBO) ditampilkan
+                        langsung dari data tabel yang sudah ada -- kalau ABO (budget di ad set, bukan
+                        campaign) field ini null, popup yang isi angka gabungan ad set aktifnya. */}
+                    <td className="px-3 py-2.5 whitespace-nowrap">
+                      {c.campaignId === 'ORGANIC' ? (
+                        <span className="text-gray-400 font-normal text-xs">-</span>
+                      ) : (
+                        <button
+                          onClick={() => openBudgetPanel(c)}
+                          title="Lihat rekomendasi budget & status bid campaign ini"
+                          className="flex items-center gap-1 text-[11px] font-mono font-semibold text-indigo-700 bg-indigo-50 hover:bg-indigo-100 rounded-lg px-2 py-1 transition-colors border border-indigo-100"
+                        >
+                          <CreditCard className="w-3 h-3 shrink-0" />
+                          {c.dailyBudget != null ? formatCurrency(c.dailyBudget) : 'Lihat'}
+                        </button>
+                      )}
+                    </td>
+
+                    {/* Spend */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700 whitespace-nowrap">
+                      {formatCurrency(c.spend)}
+                    </td>
+
+                    {/* Result */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700 whitespace-nowrap">
+                      {(() => {
+                        const meta = getMetaResultAndCpr(c);
+                        if (c.campaignId === 'ORGANIC') {
+                          return <span className="text-gray-400 font-normal">-</span>;
+                        }
+                        return (
+                          <div className="flex flex-col items-start">
+                            <span className="font-semibold text-gray-800">
+                              {meta.resultValue > 0 ? new Intl.NumberFormat('id-ID').format(meta.resultValue) : '-'}
+                            </span>
+                            <span className="text-[9px] text-gray-500 bg-gray-100 px-1 py-0.5 rounded border border-gray-200 mt-0.5 leading-none">
+                              {meta.resultLabel}
+                            </span>
+                          </div>
+                        );
+                      })()}
+                    </td>
+
+                    {/* CPR */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700 whitespace-nowrap">
+                      {(() => {
+                        const meta = getMetaResultAndCpr(c);
+                        if (c.campaignId === 'ORGANIC') {
+                          return <span className="text-gray-400 font-normal">-</span>;
+                        }
+                        return (
+                          <div className="flex flex-col items-start">
+                            <span className="font-semibold text-gray-800">
+                              {meta.cprValue > 0 ? formatCurrency(meta.cprValue) : '-'}
+                            </span>
+                            <span className="text-[9px] text-gray-500 bg-gray-100 px-1 py-0.5 rounded border border-gray-200 mt-0.5 leading-none">
+                              {meta.badgeLabel}
+                            </span>
+                          </div>
+                        );
+                      })()}
+                    </td>
+
+                    {/* CPP */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700 whitespace-nowrap">
+                      {c.campaignId === 'ORGANIC' || c.closing === 0 ? (
+                        <span className="text-gray-400 font-normal">-</span>
+                      ) : (
+                        <span className="font-semibold text-gray-800">{formatCurrency(c.spend / c.closing)}</span>
+                      )}
+                    </td>
+
+                    {/* Clicks */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700 whitespace-nowrap">
+                      {new Intl.NumberFormat('id-ID').format(c.clicks || 0)}
+                    </td>
+
+                    {/* CTR -- [2026-08-26] klik buka panel "ad mana yg nyeret CTR turun/naik" */}
+                    <td className="px-3 py-2.5 whitespace-nowrap">
+                      {c.campaignId === 'ORGANIC' ? (
+                        <span className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold border inline-block ${
+                          (c.ctr || 0) > 2.5 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                          (c.ctr || 0) > 1.5 ? 'bg-amber-50 text-amber-700 border-amber-200' :
+                          'bg-rose-50 text-rose-700 border-rose-200'
+                        }`}>
+                          {(c.ctr || 0).toFixed(2)}%
+                        </span>
+                      ) : (
+                        <button
+                          onClick={() => openCampaignAdsCtrPanel(c)}
+                          title="Lihat ad mana yang nyeret CTR campaign ini naik/turun"
+                          className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold border inline-block cursor-pointer hover:ring-2 hover:ring-offset-1 transition-all ${
+                            (c.ctr || 0) > 2.5 ? 'bg-emerald-50 text-emerald-700 border-emerald-200 hover:ring-emerald-300' :
+                            (c.ctr || 0) > 1.5 ? 'bg-amber-50 text-amber-700 border-amber-200 hover:ring-amber-300' :
+                            'bg-rose-50 text-rose-700 border-rose-200 hover:ring-rose-300'
+                          }`}
+                        >
+                          {(c.ctr || 0).toFixed(2)}%
+                        </button>
+                      )}
+                    </td>
+
+                    {/* Frequency */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700 whitespace-nowrap">
+                      <div className="flex items-center gap-1 whitespace-nowrap">
+                        <span>{(c.frequency || 0).toFixed(2)}x</span>
+                        {(c.frequency || 0) > 2.5 && (
+                          <span title="Ad Fatigue Warning">
+                            <AlertCircle className="w-3 h-3 text-amber-500" />
+                          </span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Omset CS */}
+                    <td className="px-4 py-2.5 text-emerald-600 font-semibold whitespace-nowrap">
+                      {formatCurrency(c.omset)}
+                    </td>
+
+                    {/* Closing */}
+                    <td className="px-4 py-2.5 font-medium whitespace-nowrap">
+                      {c.closing} order
+                    </td>
+
+                    {/* ROAS */}
+                    <td className="px-4 py-2.5 text-right whitespace-nowrap">
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border inline-block ${
+                        c.roas >= 3.5 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                        c.roas >= 2.5 ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                        'bg-rose-50 text-rose-700 border-rose-200'
+                      }`}>
+                        {c.roas >= 3.5 ? '🚀 ' : c.roas >= 2.5 ? '🟢 ' : '⚠️ '}
+                        {c.roas.toFixed(2)}x
+                      </span>
+                    </td>
+
+                    {/* Audit AI */}
+                    <td className="px-4 py-2.5 text-center whitespace-nowrap">
+                      <button
+                        onClick={() => setAuditCampaign(c)}
+                        className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-600 hover:text-indigo-800 border border-indigo-200 hover:border-indigo-300 rounded-full px-2.5 py-1 transition-colors"
+                        title="Audit AI instan campaign ini + analisa senior media buyer"
+                      >
+                        🔍 Audit AI
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Creative Preview & Insight Modal */}
+      {insightAd && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-5xl w-full overflow-hidden border border-gray-200 flex flex-col max-h-[92vh]">
+            {/* Header */}
+            <div className="px-5 py-3.5 border-b border-gray-100 flex justify-between items-center bg-gray-50/80">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-indigo-100 flex items-center justify-center text-indigo-600 shadow-xs">
+                  {insightAd.mediaType === 'VIDEO' ? <Play className="w-4 h-4 fill-current text-rose-500" /> : <ImageIcon className="w-4 h-4 text-blue-500" />}
+                </div>
+                <div>
+                  <h3 className="font-bold text-gray-900 text-sm flex items-center gap-2">
+                    {insightAd.mediaType === 'VIDEO' ? '🎬 Preview Video & Insight Creative' : '🖼️ Preview Gambar & Insight Creative'}
+                  </h3>
+                  <p className="text-[11px] text-gray-500 truncate max-w-lg">{insightAd.adName}</p>
+                </div>
+              </div>
+              <button 
+                onClick={() => setInsightAd(null)} 
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-200 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            {/* Modal Body - 2 Columns on Desktop */}
+            <div className="p-6 overflow-y-auto grid grid-cols-1 lg:grid-cols-12 gap-6 flex-grow">
+              {/* Left Column: Interactive Preview (Iframe or High-Res Image) */}
+              <div className="lg:col-span-6 flex flex-col items-center justify-center bg-gray-950 rounded-2xl p-4 border border-gray-800 shadow-inner overflow-hidden min-h-[520px] self-start lg:sticky lg:top-0">
+                {insightAd.previewIframe ? (
+                  <div className="relative w-full flex items-center justify-center">
+                    <div
+                      key={insightAd.previewIframe}
+                      className="w-full flex items-center justify-center overflow-hidden [&>iframe]:w-full [&>iframe]:max-w-[360px] [&>iframe]:h-[450px] [&>iframe]:border-0 [&>iframe]:rounded-xl [&>iframe]:shadow-2xl"
+                      dangerouslySetInnerHTML={{ __html: insightAd.previewIframe }}
+                    />
+                    <button
+                      onClick={() => fetchFreshAdPreview(insightAd.adId)}
+                      disabled={previewRefreshing}
+                      title="Kalau video preview berhenti/hitam, klik utk muat ulang"
+                      className="absolute top-2 right-2 w-7 h-7 rounded-full bg-black/60 hover:bg-black/80 text-white flex items-center justify-center transition-colors disabled:opacity-50 z-10"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${previewRefreshing ? 'animate-spin' : ''}`} />
+                    </button>
+                    <p className="absolute bottom-2 left-1/2 -translate-x-1/2 text-[9px] text-gray-300 bg-black/60 px-2 py-0.5 rounded-full whitespace-nowrap">
+                      Video berhenti/hitam? Klik ikon reload di kanan atas.
+                    </p>
+                  </div>
+                ) : insightAd.thumbnailUrl ? (
+                  <div className="relative w-full h-full flex flex-col items-center justify-center p-2">
+                    <img 
+                      src={insightAd.thumbnailUrl} 
+                      alt={insightAd.adName} 
+                      className="max-h-[480px] w-auto object-contain rounded-xl shadow-2xl"
+                    />
+                    {insightAd.mediaType === 'VIDEO' && (
+                      <div className="mt-3 text-center text-xs text-rose-400 font-medium bg-rose-950/60 px-3 py-1.5 rounded-lg border border-rose-800">
+                        🎥 Konten Video Iklan
+                      </div>
+                    )}
+                  </div>
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-64 text-gray-500">
+                    <ImageIcon className="w-12 h-12 mb-2 opacity-30" />
+                    <span className="text-xs">Preview visual tidak tersedia dari Meta API</span>
+                  </div>
+                )}
+              </div>
+
+              {/* Right Column: Key Metrics & AI Insight */}
+              <div className="lg:col-span-6 flex flex-col space-y-4">
+                <div>
+                  <span className="text-[10px] text-gray-400 uppercase font-bold tracking-wider">Campaign</span>
+                  <p className="text-xs font-semibold text-gray-800 mt-0.5">{insightAd.campaignName}</p>
+                </div>
+
+                {/* Metrics Summary Pill Grid */}
+                <div className="grid grid-cols-3 gap-2 bg-gray-50 p-3 rounded-xl border border-gray-200">
+                  <div className="text-center">
+                    <span className="text-[10px] text-gray-500">CTR (Click-Through)</span>
+                    <p className="text-sm font-bold text-emerald-600 mt-0.5">{insightAd.ctr.toFixed(2)}%</p>
+                  </div>
+                  <div className="text-center border-x border-gray-200">
+                    <span className="text-[10px] text-gray-500">Total Spend</span>
+                    <p className="text-xs font-bold text-gray-800 mt-0.5">{formatCurrency(insightAd.spend)}</p>
+                  </div>
+                  <div className="text-center">
+                    <span className="text-[10px] text-gray-500">Tayangan (Imp)</span>
+                    <p className="text-xs font-bold text-gray-800 mt-0.5">{insightAd.impressions.toLocaleString('id-ID')}</p>
+                  </div>
+                </div>
+
+                {/* Relevance Diagnostics */}
+                <div className="bg-white p-3.5 rounded-xl border border-gray-200 space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs font-bold text-gray-900">🎯 Meta Relevance Diagnostics:</p>
+                    <span className="text-[10px] text-gray-400">Evaluasi Resmi Meta</span>
+                  </div>
+
+                  {/* Quality Ranking */}
+                  {(() => {
+                    const q = formatMetaRanking(insightAd.qualityRanking);
+                    return (
+                      <div className="flex justify-between items-center text-xs py-1 border-b border-gray-50">
+                        <span className="text-gray-600">Quality Ranking:</span>
+                        <span className={`font-semibold px-2 py-0.5 rounded text-[10px] ${q.className}`} title={q.desc}>
+                          {q.label}
+                        </span>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Engagement Ranking */}
+                  {(() => {
+                    const e = formatMetaRanking(insightAd.engagementRanking);
+                    return (
+                      <div className="flex justify-between items-center text-xs py-1 border-b border-gray-50">
+                        <span className="text-gray-600">Engagement Ranking:</span>
+                        <span className={`font-semibold px-2 py-0.5 rounded text-[10px] ${e.className}`} title={e.desc}>
+                          {e.label}
+                        </span>
+                      </div>
+                    );
+                  })()}
+
+                  {/* Conversion Ranking */}
+                  {(() => {
+                    const c = formatMetaRanking(insightAd.conversionRanking);
+                    return (
+                      <div className="flex justify-between items-center text-xs py-1">
+                        <span className="text-gray-600">Conversion Ranking:</span>
+                        <span className={`font-semibold px-2 py-0.5 rounded text-[10px] ${c.className}`} title={c.desc}>
+                          {c.label}
+                        </span>
+                      </div>
+                    );
+                  })()}
+
+                  <p className="text-[10px] text-gray-400 italic pt-1">
+                    * Catatan: Jika status "Tidak Dievaluasi Meta", Meta tidak mengeluarkan ranking karena objective campaign (misal: Leads / WhatsApp / CPAS) dioptimasi di luar event engagement standar.
+                  </p>
+                </div>
+
+                {/* [2026-08-26] Analisa Copy (AI) -- gantikan template hardcoded lama, sekarang beneran
+                    lewat agy (kolam 'ai-ads-creative'), cache+refresh+cooldown+self-heal sama pola
+                    dgn Audit AI Lapis 2 / Health Score. */}
+                <div className="bg-indigo-50/80 p-4 rounded-xl border border-indigo-100">
+                  <div className="flex items-center justify-between gap-2 mb-1.5 flex-wrap">
+                    <h4 className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
+                      <Sparkles className="w-3.5 h-3.5 text-indigo-600" /> Analisa Copy (AI)
+                    </h4>
+                    <button
+                      onClick={handleCreativeInsightRefreshClick}
+                      disabled={creativeInsightAgyBusy || creativeInsightCooldownSec > 0 || creativeInsightCache?.status === 'RUNNING'}
+                      className="flex items-center gap-1 text-[10px] font-semibold text-indigo-700 hover:text-indigo-900 disabled:opacity-40 disabled:cursor-not-allowed border border-indigo-200 hover:border-indigo-300 rounded-full px-2 py-0.5 transition-colors"
+                      title="Hitung ulang analisa AI (ada jeda antar refresh)"
+                    >
+                      <RefreshCw className="w-3 h-3" /> Refresh
+                    </button>
+                  </div>
+                  <p className="text-[10px] text-indigo-400 mb-1.5">
+                    Terakhir update:{' '}
+                    {creativeInsightCache?.lastCompletedAt
+                      ? formatLastUpdated(creativeInsightCache.lastCompletedAt)
+                      : creativeInsightCache?.status === 'RUNNING'
+                      ? 'sedang dianalisa...'
+                      : '-'}
+                  </p>
+                  {creativeInsightLoading && (
+                    <div className="text-xs text-indigo-700 flex items-center gap-2">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" /> Memuat cache analisa AI...
+                    </div>
+                  )}
+                  {!creativeInsightLoading && creativeInsightCache?.status === 'RUNNING' && (
+                    <div className="text-xs text-indigo-700 flex items-center gap-2">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" /> Sedang menganalisa copy di server (bisa sampai
+                      beberapa menit) -- popup ini update otomatis begitu selesai.
+                    </div>
+                  )}
+                  {creativeInsightCache?.status === 'ERROR' && (
+                    <p className="text-xs text-red-600">Percobaan terakhir gagal: {creativeInsightCache.errorMessage || 'Tidak diketahui.'}</p>
+                  )}
+                  {creativeInsightError && <p className="text-xs text-red-600">{creativeInsightError}</p>}
+
+                  {creativeInsightCache?.result?.structured && (
+                    <div className="space-y-3 mt-1">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${
+                          creativeInsightCache.result.verdict === 'scale_up' ? 'bg-emerald-100 text-emerald-700' :
+                          creativeInsightCache.result.verdict === 'maintain_watch' ? 'bg-blue-100 text-blue-700' :
+                          creativeInsightCache.result.verdict === 'needs_refresh' ? 'bg-amber-100 text-amber-700' :
+                          'bg-red-100 text-red-700'
+                        }`}>
+                          {CREATIVE_VERDICT_LABEL[creativeInsightCache.result.verdict] || creativeInsightCache.result.verdict}
+                        </span>
+                        <span className="text-[11px] text-indigo-900">{creativeInsightCache.result.verdict_reason}</span>
+                      </div>
+
+                      {creativeInsightCache.result.lever_scores && (
+                        <div className="space-y-1.5">
+                          {Object.entries(creativeInsightCache.result.lever_scores).map(([key, v]: any) => (
+                            <div key={key} className="flex items-start gap-2 text-[11px]">
+                              <span className="font-mono text-[9px] uppercase tracking-wide text-indigo-400 w-24 mt-0.5 shrink-0">{key.replace(/_/g, ' ')}</span>
+                              <div className="w-16 h-1.5 bg-indigo-100 rounded-full overflow-hidden mt-1.5 shrink-0">
+                                <div className="h-full bg-indigo-500" style={{ width: `${Math.min(100, (v.score / 10) * 100)}%` }} />
+                              </div>
+                              <span className="flex-1 text-indigo-800">{v.reason}</span>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {Array.isArray(creativeInsightCache.result.rewrites) && creativeInsightCache.result.rewrites.length > 0 && (
+                        <div className="space-y-1.5 border-t border-indigo-100 pt-2">
+                          <p className="text-[10px] font-bold text-indigo-500 uppercase tracking-wide">Rewrite tertarget</p>
+                          {creativeInsightCache.result.rewrites.map((r: any, i: number) => (
+                            <div key={i} className="text-[11px] bg-white/70 border border-indigo-100 rounded-lg p-2">
+                              <p className="text-indigo-400 text-[9px] uppercase font-mono mb-0.5">{r.lever_targeted}</p>
+                              <p className="text-gray-500 line-through decoration-red-300">{r.before}</p>
+                              <p className="text-indigo-900 font-medium">{r.after}</p>
+                              <p className="text-emerald-600 text-[10px] mt-0.5">{r.expected_lift_directional}</p>
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {creativeInsightCache.result.full_rewritten_version && (
+                        <div className="border-t border-indigo-100 pt-2">
+                          <p className="text-[10px] font-bold text-indigo-500 uppercase tracking-wide mb-1">Versi rewrite lengkap</p>
+                          <p className="text-[11px] text-indigo-900 bg-white/70 border border-indigo-100 rounded-lg p-2 leading-relaxed">{creativeInsightCache.result.full_rewritten_version}</p>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {creativeInsightCache?.result && creativeInsightCache.result.structured === false && (
+                    <p className="text-[11px] text-indigo-900 leading-relaxed whitespace-pre-wrap">{creativeInsightCache.result.rawText}</p>
+                  )}
+
+                  {creativeInsightAgyBusy && (
+                    <p className="text-[10px] text-amber-600 mt-1">Masih ada proses lain jalan di server -- tunggu dulu.</p>
+                  )}
+                  {!creativeInsightAgyBusy && creativeInsightCooldownSec > 0 && (
+                    <p className="text-[10px] text-indigo-400 mt-1">Bisa refresh lagi dalam ~{Math.ceil(creativeInsightCooldownSec / 60)} menit.</p>
+                  )}
+                  {creativeInsightRefreshMsg && <p className="text-[10px] text-indigo-500 mt-1">{creativeInsightRefreshMsg}</p>}
+                </div>
+
+                <button 
+                  onClick={() => setInsightAd(null)}
+                  className="w-full py-2.5 bg-gray-900 text-white text-xs font-bold rounded-xl hover:bg-gray-800 transition-colors shadow-sm"
+                >
+                  Tutup Preview
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* [2026-08-26] Popup "Top Ad Fatigue" -- SENGAJA struktur beda total dari popup Top
+          Creative (permintaan eksplisit Bossfren "isi popup nya beda"): fokus ke decay%/severity/
+          skor-sinyal (Layer 1, dihitung Node) + rekomendasi refresh (Layer 2, agy kolam
+          'ai-ads-fatigue'), BUKAN lever-scoring copy kayak popup Top Creative. */}
+      {fatigueInsightAd && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-3xl w-full overflow-hidden border border-gray-200 flex flex-col max-h-[92vh]">
+            {/* Header */}
+            <div className="px-5 py-3.5 border-b border-gray-100 flex justify-between items-center bg-gray-50/80">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-rose-100 flex items-center justify-center text-rose-600 shadow-xs">
+                  <Flame className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-gray-900 text-sm">🔥 Diagnosa Ad Fatigue</h3>
+                  <p className="text-[11px] text-gray-500 truncate max-w-lg">{fatigueInsightAd.adName}</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setFatigueInsightAd(null)}
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-200 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto flex-grow space-y-4">
+              <div className="flex items-center gap-4">
+                <div className="w-24 h-24 shrink-0 rounded-xl overflow-hidden bg-gray-950 border border-gray-200 flex items-center justify-center">
+                  {fatigueInsightAd.thumbnailUrl ? (
+                    <img src={fatigueInsightAd.thumbnailUrl} alt={fatigueInsightAd.adName} className="w-full h-full object-cover" />
+                  ) : (
+                    <ImageIcon className="w-6 h-6 text-gray-600" />
+                  )}
+                </div>
+                <div className="flex-1">
+                  <p className="text-xs font-semibold text-gray-800">{fatigueInsightAd.campaignName}</p>
+                  <p className="text-[10px] text-gray-500 mt-0.5">
+                    Sudah tayang {typeof fatigueInsightAd.daysRunning === 'number' ? `${fatigueInsightAd.daysRunning} hari` : 'tidak diketahui'} · {fatigueInsightAd.weekCount} minggu data
+                  </p>
+                  {(() => {
+                    const sevStyle: Record<string, string> = {
+                      severe: 'bg-red-100 text-red-700',
+                      moderate: 'bg-amber-100 text-amber-700',
+                      mild: 'bg-yellow-100 text-yellow-800',
+                      none: 'bg-gray-100 text-gray-600',
+                    };
+                    const sevLabel: Record<string, string> = {
+                      severe: 'Parah',
+                      moderate: 'Moderat',
+                      mild: 'Ringan',
+                      none: 'Aman',
+                    };
+                    return (
+                      <div className="flex items-center gap-2 mt-1.5 flex-wrap">
+                        <span className={`text-[10px] font-bold px-2 py-0.5 rounded-full ${sevStyle[fatigueInsightAd.severityOverall] || sevStyle.none}`}>
+                          Severity: {sevLabel[fatigueInsightAd.severityOverall] || 'Aman'}
+                        </span>
+                        <span className="text-[11px] text-gray-600">{fatigueInsightAd.severityReason}</span>
+                      </div>
+                    );
+                  })()}
+                </div>
+              </div>
+
+              {/* Decay computed dari angka mingguan */}
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-2 bg-gray-50 p-3 rounded-xl border border-gray-200">
+                <div className="text-center">
+                  <span className="text-[10px] text-gray-500">Reach decay</span>
+                  <p className="text-xs font-bold text-gray-800 mt-0.5">{fatigueInsightAd.computedDecay.reachDecay}</p>
+                </div>
+                <div className="text-center border-x border-gray-200">
+                  <span className="text-[10px] text-gray-500">CTR decay</span>
+                  <p className="text-xs font-bold text-gray-800 mt-0.5">{fatigueInsightAd.computedDecay.ctrDecay}</p>
+                </div>
+                <div className="text-center border-r border-gray-200">
+                  <span className="text-[10px] text-gray-500">CPM creep</span>
+                  <p className="text-xs font-bold text-gray-800 mt-0.5">{fatigueInsightAd.computedDecay.cpmCreep}</p>
+                </div>
+                <div className="text-center">
+                  <span className="text-[10px] text-gray-500">Frekuensi</span>
+                  <p className="text-xs font-bold text-gray-800 mt-0.5">{fatigueInsightAd.currentFrequency.toFixed(2)}x</p>
+                </div>
+              </div>
+              {fatigueInsightAd.computedDecay.notes && (
+                <p className="text-[10px] text-amber-600 -mt-2">⚠️ {fatigueInsightAd.computedDecay.notes}</p>
+              )}
+
+              {/* Sinyal per kategori */}
+              <div className="bg-white p-3.5 rounded-xl border border-gray-200 space-y-2">
+                <p className="text-xs font-bold text-gray-900 mb-1">📊 Sinyal Fatigue</p>
+                {Object.entries(fatigueInsightAd.signals).map(([key, v]: any) => (
+                  <div key={key} className="flex items-start gap-2 text-[11px] py-1 border-b border-gray-50 last:border-b-0">
+                    <span className="font-mono text-[9px] uppercase tracking-wide text-gray-400 w-24 mt-0.5 shrink-0">{key.replace(/([A-Z])/g, ' $1')}</span>
+                    <div className="w-14 h-1.5 bg-gray-100 rounded-full overflow-hidden mt-1.5 shrink-0">
+                      <div className={`h-full ${v.thresholdBreached ? 'bg-red-500' : 'bg-emerald-500'}`} style={{ width: `${Math.min(100, (v.score / 10) * 100)}%` }} />
+                    </div>
+                    <span className="flex-1 text-gray-700">{v.reading}</span>
+                    {v.thresholdBreached && <span className="text-[9px] font-bold text-red-600 bg-red-50 px-1.5 py-0.5 rounded shrink-0">breached</span>}
+                  </div>
+                ))}
+              </div>
+
+              {/* Rekomendasi AI (Layer 2) */}
+              <div className="bg-rose-50/80 p-4 rounded-xl border border-rose-100">
+                <div className="flex items-center justify-between gap-2 mb-1.5 flex-wrap">
+                  <h4 className="text-xs font-bold text-rose-900 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-rose-600" /> Rekomendasi Refresh (AI)
+                  </h4>
+                  <button
+                    onClick={handleFatigueInsightRefreshClick}
+                    disabled={fatigueInsightAgyBusy || fatigueInsightCooldownSec > 0 || fatigueInsightCache?.status === 'RUNNING'}
+                    className="flex items-center gap-1 text-[10px] font-semibold text-rose-700 hover:text-rose-900 disabled:opacity-40 disabled:cursor-not-allowed border border-rose-200 hover:border-rose-300 rounded-full px-2 py-0.5 transition-colors"
+                    title="Hitung ulang rekomendasi AI (ada jeda antar refresh)"
+                  >
+                    <RefreshCw className="w-3 h-3" /> Refresh
+                  </button>
+                </div>
+                <p className="text-[10px] text-rose-400 mb-1.5">
+                  Terakhir update:{' '}
+                  {fatigueInsightCache?.lastCompletedAt
+                    ? formatLastUpdated(fatigueInsightCache.lastCompletedAt)
+                    : fatigueInsightCache?.status === 'RUNNING'
+                    ? 'sedang dianalisa...'
+                    : '-'}
+                </p>
+                {fatigueInsightLoading && (
+                  <div className="text-xs text-rose-700 flex items-center gap-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Memuat cache rekomendasi AI...
+                  </div>
+                )}
+                {!fatigueInsightLoading && fatigueInsightCache?.status === 'RUNNING' && (
+                  <div className="text-xs text-rose-700 flex items-center gap-2">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" /> Sedang menyusun rekomendasi di server (bisa sampai
+                    beberapa menit) -- popup ini update otomatis begitu selesai.
+                  </div>
+                )}
+                {fatigueInsightCache?.status === 'ERROR' && (
+                  <p className="text-xs text-red-600">Percobaan terakhir gagal: {fatigueInsightCache.errorMessage || 'Tidak diketahui.'}</p>
+                )}
+                {fatigueInsightError && <p className="text-xs text-red-600">{fatigueInsightError}</p>}
+
+                {fatigueInsightCache?.result?.structured && (
+                  <div className="space-y-3 mt-1">
+                    {fatigueInsightCache.result.refresh_options && (
+                      <div className="space-y-2">
+                        {(['low_effort', 'medium_effort', 'high_effort'] as const).map((tier) => {
+                          const items = fatigueInsightCache.result.refresh_options?.[tier] || [];
+                          if (!items.length) return null;
+                          const tierLabel: Record<string, string> = { low_effort: 'Effort Rendah', medium_effort: 'Effort Sedang', high_effort: 'Effort Tinggi' };
+                          return (
+                            <div key={tier}>
+                              <p className="text-[10px] font-bold text-rose-500 uppercase tracking-wide mb-1">{tierLabel[tier]}</p>
+                              <div className="space-y-1">
+                                {items.map((it: any, i: number) => (
+                                  <div key={i} className="text-[11px] bg-white/70 border border-rose-100 rounded-lg p-2">
+                                    <p className="text-rose-900 font-medium">{it.action}</p>
+                                    <p className="text-gray-600">{it.specific_change}</p>
+                                    <p className="text-emerald-600 text-[10px] mt-0.5">{it.expected_lift}</p>
+                                  </div>
+                                ))}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {Array.isArray(fatigueInsightCache.result.new_angles_to_test) && fatigueInsightCache.result.new_angles_to_test.length > 0 && (
+                      <div className="border-t border-rose-100 pt-2">
+                        <p className="text-[10px] font-bold text-rose-500 uppercase tracking-wide mb-1">Angle baru utk dites</p>
+                        <div className="space-y-1">
+                          {fatigueInsightCache.result.new_angles_to_test.map((a: any, i: number) => (
+                            <div key={i} className="text-[11px] bg-white/70 border border-rose-100 rounded-lg p-2">
+                              <span className="text-[9px] font-mono uppercase text-rose-400">{a.angle_label}</span>
+                              <p className="text-rose-900 font-medium">{a.angle}</p>
+                              <p className="text-gray-600">{a.rationale}</p>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
+                    {fatigueInsightCache.result.kill_threshold && (
+                      <div className="border-t border-rose-100 pt-2">
+                        <p className="text-[10px] font-bold text-rose-500 uppercase tracking-wide mb-1">Kill Threshold</p>
+                        <p className="text-[11px] text-red-700 bg-white/70 border border-red-100 rounded-lg p-2 font-mono">{fatigueInsightCache.result.kill_threshold}</p>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {fatigueInsightCache?.result && fatigueInsightCache.result.structured === false && (
+                  <p className="text-[11px] text-rose-900 leading-relaxed whitespace-pre-wrap">{fatigueInsightCache.result.rawText}</p>
+                )}
+
+                {fatigueInsightAgyBusy && (
+                  <p className="text-[10px] text-amber-600 mt-1">Masih ada proses lain jalan di server -- tunggu dulu.</p>
+                )}
+                {!fatigueInsightAgyBusy && fatigueInsightCooldownSec > 0 && (
+                  <p className="text-[10px] text-rose-400 mt-1">Bisa refresh lagi dalam ~{Math.ceil(fatigueInsightCooldownSec / 60)} menit.</p>
+                )}
+                {fatigueInsightRefreshMsg && <p className="text-[10px] text-rose-500 mt-1">{fatigueInsightRefreshMsg}</p>}
+              </div>
+
+              <button
+                onClick={() => setFatigueInsightAd(null)}
+                className="w-full py-2.5 bg-gray-900 text-white text-xs font-bold rounded-xl hover:bg-gray-800 transition-colors shadow-sm"
+              >
+                Tutup
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* [2026-08-26] Panel jembatan "CTR campaign -> ad" -- klik kolom CTR di tabel drill-down.
+          Murni Node (nol agy), cuma nunjukin ad mana yang nyeret CTR naik/turun, lalu ngarahin ke
+          popup Preview & Insight (insightAd) yang sudah ada -- BUKAN analisa AI baru. */}
+      {campaignCtrPanelCampaign && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full overflow-hidden border border-gray-200 flex flex-col max-h-[85vh]">
+            <div className="px-5 py-3.5 border-b border-gray-100 flex justify-between items-center bg-gray-50/80">
+              <div>
+                <h3 className="font-bold text-gray-900 text-sm">📊 Penyumbang CTR Campaign</h3>
+                <p className="text-[11px] text-gray-500 truncate max-w-md">{campaignCtrPanelCampaign.campaignName}</p>
+              </div>
+              <button
+                onClick={() => setCampaignCtrPanelCampaign(null)}
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-200 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 overflow-y-auto flex-grow">
+              {campaignCtrPanelLoading && (
+                <div className="text-center py-10 text-gray-400 text-xs flex items-center justify-center gap-2">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Memuat data ad per campaign ini...
+                </div>
+              )}
+              {campaignCtrPanelError && (
+                <div className="text-center py-6 text-red-500 text-xs">{campaignCtrPanelError}</div>
+              )}
+              {!campaignCtrPanelLoading && !campaignCtrPanelError && campaignCtrPanelData && (
+                <>
+                  <div className="flex items-center justify-between mb-3 bg-gray-50 border border-gray-200 rounded-lg px-3 py-2">
+                    <span className="text-[11px] text-gray-500">CTR rata-rata campaign (tertimbang)</span>
+                    <span className="font-mono text-sm font-bold text-gray-800">{campaignCtrPanelData.campaignAvgCtr.toFixed(2)}%</span>
+                  </div>
+
+                  {campaignCtrPanelData.ads.length === 0 && (
+                    <div className="text-center py-8 text-gray-400 text-xs">
+                      Tidak ada ad dengan tayangan memadai (min. 100 imp) di campaign ini pada rentang tanggal terpilih.
+                    </div>
+                  )}
+
+                  <div className="space-y-1.5">
+                    {campaignCtrPanelData.ads.map((ad) => {
+                      const isDrag = ad.deltaFromAvgPct < 0;
+                      return (
+                        <div key={ad.adId} className="flex items-center gap-2.5 border border-gray-200 rounded-lg p-2 hover:border-gray-300 transition-colors">
+                          <div className="w-10 h-10 shrink-0 rounded-lg overflow-hidden bg-gray-950 flex items-center justify-center">
+                            {ad.thumbnailUrl ? (
+                              <img src={ad.thumbnailUrl} alt={ad.adName} className="w-full h-full object-cover" />
+                            ) : (
+                              <ImageIcon className="w-4 h-4 text-gray-600" />
+                            )}
+                          </div>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-xs font-semibold text-gray-800 truncate" title={ad.adName}>{ad.adName}</p>
+                            <p className="text-[10px] text-gray-500">CTR {ad.ctr.toFixed(2)}% · {ad.impressions.toLocaleString('id-ID')} imp</p>
+                          </div>
+                          <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded shrink-0 ${isDrag ? 'bg-rose-50 text-rose-600' : 'bg-emerald-50 text-emerald-600'}`}>
+                            {isDrag ? '▼' : '▲'} {Math.abs(ad.deltaFromAvgPct).toFixed(0)}%
+                          </span>
+                          <button
+                            onClick={() => { setInsightAd(ad); setCampaignCtrPanelCampaign(null); }}
+                            className="shrink-0 flex items-center gap-1 text-[10px] font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg px-2 py-1.5 transition-colors border border-indigo-100"
+                          >
+                            <Sparkles className="w-3 h-3" /> Lihat Insight
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                </>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* [2026-08-26] Popup "Rekomendasi Budget" (kolom Budget baru di drill-down Campaign) --
+          Layer 1 (fakta CPR/CTR/frekuensi/ROAS/bid status/budget level/saran angka, MURNI Node
+          GET /business/budget-facts) + Layer 2 (narasi kualitatif, agy kolam 'ai-ads-budget').
+          Stage A -- READ-ONLY. Tombol edit budget beneran (Stage B, yg nyentuh spend asli ke Meta)
+          SENGAJA belum ada di sini, dipisah biar kualitas rekomendasi bisa dicek dulu (permintaan
+          eksplisit Bossfren -- ini jalur PERTAMA di dashboard yg bakal ubah duit sungguhan). */}
+      {budgetPanelCampaign && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/60 backdrop-blur-xs">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-2xl w-full overflow-hidden border border-gray-200 flex flex-col max-h-[92vh]">
+            <div className="px-5 py-3.5 border-b border-gray-100 flex justify-between items-center bg-gray-50/80">
+              <div className="flex items-center gap-2.5">
+                <div className="w-9 h-9 rounded-xl bg-indigo-100 flex items-center justify-center text-indigo-600 shadow-xs">
+                  <CreditCard className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="font-bold text-gray-900 text-sm">💰 Rekomendasi Budget</h3>
+                  <p className="text-[11px] text-gray-500 truncate max-w-lg">{budgetPanelCampaign.campaignName}</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setBudgetPanelCampaign(null)}
+                className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-200 transition-colors"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 overflow-y-auto flex-grow space-y-4">
+              {budgetFactsLoading && (
+                <div className="text-xs text-gray-600 flex items-center gap-2 py-6 justify-center">
+                  <Loader2 className="w-4 h-4 animate-spin" /> Memuat data budget dari Meta...
+                </div>
+              )}
+              {budgetFactsError && <p className="text-xs text-red-600">{budgetFactsError}</p>}
+
+              {!budgetFactsLoading && budgetFacts && (
+                <>
+                  <div className="grid grid-cols-3 gap-2">
+                    <div className="bg-gray-50 rounded-xl p-3 border border-gray-100 relative">
+                      <p className="text-[10px] text-gray-500 uppercase font-semibold">Budget Harian</p>
+                      <div className="flex items-center gap-1.5 mt-0.5">
+                        {budgetEditSubmitting ? (
+                          <p className="text-sm font-bold text-gray-400 flex items-center gap-1.5">
+                            <Loader2 className="w-3.5 h-3.5 animate-spin" /> Menyimpan...
+                          </p>
+                        ) : (
+                          <p className="text-sm font-bold text-gray-800">
+                            {budgetFacts.currentDailyBudget != null ? formatCurrency(budgetFacts.currentDailyBudget) : '-'}
+                          </p>
+                        )}
+                        {!budgetEditSubmitting && budgetFacts.editableBudget && (
+                          <button
+                            onClick={() => {
+                              setBudgetEditValue(budgetFacts.currentDailyBudget != null ? String(Math.round(budgetFacts.currentDailyBudget)) : '');
+                              setBudgetEditError('');
+                              setBudgetEditOpen(true);
+                            }}
+                            className="text-gray-400 hover:text-indigo-600 transition-colors"
+                            title="Edit budget manual"
+                          >
+                            <Pencil className="w-3 h-3" />
+                          </button>
+                        )}
+                      </div>
+                      <p className="text-[9px] text-gray-400 mt-0.5">
+                        {budgetFacts.budgetLevel === 'CBO' ? 'CBO (level campaign)' : budgetFacts.budgetLevel === 'ABO' ? 'ABO (per ad set)' : 'Tidak diketahui'}
+                      </p>
+                      {!budgetFacts.editableBudget && budgetFacts.editableReason && (
+                        <p className="text-[9px] text-amber-500 mt-0.5 leading-snug">{budgetFacts.editableReason}</p>
+                      )}
+
+                      {budgetEditOpen && (
+                        <div className="absolute z-20 top-full left-0 mt-1 w-60 bg-white rounded-xl shadow-xl border border-gray-200 p-3 space-y-2">
+                          <p className="text-[10px] font-semibold text-gray-600">Budget harian baru (Rp)</p>
+                          <input
+                            type="number"
+                            autoFocus
+                            value={budgetEditValue}
+                            onChange={(e) => setBudgetEditValue(e.target.value)}
+                            className="w-full border border-gray-200 rounded-lg px-2 py-1.5 text-sm font-semibold text-gray-800 focus:outline-none focus:ring-2 focus:ring-indigo-200"
+                            placeholder="mis. 150000"
+                          />
+                          {(() => {
+                            const newVal = parseFloat(budgetEditValue);
+                            const oldVal = budgetFacts.currentDailyBudget;
+                            if (!Number.isFinite(newVal) || oldVal == null || oldVal === 0) return null;
+                            const pct = ((newVal - oldVal) / oldVal) * 100;
+                            const bigJump = Math.abs(pct) > 20;
+                            return (
+                              <p className={`text-[10px] leading-snug ${bigJump ? 'text-amber-600' : 'text-gray-500'}`}>
+                                {formatCurrency(oldVal)} {'->'}  {formatCurrency(newVal)} ({pct >= 0 ? '+' : ''}{pct.toFixed(0)}%)
+                                {bigJump && ' -- lompatan besar, Meta sarankan maks +/-20% sekali jalan'}
+                              </p>
+                            );
+                          })()}
+                          {budgetEditError && <p className="text-[10px] text-red-600">{budgetEditError}</p>}
+                          <div className="flex justify-end gap-2 pt-1">
+                            <button
+                              onClick={() => setBudgetEditOpen(false)}
+                              disabled={budgetEditSubmitting}
+                              className="text-[11px] font-semibold text-gray-500 hover:text-gray-700 px-2 py-1 disabled:opacity-40"
+                            >
+                              Batal
+                            </button>
+                            <button
+                              onClick={handleBudgetEditSubmit}
+                              disabled={budgetEditSubmitting || !budgetEditValue}
+                              className="text-[11px] font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 rounded-lg px-3 py-1 flex items-center gap-1"
+                            >
+                              {budgetEditSubmitting && <Loader2 className="w-3 h-3 animate-spin" />} OK
+                            </button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    <div className="bg-gray-50 rounded-xl p-3 border border-gray-100">
+                      <p className="text-[10px] text-gray-500 uppercase font-semibold">Status Bid</p>
+                      <p className="text-xs font-bold text-gray-800 mt-1 leading-tight">{budgetFacts.bidStrategy.label}</p>
+                    </div>
+                    <div className="bg-gray-50 rounded-xl p-3 border border-gray-100">
+                      <p className="text-[10px] text-gray-500 uppercase font-semibold">Verdict</p>
+                      <span className={`inline-block mt-1 text-[10px] font-bold px-2 py-0.5 rounded-full ${BUDGET_VERDICT_STYLE[budgetFacts.verdict] || BUDGET_VERDICT_STYLE.MAINTAIN}`}>
+                        {BUDGET_VERDICT_LABEL[budgetFacts.verdict] || budgetFacts.verdict}
+                      </span>
+                    </div>
+                  </div>
+
+                  <p className="text-xs text-gray-600 bg-indigo-50/60 border border-indigo-100 rounded-lg p-2.5">{budgetFacts.verdictReason}</p>
+
+                  {budgetFacts.suggestedDailyBudget != null && (
+                    <div className="bg-emerald-50 border border-emerald-100 rounded-xl p-3 flex items-center justify-between">
+                      <span className="text-xs font-semibold text-emerald-800">Saran budget baru</span>
+                      <span className="text-sm font-bold text-emerald-700">{formatCurrency(budgetFacts.suggestedDailyBudget)}</span>
+                    </div>
+                  )}
+
+                  <div>
+                    <p className="text-[10px] font-bold text-gray-500 uppercase tracking-wide mb-1.5">
+                      Target {budgetFacts.today.badgeLabel} (baseline rata-rata 7 hari)
+                    </p>
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="border border-gray-100 rounded-lg p-2.5">
+                        <p className="text-[10px] text-gray-500">Hari ini</p>
+                        <p className="text-sm font-bold text-gray-800">{budgetFacts.today.cpr > 0 ? formatCurrency(budgetFacts.today.cpr) : '-'}</p>
+                      </div>
+                      <div className="border border-gray-100 rounded-lg p-2.5">
+                        <p className="text-[10px] text-gray-500">Rata-rata 7 hari</p>
+                        <p className="text-sm font-bold text-gray-800">{budgetFacts.avg7d.cpr > 0 ? formatCurrency(budgetFacts.avg7d.cpr) : '-'}</p>
+                      </div>
+                    </div>
+                    {budgetFacts.roas ? (
+                      <div className="grid grid-cols-2 gap-2 mt-2">
+                        <div className="border border-gray-100 rounded-lg p-2.5">
+                          <p className="text-[10px] text-gray-500">ROAS hari ini</p>
+                          <p className="text-sm font-bold text-gray-800">{budgetFacts.roas.today.toFixed(2)}x</p>
+                        </div>
+                        <div className="border border-gray-100 rounded-lg p-2.5">
+                          <p className="text-[10px] text-gray-500">ROAS rata-rata 7 hari</p>
+                          <p className="text-sm font-bold text-gray-800">{budgetFacts.roas.avg7d.toFixed(2)}x</p>
+                        </div>
+                      </div>
+                    ) : (
+                      <p className="text-[10px] text-gray-400 mt-1.5">ROAS tidak tersedia -- bisnis ini belum setup value-tracking Pixel/CAPI, tidak diikutkan dalam analisa.</p>
+                    )}
+                  </div>
+
+                  {!budgetFacts.editableBudget && (
+                    <p className="text-[10px] text-amber-600 bg-amber-50 border border-amber-100 rounded-lg p-2">{budgetFacts.editableReason}</p>
+                  )}
+
+                  <div className="bg-indigo-50/80 p-4 rounded-xl border border-indigo-100">
+                    <div className="flex items-center justify-between gap-2 mb-1.5 flex-wrap">
+                      <h4 className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
+                        <Sparkles className="w-3.5 h-3.5 text-indigo-600" /> Analisa AI
+                      </h4>
+                      <button
+                        onClick={handleBudgetInsightRefreshClick}
+                        disabled={budgetInsightAgyBusy || budgetInsightCooldownSec > 0 || budgetInsightCache?.status === 'RUNNING'}
+                        className="flex items-center gap-1 text-[10px] font-semibold text-indigo-700 hover:text-indigo-900 disabled:opacity-40 disabled:cursor-not-allowed border border-indigo-200 hover:border-indigo-300 rounded-full px-2 py-0.5 transition-colors"
+                        title="Hitung ulang analisa AI (ada jeda antar refresh)"
+                      >
+                        <RefreshCw className="w-3 h-3" /> Refresh
+                      </button>
+                    </div>
+                    <p className="text-[10px] text-indigo-400 mb-1.5">
+                      Terakhir update:{' '}
+                      {budgetInsightCache?.lastCompletedAt
+                        ? formatLastUpdated(budgetInsightCache.lastCompletedAt)
+                        : budgetInsightCache?.status === 'RUNNING'
+                        ? 'sedang dianalisa...'
+                        : '-'}
+                    </p>
+                    {budgetInsightCache?.status === 'RUNNING' && (
+                      <div className="text-xs text-indigo-700 flex items-center gap-2">
+                        <Loader2 className="w-3.5 h-3.5 animate-spin" /> Sedang menyusun analisa di server (bisa sampai
+                        beberapa menit) -- popup ini update otomatis begitu selesai.
+                      </div>
+                    )}
+                    {budgetInsightCache?.status === 'ERROR' && (
+                      <p className="text-xs text-red-600">Percobaan terakhir gagal: {budgetInsightCache.errorMessage || 'Tidak diketahui.'}</p>
+                    )}
+                    {budgetInsightError && <p className="text-xs text-red-600">{budgetInsightError}</p>}
+
+                    {budgetInsightCache?.result?.structured && (
+                      <div className="space-y-2 mt-1">
+                        <p className="text-[11px] text-indigo-900 leading-relaxed">{budgetInsightCache.result.narrative}</p>
+                        {Array.isArray(budgetInsightCache.result.risks) && budgetInsightCache.result.risks.length > 0 && (
+                          <div className="border-t border-indigo-100 pt-2">
+                            <p className="text-[10px] font-bold text-indigo-500 uppercase tracking-wide mb-1">Risiko</p>
+                            <ul className="list-disc list-inside space-y-0.5">
+                              {budgetInsightCache.result.risks.map((r: string, i: number) => (
+                                <li key={i} className="text-[11px] text-gray-700">{r}</li>
+                              ))}
+                            </ul>
+                          </div>
+                        )}
+                        {budgetInsightCache.result.confidence && (
+                          <p className="text-[10px] text-gray-500">Keyakinan: <span className="font-semibold">{budgetInsightCache.result.confidence}</span></p>
+                        )}
+                        {budgetInsightCache.result.alternative_consideration && (
+                          <p className="text-[11px] text-gray-600 bg-white/70 border border-indigo-100 rounded-lg p-2">{budgetInsightCache.result.alternative_consideration}</p>
+                        )}
+                      </div>
+                    )}
+                    {budgetInsightCache?.result && budgetInsightCache.result.structured === false && (
+                      <p className="text-[11px] text-indigo-900 leading-relaxed whitespace-pre-wrap">{budgetInsightCache.result.rawText}</p>
+                    )}
+
+                    {budgetInsightAgyBusy && (
+                      <p className="text-[10px] text-amber-600 mt-1">Masih ada proses lain jalan di server -- tunggu dulu.</p>
+                    )}
+                    {!budgetInsightAgyBusy && budgetInsightCooldownSec > 0 && (
+                      <p className="text-[10px] text-indigo-400 mt-1">Bisa refresh lagi dalam ~{Math.ceil(budgetInsightCooldownSec / 60)} menit.</p>
+                    )}
+                    {budgetInsightRefreshMsg && <p className="text-[10px] text-indigo-500 mt-1">{budgetInsightRefreshMsg}</p>}
+                  </div>
+
+                  {budgetFacts.warnings.length > 0 && (
+                    <div className="text-[10px] text-amber-600 space-y-0.5">
+                      {budgetFacts.warnings.map((w, i) => <p key={i}>⚠️ {w}</p>)}
+                    </div>
+                  )}
+                </>
+              )}
+
+              <button
+                onClick={() => setBudgetPanelCampaign(null)}
+                className="w-full py-2.5 bg-gray-900 text-white text-xs font-bold rounded-xl hover:bg-gray-800 transition-colors shadow-sm"
+              >
+                Tutup
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {auditCampaign && (
+        <CampaignAuditModal campaign={auditCampaign} onClose={() => setAuditCampaign(null)} />
+      )}
+
+      {healthScoreCampaign && (
+        <HealthScorePopup campaign={healthScoreCampaign} onClose={() => setHealthScoreCampaign(null)} />
+      )}
+
+    </div>
+  );
+}
+

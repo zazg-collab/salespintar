@@ -22,7 +22,9 @@ export function setupWebSocket(httpServer: HttpServer) {
 
   io.use(async (socket, next) => {
     try {
-      const token = socket.handshake.query.token as string;
+      // \u2500\u2500 Fix A6: Baca dari auth (tidak masuk URL log), fallback ke query untuk kompatibilitas \u2500\u2500
+      const token = (socket.handshake.auth?.token || socket.handshake.query?.token) as string | undefined;
+      // \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
       if (!token) {
         return next(new Error('Authentication required'));
       }

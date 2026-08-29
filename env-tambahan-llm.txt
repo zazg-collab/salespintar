@@ -1,0 +1,305 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# TEMPELKAN SELURUH ISI DI BAWAH INI KE UJUNG backend/.env
+#
+# Kenapa tidak saya tulis sendiri: alat remote memblokir penulisan ke berkas
+# bernama `.env`, apa pun lokasinya. Jadi salinan di ~/Documents/.env juga akan
+# ditolak — bukan soal folder, soal namanya.
+#
+# ⚠️ backend/.env ITULAH yang dimuat. `config/env.ts:5` memakai
+#    path.resolve(__dirname, '../../.env') → selalu backend/.env, baik lewat
+#    `tsx` (src/config) maupun `dist` (dist/config). `.env` di AKAR repo TIDAK
+#    PERNAH dibaca backend. Isinya berbeda (GROQ_MODEL=llama-3.1-8b-instant) dan
+#    itu sudah sekali menyesatkan analisis, 30 Juli 2026. Jangan sunting yang di akar.
+#
+# ── SATU TEMPAT MEMUTUSKAN: halaman "Pengaturan Model" di dashboard ──────────
+#
+# Baris LLM_MODEL_* di bawah adalah NILAI BAWAAN, bukan pemenang. Di dashboard,
+# bawaan tiap dropdown adalah opsi "ikut .env" — dan opsi itu MENULISKAN nilai
+# dari baris di bawah, jadi tidak ada yang tersembunyi. Selama dropdown-nya masih
+# di posisi itu, yang jalan adalah nilai di berkas ini.
+#
+# Begitu kamu memilih yang lain di dashboard, pilihan itulah yang jalan — dan
+# halaman itu menandainya jelas ("dipilih di sini") plus memberi peringatan
+# kalau pilihanmu LEBIH MAHAL dari nilai di bawah, lengkap dengan kelipatannya.
+# Jadi tidak ada kenaikan biaya yang terjadi diam-diam, dan tidak ada keadaan
+# di mana kamu harus menebak mana yang hidup.
+#
+# Kalau ingin balik ke nilai berkas ini: di dashboard pilih ulang opsi
+# "ikut .env" untuk pekerjaan itu. Tidak perlu menyentuh berkas ini, tidak perlu
+# restart.
+#
+# Urutan lengkapnya, dari yang paling menang:
+#   1. --model= (cuma untuk `npx tsx audit-ai.ts`, sekali jalan)
+#   2. pilihan di halaman Pengaturan Model, per toko
+#   3. LLM_MODEL_* di berkas ini
+#   4. GROQ_MODEL / GROQ_EXTRACTOR_MODEL (cadangan terakhir)
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ── Pembatas laju & pencatatan ───────────────────────────────────────────────
+# LLM_MIN_GAP_MS_MINER memindahkan konstanta MIN_GAP_MS yang tadinya HARDCODE di
+# question-mining.worker.ts. Komentar di berkas itu sendiri sudah mengakui
+# masalahnya: "kalau naik ke tier berbayar, cukup kecilkan MIN_GAP_MS" — yaitu
+# menyuruh mengedit kode untuk hal yang seharusnya konfigurasi.
+LLM_MIN_GAP_MS_MINER=21000
+LLM_MIN_GAP_MS_PUBLISH=0
+LLM_MAX_ATTEMPTS=4
+LLM_LOG_CALLS=true
+LLM_CALL_RETENTION_DAYS=30
+
+# ── Tombol model per pekerjaan (9 pekerjaan) ─────────────────────────────────
+# Kesembilan tombol SENGAJA AKTIF (tidak dikomentari), supaya berkas ini
+# menuliskan apa yang benar-benar jalan alih-alih menyerahkannya ke warisan
+# GROQ_MODEL / GROQ_EXTRACTOR_MODEL. Lebih mudah dibaca, dan yang lebih penting:
+# tiap pekerjaan jadi bisa digeser SATU-SATU sesudah diaudit, tanpa ikut
+# menggeser delapan lainnya.
+#
+# ⚠️ Konsekuensi yang perlu disadari: karena kesembilannya kini eksplisit,
+#    mengubah GROQ_MODEL di atas TIDAK LAGI berpengaruh ke sembilan pekerjaan
+#    ini. GROQ_MODEL tinggal jadi cadangan terakhir kalau salah satu baris di
+#    bawah dihapus.
+#
+# ℹ️ Nilai di bawah adalah BAWAAN yang diikuti opsi "ikut .env" di dashboard.
+#    Dashboard menampilkannya di dalam opsi itu, jadi kedua tempat selalu
+#    menunjukkan angka yang sama — tidak ada versi tersembunyi.
+#
+# Cek peta yang berlaku — dicetak di log tiap backend menyala:
+#   [LLM] Peta model per pekerjaan: …
+#
+# Cek pemakaian nyata sebelum menggeser apa pun (halaman Pengaturan Model sudah
+# menampilkan tabelnya, atau langsung ke Postgres):
+#   SELECT job, model, count(*), sum(prompt_tokens) AS in_tok,
+#          sum(completion_tokens) AS out_tok, avg(latency_ms)::int AS ms,
+#          count(*) FILTER (WHERE NOT ok) AS gagal
+#   FROM llm_calls GROUP BY 1,2 ORDER BY 4 DESC;
+#
+# Bentuk nilai: "<provider>:<model>". Baru `groq:` yang diimplementasi — awalan
+# lain akan MELEDAK saat bootstrap, bukan saat pesan pelanggan masuk.
+#
+# Harga per 1 juta token (groq.com/pricing, Juli 2026):
+#   llama-3.3-70b-versatile   $0,59 / $0,79
+#   llama-3.1-8b-instant      $0,05 / $0,08
+#   openai/gpt-oss-120b       $0,15 / $0,60   (input ke-cache $0,075)
+#   openai/gpt-oss-20b        $0,075 / $0,30  (input ke-cache $0,0375)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ⚠️ SEBERAPA HEMAT KONFIGURASI DI BAWAH INI — supaya tidak salah harap
+#
+# Enam pekerjaan berat tetap di `llama-3.3-70b-versatile`, yaitu model yang
+# SUDAH jalan sekarang. Yang berubah dari keadaan sekarang cuma tiga: intent,
+# miner, dan fallback turun ke `llama-3.1-8b-instant`.
+#
+# Taksiran, volume 100 pelanggan x 80 pesan per CS per hari:
+#   sekarang (semua 70B lewat warisan)   ~$183/bulan/CS   ~$1.100 untuk 6 CS
+#   konfigurasi di bawah                 ~$170/bulan/CS   ~$1.020 untuk 6 CS
+#   kalau reply+supervisor ikut gpt-oss  ~$23 /bulan/CS   ~$140   untuk 6 CS
+#
+# Jadi penghematannya ~7%, bukan ~87%. Itu WAJAR dan disengaja: yang mahal
+# adalah `reply` dan `supervisor`, dan dua-duanya sengaja dipertahankan di 70B
+# karena 70B-lah yang terbukti 13/14 bersih di audit — sementara keluarga
+# gpt-oss BELUM pernah diuji pada bahasa Indonesia di toko ini.
+#
+# Nilai sesungguhnya dari blok ini bukan penghematan hari ini, tapi bahwa tiap
+# pekerjaan sekarang punya tombolnya sendiri. Jalan yang benar ke depan:
+#   1. Biarkan jalan beberapa hari, biar tabel `llm_calls` terisi.
+#   2. `npx tsx audit-ai.ts --model=llama-3.3-70b-versatile,openai/gpt-oss-120b`
+#   3. Geser SATU tombol, audit lagi, baru lanjut ke tombol berikutnya.
+# Mulai dari `classify` — pekerjaan paling ringan, dan tidak ada yang dilihat
+# pelanggan kalau ternyata jelek.
+#
+# SEMUA ANGKA DI ATAS TAKSIRAN dari membaca kode. Belum satu pun diukur.
+# ══════════════════════════════════════════════════════════════════════════════
+
+# Balasan pelanggan. Satu-satunya yang dibaca pelanggan, dan mereka MENUNGGU
+# saat ini jalan — jadi kecepatan ikut terasa, bukan cuma kualitas.
+# Alternatif hemat: groq:openai/gpt-oss-120b (input 4x lebih murah, dan turun
+# lagi jadi 8x kalau prefix promptnya kena cache). BELUM diaudit di sini.
+LLM_MODEL_REPLY=groq:llama-3.3-70b-versatile
+
+# Supervisor — memeriksa SETIAP balasan sebelum dikirim: mengarang harga?
+# mengklaim stok? Jangan pernah dimatikan demi hemat; yang dibayar kalau ini
+# mati adalah kepercayaan pelanggan.
+# Baris termahal kedua sesudah `reply`, karena jalan tiap balasan DENGAN konteks
+# pustaka penuh (~$66/bulan/CS di 70B vs ~$3,90 di gpt-oss-20b). Keluarannya
+# cuma 200 token, jadi di pekerjaan ini harga INPUT yang menentukan.
+LLM_MODEL_SUPERVISOR=groq:llama-3.3-70b-versatile
+
+# Shadow Mining klasifikasi — pilih 1 dari 6 label, keluaran maks 150 token.
+# Pekerjaan paling ringan di sistem. KALAU MAU MULAI MENCOBA MODEL MURAH,
+# MULAI DARI SINI: risikonya paling kecil, dan tidak ada yang dilihat pelanggan.
+LLM_MODEL_CLASSIFY=groq:llama-3.3-70b-versatile
+
+# Shadow Mining ekstraksi — mengubah percakapan jadi dokumen pengetahuan.
+# Keluarannya PANJANG (maks 2048 token) dan harus menuruti delapan aturan, jadi
+# di pekerjaan inilah harga KELUAR paling menentukan tagihan.
+LLM_MODEL_EXTRACT=groq:llama-3.3-70b-versatile
+
+# Penyusun dokumen pustaka — merapikan jawaban yang kamu tulis sendiri.
+# Dilarang menambah fakta; tugasnya bentuk, bukan isi. Dipicu manusia, volume kecil.
+LLM_MODEL_PUBLISH=groq:llama-3.3-70b-versatile
+
+# Alat audit (`audit-ai.ts`), di luar jalur produksi. Bisa ditimpa per-jalan:
+#   npx tsx audit-ai.ts --model=llama-3.3-70b-versatile,openai/gpt-oss-120b
+LLM_MODEL_AUDIT=groq:llama-3.3-70b-versatile
+
+# ── Tiga yang sengaja MURAH ──────────────────────────────────────────────────
+
+# Penanda intent — menghasilkan satu label penanda per PESAN (~4.000/hari pada
+# volume di atas). Tidak butuh otak besar.
+# Catatan: ini sebetulnya kandidat DIHAPUS, bukan dimurahkan — satu panggilan
+# model per pesan hanya untuk satu label itu mahal betapa pun murah modelnya.
+LLM_MODEL_INTENT=groq:llama-3.1-8b-instant
+
+# Penambang pertanyaan — memungut & merapikan pertanyaan pelanggan dari chat
+# lama. Memungut, bukan menalar.
+LLM_MODEL_MINER=groq:llama-3.1-8b-instant
+
+# Balasan cadangan — hanya jalan kalau `reply` galat.
+# SENGAJA berbeda dari `reply`: cadangan yang memakai model yang SAMA cuma jadi
+# percobaan ulang, bukan cadangan. Ini juga menggantikan
+# GROQ_FALLBACK_MODEL=mixtral-8x7b-32768 di atas — model itu sudah DIPENSIUNKAN
+# Groq, jadi jalur cadangan selama ini kemungkinan besar selalu gagal dan
+# pelanggan langsung dapat "Maaf sedang sibuk".
+# Buktinya akan muncul sendiri dalam sehari:
+#   SELECT ok, count(*) FROM llm_calls WHERE job='fallback' GROUP BY 1;
+# Idealnya cadangan ada di PROVIDER lain — cadangan di provider yang sama tidak
+# menolong saat provider itulah yang bermasalah. Untuk sekarang, minimal hidup.
+LLM_MODEL_FALLBACK=groq:llama-3.1-8b-instant
+
+# ── Tombol ke-10: PEMBACA GAMBAR (Fase 65) ───────────────────────────────────
+#
+# Sebelum Fase 65, foto dari pelanggan diabaikan TOTAL — captionnya pun tidak
+# dibaca, dan pelanggan menerima kesunyian. Sekarang caption selalu dibaca
+# (gratis), dan gambarnya dibaca model kalau tombol ini menyala.
+#
+# ⚠️ TOMBOL INI TIDAK MEWARISI GROQ_MODEL, berbeda dari sembilan tombol di atas.
+# Warisan itu benar untuk pekerjaan teks — itu yang membuat Fase 59 netral
+# terhadap perilaku. Di sini justru jebakan: `llama-3.3-70b-versatile` TIDAK BISA
+# melihat gambar, dan kegagalannya baru muncul saat pelanggan sungguhan mengirim
+# foto. Jadi kalau baris ini dikosongkan, yang berlaku bukan GROQ_MODEL tapi
+# bawaan keras `groq:qwen/qwen3.6-27b` di services/llm.ts.
+#
+# `qwen/qwen3.6-27b` satu-satunya model Groq yang bisa menerima gambar
+# (dokumentasi Groq, Juli 2026). Harganya $0,60 masuk / $3,00 keluar per 1M token
+# — keluarannya ~4x lebih mahal dari 70B, jadi ini tombol termahal di berkas ini
+# per token. Yang menahan tagihannya bukan harganya tapi BATASnya di bawah.
+LLM_MODEL_VISION=groq:qwen/qwen3.6-27b
+
+# Matikan seluruh pembacaan gambar tanpa mengubah kode. Caption TETAP dibaca dan
+# pelanggan TETAP dapat ajakan mengetik — jadi mematikan ini tidak
+# mengembalikan kesunyian, cuma mengembalikan biayanya ke nol.
+VISION_ENABLED=true
+
+# Batas gambar per pelanggan per HARI (zona Jakarta, sejalan dengan kuota AI).
+# Ini pagar tagihan yang sesungguhnya: satu orang bisa mengirim 30 foto dalam
+# semenit tanpa niat jahat sama sekali. Kuota AI harian yang sudah ada TIDAK
+# melindungi di sini — ia menghitung BALASAN, sedangkan yang mahal adalah
+# PEMBACAAN, dan pembacaan terjadi lebih dulu.
+VISION_DAILY_CAP_PER_LEAD=10
+
+# Batas ukuran gambar yang dikirim ke model, dalam byte. Groq membatasi 4 MB
+# untuk gambar base64 (20 MB hanya untuk URL — dan URL tidak bisa dipakai di
+# sini, media WhatsApp terenkripsi tanpa URL publik). Lebih besar dari ini
+# dilewati dengan log, bukan dicoba lalu gagal.
+VISION_MAX_IMAGE_BYTES=4000000
+
+# Jeda minimal antar pesan "boleh diketik saja" ke SATU pelanggan, dalam detik.
+# Tanpa ini, lima stiker berturut-turut dijawab lima kali — dan itu terlihat
+# lebih rusak daripada diam.
+MEDIA_HINT_COOLDOWN_SEC=600
+
+# ═════════════════════════════════════════════════════════════════════════════
+# HUMAN LEARNING — buffer & penyapu (Fase 63/68/69)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Semua punya bawaan di kode, jadi blok ini OPSIONAL. Ditulis di sini supaya bisa
+# disetel tanpa menyentuh kode — dan supaya angkanya kelihatan, bukan tersembunyi.
+
+# Minimal baris supaya satu buffer layak dikirim ke Shadow Mining.
+#
+# 2 = minimal satu tukar-kata (pertanyaan pembeli + jawaban CS). Itu atom terkecil
+# yang masih bisa dipelajari.
+#
+# ⚠️ Turun dari 4 di Fase 69. Dengan 4, buffer berisi 1-3 baris TIDAK PERNAH
+# dikirim: penyapu melewatinya tiap putaran, lalu Redis membuangnya saat TTL habis.
+# Terlihat nyata di dashboard 30 Juli — satu sesi CS dengan 40 balasan menampilkan
+# 0 fakta, dan akan tetap 0 SELAMANYA karena pola percakapannya tidak pernah
+# mencapai 4 baris.
+#
+# Yang menghakimi "percakapan ini terlalu remeh" seharusnya Lapis 1 (`classify`) —
+# ia dibangun untuk itu, pakai model termurah, dan hasilnya DILAPORKAN ke dashboard
+# sebagai "basa-basi/dibuang". Hitungan baris di Redis melakukan penilaian yang
+# sama dengan aturan lebih tumpul, lebih awal, dan tanpa meninggalkan jejak.
+#
+# Naikkan ke 3-4 kalau nanti "basa-basi/dibuang" terlalu ramai dan token terasa.
+HL_BUFFER_MIN_MESSAGES=2
+
+# Kirim SEKETIKA begitu buffer mencapai jumlah baris ini, tanpa menunggu idle.
+HL_BUFFER_FLUSH_AT_LINES=10
+
+# Detik tanpa pesan baru sebelum buffer dianggap selesai dan dikirim.
+HL_BUFFER_IDLE_SEC=600
+
+# Selang penyapu berulang `hl-idle-flush`, dalam detik.
+HL_IDLE_CHECK_INTERVAL_SEC=300
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# LAYANAN LLM SELAIN GROQ — Fase 82
+# ═══════════════════════════════════════════════════════════════════════════════
+#
+# Nilai `LLM_MODEL_*` berbentuk "<layanan>:<model>". Tanpa awalan layanan
+# dianggap `groq:` supaya nilai lama tetap sah. Layanan yang dikenali:
+#
+#   groq:        (kunci GROQ_API_KEY)        — sudah dipakai kesembilan pekerjaan
+#   google:      (kunci GOOGLE_API_KEY)      — Google AI Studio / Gemini
+#   openrouter:  (kunci OPENROUTER_API_KEY)  — bisa dipakai, daftarnya belum dikurasi
+#
+# Kunci boleh dibiarkan kosong. Yang memeriksa "kunci ada untuk layanan yang
+# BENAR-BENAR dipakai" adalah `validateLlmConfig()` saat bootstrap — jadi salah
+# setelan meledak saat menyala, bukan pada pesan pelanggan pertama.
+
+# GOOGLE_API_KEY=
+# OPENROUTER_API_KEY=
+
+# ── Yang WAJIB diketahui sebelum menggeser pekerjaan ke Gemini ─────────────────
+#
+# 1. Model Gemini 2.5+ BERPIKIR secara bawaan, dan token berpikirnya MEMAKAN
+#    jatah `max_tokens`. Diukur di Fase 81: dengan max_tokens 150, model habis
+#    jatah saat berpikir lalu jawabannya terpotong jadi prosa dan JSON.parse
+#    gagal. `llm.ts` sekarang MEMAKSA `reasoning_effort: 'none'` untuk semua
+#    panggilan `google:` — hanya 'none' yang bekerja; 'minimal' dan 'low' diuji
+#    dan tetap menghabiskan ~136 token berpikir.
+#
+# 2. Token berpikir DITAGIH tapi tidak muncul di `completion_tokens`. Kolom
+#    `llm_calls.reasoning_tokens` menampungnya (dihitung total - masuk - keluar).
+#    Kalau kolom itu terisi besar, biaya nyata jauh di atas taksiran.
+#
+# 3. Daftar model dari API Google memuat model yang TIDAK BISA dipakai:
+#    gemini-2.5-flash-lite -> 404 "no longer available to new users"
+#    seluruh keluarga *-pro -> 429 di tier gratis
+#    Karena itu dropdown disaring ke daftar yang sudah DIUJI hidup
+#    (`MODEL_GOOGLE_TERUJI` di llm.ts). Model di luar daftar itu tetap bisa
+#    dipakai lewat LLM_MODEL_* di berkas ini.
+#
+# 4. Tier GRATIS dan tier BERBAYAR punya perlakuan data berbeda. Percakapan di
+#    sistem ini memuat nama, alamat, nomor HP, dan nilai transaksi pembeli.
+#    Untuk membanding-bandingkan model, tier gratis cukup. Untuk pekerjaan yang
+#    membalas pelanggan sungguhan (`reply`, `supervisor`), putuskan tiernya dulu.
+
+# ── Contoh, semuanya masih dikomentari ────────────────────────────────────────
+# Model yang terbukti hidup di tier gratis (Fase 81):
+#   gemini-3.5-flash  gemini-3.1-flash-lite  gemini-3-flash-preview
+#   gemini-2.5-flash  gemini-flash-latest    gemini-flash-lite-latest
+#
+# Kandidat paling masuk akal untuk digeser lebih dulu — jalur paling jarang
+# dipakai, jadi salahnya paling murah, sekaligus yang paling mungkin naik kelas:
+# LLM_MODEL_VISION=google:gemini-2.5-flash
+#
+# Berikutnya, yang volumenya besar tapi keluarannya pendek & terstruktur:
+# LLM_MODEL_CLASSIFY=google:gemini-3.1-flash-lite
+# LLM_MODEL_INTENT=google:gemini-3.1-flash-lite
+#
+# `fallback` sengaja disebut terakhir: sejak Fase 59 komentarnya berbunyi
+# "idealnya model DAN provider yang berbeda; cadangan di tempat yang sama tidak
+# menolong saat tempat itu yang bermasalah". Sampai Fase 82 itu tidak bisa
+# dipenuhi karena cuma ada satu layanan. Sekarang bisa:
+# LLM_MODEL_FALLBACK=google:gemini-2.5-flash

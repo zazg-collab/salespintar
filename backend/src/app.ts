@@ -13,13 +13,32 @@ import authRoutes from './routes/auth.routes';
 import waRoutes from './routes/wa.routes';
 import conversationRoutes from './routes/conversation.routes';
 import messageRoutes from './routes/message.routes';
+import katalogRoutes from './routes/katalog.routes';
+import attributionRoutes from './routes/attribution.routes';
 import leadRoutes from './routes/lead.routes';
-import broadcastRoutes from './routes/broadcast.routes';
 import dashboardRoutes from './routes/dashboard.routes';
+import knowledgeRoutes from './routes/knowledge.routes';
+import syncRoutes from './routes/sync.routes';
+import shadowMiningRoutes from './routes/shadow-mining.routes';
+import autoLearningRoutes from './routes/auto-learning.routes';
+import chatImportRoutes from './routes/chat-import.routes';
+import questionMinerRoutes from './routes/question-miner.routes';
+import humanLearningRoutes from './routes/human-learning.routes';
+import llmSettingsRoutes from './routes/llm-settings.routes';
+import businessRoutes from './routes/business.routes';
+import automationSyncRoutes from './routes/automation-sync.routes';
+import aiAdsRoutes from './routes/ai-ads.routes';
+import videoGuardRoutes from './routes/video-guard.routes';
+import copywritingRoutes from './routes/copywriting.routes';
+import llmModelsRoutes from './routes/llm-models.routes';
 
 const app = express();
 
 app.use(helmet());
+
+// Pengecualian CORS: Endpoint Atribusi Landing Page harus bisa diakses dari mana saja
+app.use(`${env.API_PREFIX}/meta-capi/attribution`, attributionRoutes);
+
 app.use(cors({
   origin: env.CORS_ORIGIN.split(',').map(o => o.trim()),
   credentials: true,
@@ -67,8 +86,27 @@ app.use(`${env.API_PREFIX}/wa`, waRoutes);
 app.use(`${env.API_PREFIX}/conversations`, conversationRoutes);
 app.use(`${env.API_PREFIX}/conversations/:id/messages`, messageRoutes);
 app.use(`${env.API_PREFIX}/leads`, leadRoutes);
-app.use(`${env.API_PREFIX}/broadcasts`, broadcastRoutes);
 app.use(`${env.API_PREFIX}/dashboard`, dashboardRoutes);
+app.use(`${env.API_PREFIX}/knowledge`, knowledgeRoutes);
+app.use(`${env.API_PREFIX}/sync`, syncRoutes);
+app.use(`${env.API_PREFIX}/shadow-mining`, shadowMiningRoutes);
+app.use(`${env.API_PREFIX}/auto-learning`, autoLearningRoutes);
+app.use(`${env.API_PREFIX}/chat-import`, chatImportRoutes);
+app.use(`${env.API_PREFIX}/question-miner`, questionMinerRoutes);
+app.use(`${env.API_PREFIX}/human-learning`, humanLearningRoutes);
+app.use(`${env.API_PREFIX}/llm-settings`, llmSettingsRoutes);
+app.use(`${env.API_PREFIX}/business`, businessRoutes);
+app.use(`${env.API_PREFIX}/katalog`, katalogRoutes);
+// [2026-08-27] Fase 2 -- endpoint machine-to-machine VPS45 -> Upcloud.
+// SENGAJA mount di path TERPISAH (bukan di bawah /ai-ads) supaya TIDAK
+// pernah lewat `router.use(authenticate)` JWT yang di-pasang di paling atas
+// ai-ads.routes.ts -- endpoint ini digerbangi shared-secret header sendiri
+// (X-Internal-Sync-Key), lihat automation-sync.routes.ts.
+app.use(`${env.API_PREFIX}/automation-sync`, automationSyncRoutes);
+app.use(`${env.API_PREFIX}/ai-ads`, aiAdsRoutes);
+app.use(`${env.API_PREFIX}/video-guard`, videoGuardRoutes);
+app.use(`${env.API_PREFIX}/copywriting-ads`, copywritingRoutes);
+app.use(`${env.API_PREFIX}/llm-models`, llmModelsRoutes);
 
 app.use(errorHandler);
 

@@ -1,0 +1,1222 @@
+import { Router, Request, Response, NextFunction } from 'express';
+import multer from 'multer';
+import { z } from 'zod';
+import { prisma } from '../config/prisma';
+import { Prisma } from '@prisma/client';
+import { env } from '../config/env';
+import { authenticate } from '../middleware/auth';
+import { authorize } from '../middleware/auth';
+import { encrypt, decrypt, maskedPreview } from '../services/crypto.service';
+import { logger } from '../utils/logger';
+import { ValidationError, NotFoundError } from '../utils/errors';
+
+/**
+ * Proxy tipis ke `metaguard_service` (FastAPI, Python) -- VPS Antigravity ("VPS 45",
+ * 45.77.247.72:4010), BUKAN VPS Upcloud tempat backend Node ini jalan. Lihat
+ * projek-ceo/20260825-blueprint-integrasi-meta-video-ai-guards-ke-salespintar.md Section 3.1b/3.3
+ * untuk alasan topologi lintas-VPS (co-location dengan `api-bridge` demi akses file lokal `agy
+ * --add-dir`), dan TECHNICAL_SYSTEM_DESIGN_BLUEPRINT.md untuk source of truth logic audit/scoring.
+ *
+ * Business logic AI SAMA SEKALI TIDAK ADA di sini -- file ini cuma: (1) auth JWT + resolve
+ * businessId, (2) baca GEMINI_API_KEY per-business dari Business.settings kalau ada, teruskan
+ * sebagai override, (3) teruskan multipart request (video/thumbnail) ke metaguard_service pakai
+ * native `fetch`+`FormData` (Node 24, tidak butuh axios/form-data tambahan -- lihat pola
+ * `services/mengantar.service.ts` utk fetch+AbortSignal.timeout yang sudah established di repo
+ * ini), (4) kembalikan hasilnya apa adanya ke frontend.
+ *
+ * Persistensi (2026-08-25, Section 3.4): tabel `VideoAdAudit` di Prisma dipakai sebagai catatan
+ * histori -- id baris = `audit_id` metaguard_service sendiri (format "aud_<hex32>", BUKAN uuid
+ * random Prisma default, lihat komentar di schema.prisma), supaya satu id yang sama dipakai di
+ * URL frontend/proxy/DB tanpa lapisan translasi. Baris dibuat SAAT submit (POST /audit), lalu
+ * di-update begitu GET /audit/:auditId atau POST /audit/:auditId/clarify melapor status "done".
+ * Kegagalan simpan/update ke DB SENGAJA tidak melempar error ke client (cuma logger.warn) --
+ * status realtime dari metaguard_service (in-memory, lihat catatan header main.py di
+ * metaguard_service) tetap sumber kebenaran utama selama proses berjalan; tabel ini murni untuk
+ * histori/"Halaman Riwayat" (Section 2.3), bukan pengganti polling.
+ */
+
+const router = Router();
+router.use(authenticate);
+
+const METAGUARD_TIMEOUT_MS = 15_000; // request submit/status ringan -- audit sungguhan jalan async
+// di background_tasks metaguard_service sendiri, jadi timeout di sini cuma menjaga
+// submit/polling call, BUKAN durasi audit end-to-end (bisa puluhan detik - beberapa menit).
+
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024; // 200 MB -- keputusan Claude (belum ada limit Meta yang
+// dikonfirmasi Bossfren utk kasus ini), longgar dibanding rata-rata iklan video (~5-50MB) tapi
+// mencegah upload sembarang besar. Sesuaikan kalau ada kebutuhan nyata.
+
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: MAX_VIDEO_BYTES },
+});
+
+function metaguardHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...extra };
+  if (env.METAGUARD_INTERNAL_API_KEY) {
+    headers['X-Internal-Api-Key'] = env.METAGUARD_INTERNAL_API_KEY;
+  }
+  return headers;
+}
+
+/** Pecah string comma-separated "template_overlay,color_grade" (atau array kalau Express sudah
+ *  mem-parsingnya jadi string[]) jadi string[] bersih -- dipakai buat kolom layersApplied. */
+function parseLayers(raw: unknown): string[] {
+  if (Array.isArray(raw)) return raw.map((v) => String(v).trim()).filter(Boolean);
+  if (typeof raw === 'string') return raw.split(',').map((v) => v.trim()).filter(Boolean);
+  return [];
+}
+
+/** Lempar error yang jelas kalau METAGUARD_SERVICE_URL belum dikonfigurasi -- daripada gagal
+ *  dengan pesan "fetch failed" yang membingungkan saat pertama kali di-deploy. */
+function requireMetaguardUrl(): string {
+  if (!env.METAGUARD_SERVICE_URL) {
+    throw new ValidationError(
+      'METAGUARD_SERVICE_URL belum diset di .env backend -- fitur Meta Video AI Guards belum aktif.',
+    );
+  }
+  return env.METAGUARD_SERVICE_URL;
+}
+
+// fix Fase B (2026-08-27, provider picker Groq/OpenRouter/dst utk fallback Video Audit): ganti
+// `resolveBusinessGeminiKey()` (Gemini-only) dgn helper provider-agnostic di bawah. Field baru
+// `videoAuditFallbackProvider`/`videoAuditFallbackApiKeyEncrypted`/`videoAuditFallbackModel` --
+// kalau belum pernah diisi (business lama), fallback ke provider 'google' +
+// `metaGuardGeminiApiKeyEncrypted` lama (IDENTIK perilaku sebelum fitur ini ada, tidak perlu
+// setting ulang apa pun).
+type VideoFallbackProvider = 'google' | 'openai' | 'openrouter' | 'groq';
+const KNOWN_VIDEO_FALLBACK_PROVIDERS: VideoFallbackProvider[] = ['google', 'openai', 'openrouter', 'groq'];
+function isKnownVideoFallbackProvider(v: unknown): v is VideoFallbackProvider {
+  return typeof v === 'string' && (KNOWN_VIDEO_FALLBACK_PROVIDERS as string[]).includes(v);
+}
+
+interface VideoFallbackConfig {
+  provider: VideoFallbackProvider;
+  apiKey: string | null;
+  model: string | null;
+  usingLegacyGeminiKeyFallback: boolean;
+}
+
+async function resolveVideoFallbackConfig(businessId: string): Promise<VideoFallbackConfig> {
+  const business = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+  const settings = (business?.settings as Record<string, unknown>) ?? {};
+
+  const rawProvider = settings.videoAuditFallbackProvider;
+  const provider: VideoFallbackProvider = isKnownVideoFallbackProvider(rawProvider) ? rawProvider : 'google';
+
+  const perFieldEncrypted = settings.videoAuditFallbackApiKeyEncrypted;
+  const legacyEncrypted = settings.metaGuardGeminiApiKeyEncrypted;
+  const usingLegacyGeminiKeyFallback =
+    provider === 'google' &&
+    !(typeof perFieldEncrypted === 'string' && perFieldEncrypted) &&
+    typeof legacyEncrypted === 'string' &&
+    Boolean(legacyEncrypted);
+  const encrypted =
+    typeof perFieldEncrypted === 'string' && perFieldEncrypted
+      ? perFieldEncrypted
+      : usingLegacyGeminiKeyFallback
+      ? legacyEncrypted
+      : null;
+
+  let apiKey: string | null = null;
+  if (typeof encrypted === 'string' && encrypted) {
+    try {
+      apiKey = decrypt(encrypted);
+    } catch (e) {
+      logger.warn(`[VideoGuard] Gagal decrypt videoAuditFallbackApiKeyEncrypted business ${businessId}: ${(e as Error).message}`);
+    }
+  }
+
+  const rawModel = settings.videoAuditFallbackModel;
+  const model = typeof rawModel === 'string' && rawModel.trim() ? rawModel.trim() : null;
+
+  return { provider, apiKey, model, usingLegacyGeminiKeyFallback };
+}
+
+function videoFallbackHeaders(config: VideoFallbackConfig): Record<string, string> {
+  const headers: Record<string, string> = { 'X-Video-Fallback-Provider': config.provider };
+  if (config.apiKey) headers['X-Video-Fallback-Api-Key'] = config.apiKey;
+  if (config.model) headers['X-Video-Fallback-Model'] = config.model;
+  return headers;
+}
+
+// fix Fase B: fix GAP LAMA -- Check/Generate Ads OTOMATIS (Batch E, dijalankan metaguard_service
+// `_run_audit_job`) SEBELUMNYA tidak pernah menerima config apa pun dari endpoint ini, jadi SELALU
+// pakai default fungsi (provider agy) walau business sudah setting provider lain khusus di halaman
+// Copywriting Ads. Helper ini DUPLIKASI KECIL dari `resolveCopywritingLlmConfig()`
+// (copywriting.routes.ts) -- pola duplikasi kecil ini konsisten dgn metaguardHeaders/
+// requireMetaguardUrl yang sudah diduplikasi sebelumnya antara kedua file route ini (lihat
+// docstring modul copywriting.routes.ts soal alasannya: menambah export baru ke file
+// production-critical demi fitur terpisah dianggap resiko yang tidak perlu diambil). KALAU logic
+// resolusi di sana berubah, WAJIB disinkronkan manual ke sini juga.
+type CopywritingLlmProviderForAudit = 'agy' | 'google' | 'openai' | 'openrouter' | 'groq';
+const KNOWN_COPYWRITING_PROVIDERS_FOR_AUDIT: CopywritingLlmProviderForAudit[] = ['agy', 'google', 'openai', 'openrouter', 'groq'];
+function isKnownCopywritingProviderForAudit(v: unknown): v is CopywritingLlmProviderForAudit {
+  return typeof v === 'string' && (KNOWN_COPYWRITING_PROVIDERS_FOR_AUDIT as string[]).includes(v);
+}
+
+async function resolveCopywritingLlmHeadersForAudit(
+  businessId: string,
+  feature: 'check' | 'generate',
+): Promise<Record<string, string>> {
+  const business = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+  const settings = (business?.settings as Record<string, unknown>) ?? {};
+  const prefix = feature === 'check' ? 'checkAds' : 'generateAds';
+  const fields = {
+    provider: `${prefix}LlmProvider`,
+    apiKey: `${prefix}LlmApiKeyEncrypted`,
+    model: `${prefix}LlmModel`,
+  };
+
+  const perFeatureProvider = settings[fields.provider];
+  const sharedProvider = settings.copywritingLlmProvider;
+  const usingLegacySharedFallback =
+    !isKnownCopywritingProviderForAudit(perFeatureProvider) && isKnownCopywritingProviderForAudit(sharedProvider);
+  const provider: CopywritingLlmProviderForAudit = isKnownCopywritingProviderForAudit(perFeatureProvider)
+    ? perFeatureProvider
+    : isKnownCopywritingProviderForAudit(sharedProvider)
+    ? sharedProvider
+    : 'agy';
+
+  const perFeatureModel = settings[fields.model];
+  const sharedModel = settings.copywritingLlmModel;
+  const model =
+    typeof perFeatureModel === 'string' && perFeatureModel.trim()
+      ? perFeatureModel.trim()
+      : usingLegacySharedFallback && typeof sharedModel === 'string' && sharedModel.trim()
+      ? sharedModel.trim()
+      : null;
+
+  const perFeatureEncrypted = settings[fields.apiKey];
+  const sharedEncrypted = settings.copywritingLlmApiKeyEncrypted;
+  const encrypted =
+    typeof perFeatureEncrypted === 'string' && perFeatureEncrypted
+      ? perFeatureEncrypted
+      : usingLegacySharedFallback && typeof sharedEncrypted === 'string' && sharedEncrypted
+      ? sharedEncrypted
+      : null;
+
+  let apiKey: string | null = null;
+  if (typeof encrypted === 'string' && encrypted) {
+    try {
+      apiKey = decrypt(encrypted);
+    } catch (e) {
+      logger.warn(`[VideoGuard] Gagal decrypt ${fields.apiKey} (feature=${feature}) business ${businessId}: ${(e as Error).message}`);
+    }
+  }
+  if (provider === 'google' && !apiKey) {
+    const legacyEncrypted = settings.metaGuardGeminiApiKeyEncrypted;
+    if (typeof legacyEncrypted === 'string' && legacyEncrypted) {
+      try {
+        apiKey = decrypt(legacyEncrypted);
+      } catch (e) {
+        logger.warn(`[VideoGuard] Gagal decrypt metaGuardGeminiApiKeyEncrypted (fallback google, feature=${feature}) business ${businessId}: ${(e as Error).message}`);
+      }
+    }
+  }
+
+  const headerPrefix = feature === 'check' ? 'X-Check-Ads' : 'X-Generate-Ads';
+  const headers: Record<string, string> = { [`${headerPrefix}-Provider`]: provider };
+  if (apiKey) headers[`${headerPrefix}-Api-Key`] = apiKey;
+  if (model) headers[`${headerPrefix}-Model`] = model;
+  return headers;
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// GET/PUT /video-guard/settings — GEMINI_API_KEY per-business (fallback SDK)
+// Pola sama persis dengan Meta CAPI di business.routes.ts: TIDAK PERNAH balikin key mentah/
+// terenkripsi, cuma boolean "configured" + preview tersamar (fix Fase 39 temuan #1, direplikasi).
+// ══════════════════════════════════════════════════════════════════════════
+
+router.get('/settings', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const business = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+    const settings = (business?.settings as Record<string, unknown>) ?? {};
+
+    // fix Fase B (2026-08-27): GET sekarang balikin config fallback Video Audit lengkap
+    // (provider/model/preview), bukan cuma flag Gemini tunggal spt sebelumnya -- frontend render
+    // provider picker + dropdown model, bukan 1 field password doang.
+    const config = await resolveVideoFallbackConfig(businessId);
+    const perFieldEncrypted = settings.videoAuditFallbackApiKeyEncrypted;
+    const legacyEncrypted = settings.metaGuardGeminiApiKeyEncrypted;
+    const encrypted =
+      typeof perFieldEncrypted === 'string' && perFieldEncrypted
+        ? perFieldEncrypted
+        : config.usingLegacyGeminiKeyFallback && typeof legacyEncrypted === 'string' && legacyEncrypted
+        ? legacyEncrypted
+        : null;
+    let preview: string | null = null;
+    if (typeof encrypted === 'string' && encrypted) {
+      try {
+        preview = maskedPreview(decrypt(encrypted));
+      } catch (e) {
+        logger.warn(`[VideoGuard] Gagal decrypt utk preview, business ${businessId}: ${(e as Error).message}`);
+        preview = '(gagal dibaca, isi ulang key)';
+      }
+    }
+
+    res.json({
+      videoAuditFallback: {
+        provider: config.provider,
+        model: config.model,
+        usingLegacyGeminiKeyFallback: config.usingLegacyGeminiKeyFallback,
+        apiKeyConfigured: Boolean(encrypted),
+        apiKeyPreview: preview,
+      },
+      defaultReinforcementLayers: settings.metaGuardDefaultLayers ?? [],
+    });
+  } catch (e) { next(e); }
+});
+
+// fix Fase B (2026-08-27): `geminiApiKey` LAMA dipertahankan sbg alias -- kalau dikirim (frontend
+// lama/belum diupgrade), diperlakukan SAMA PERSIS dgn `apiKey` (ditulis ke field per-provider baru
+// kalau `provider` juga dikirim/default 'google', TAPI demi kompatibilitas total field LAMA
+// `metaGuardGeminiApiKeyEncrypted` tetap ditulis kalau provider yg dipakai 'google' -- lihat body
+// handler). Field baru: `provider`/`apiKey`/`model` -- provider picker Groq/OpenRouter/dst.
+const settingsSchema = z.object({
+  provider: z.enum(['google', 'openai', 'openrouter', 'groq']).optional(),
+  apiKey: z.string().optional(), // kirim string kosong "" utk hapus, undefined = tidak diubah
+  geminiApiKey: z.string().min(1).optional(), // LEGACY alias, lihat komentar di atas
+  model: z.string().optional(), // kirim string kosong "" utk hapus/pakai default provider
+  defaultReinforcementLayers: z
+    .array(z.enum(['template_overlay', 'color_grade', 'metadata_label', 'highlight_soften', 'micro_reframe']))
+    .optional(),
+});
+
+router.put('/settings', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const body = settingsSchema.parse(req.body);
+
+    const business = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+    const settings = { ...((business?.settings as Record<string, unknown>) ?? {}) };
+
+    if (body.provider !== undefined) {
+      settings.videoAuditFallbackProvider = body.provider;
+    }
+    const rawApiKey = body.apiKey !== undefined ? body.apiKey : body.geminiApiKey;
+    if (rawApiKey !== undefined) {
+      const trimmed = rawApiKey.trim();
+      const effectiveProvider = (body.provider ?? (settings.videoAuditFallbackProvider as string | undefined)) || 'google';
+      if (trimmed) {
+        settings.videoAuditFallbackApiKeyEncrypted = encrypt(trimmed);
+        // fix Fase B: provider 'google' JUGA menulis field LAMA metaGuardGeminiApiKeyEncrypted --
+        // menjaga endpoint /video-guard/audit lama (meta-rejected-creatives dkk) & frontend yang
+        // belum sempat diupgrade tetap dapat key yang sama tanpa perlu setting 2x.
+        if (effectiveProvider === 'google') settings.metaGuardGeminiApiKeyEncrypted = encrypt(trimmed);
+      } else {
+        delete settings.videoAuditFallbackApiKeyEncrypted;
+        if (effectiveProvider === 'google') delete settings.metaGuardGeminiApiKeyEncrypted;
+      }
+    }
+    if (body.model !== undefined) {
+      const trimmed = body.model.trim();
+      if (trimmed) settings.videoAuditFallbackModel = trimmed;
+      else delete settings.videoAuditFallbackModel;
+    }
+    if (body.defaultReinforcementLayers !== undefined) {
+      settings.metaGuardDefaultLayers = body.defaultReinforcementLayers;
+    }
+
+    await prisma.business.update({ where: { id: businessId }, data: { settings: settings as Prisma.InputJsonValue } });
+    res.json({ ok: true });
+  } catch (e) { next(e); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// POST /video-guard/audit — proxy multipart ke metaguard_service /v1/audit
+// ══════════════════════════════════════════════════════════════════════════
+
+router.post(
+  '/audit',
+  upload.fields([{ name: 'video_file', maxCount: 1 }, { name: 'thumbnail_file', maxCount: 1 }]),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const businessId = req.user!.businessId;
+      const files = req.files as Record<string, Express.Multer.File[]> | undefined;
+      const videoFile = files?.video_file?.[0];
+      const thumbnailFile = files?.thumbnail_file?.[0];
+      const { ad_title, primary_text, headline, landing_page_url, presentation_layers_applied } = req.body;
+
+      if (!ad_title) throw new ValidationError('ad_title wajib diisi');
+      if (!videoFile && !thumbnailFile && !landing_page_url) {
+        throw new ValidationError('Minimal satu dari video_file/thumbnail_file/landing_page_url wajib diisi.');
+      }
+
+      // fix Fase B (2026-08-27): 3 config diresolve & diteruskan sekaligus -- fallback Video Audit
+      // (provider-agnostic, sebelumnya cuma Gemini) + Check/Generate Ads (fix gap: sebelumnya
+      // endpoint ini TIDAK PERNAH kirim config apa pun, jadi Batch E di metaguard_service selalu
+      // pakai default agy tanpa baca setting business).
+      const [videoFallback, checkAdsHeaders, generateAdsHeaders] = await Promise.all([
+        resolveVideoFallbackConfig(businessId),
+        resolveCopywritingLlmHeadersForAudit(businessId, 'check'),
+        resolveCopywritingLlmHeadersForAudit(businessId, 'generate'),
+      ]);
+
+      const form = new FormData();
+      form.set('ad_title', String(ad_title));
+      if (primary_text) form.set('primary_text', String(primary_text));
+      if (headline) form.set('headline', String(headline));
+      if (landing_page_url) form.set('landing_page_url', String(landing_page_url));
+      if (presentation_layers_applied) form.set('presentation_layers_applied', String(presentation_layers_applied));
+      if (videoFile) form.set('video_file', new Blob([videoFile.buffer], { type: videoFile.mimetype }), videoFile.originalname);
+      if (thumbnailFile) form.set('thumbnail_file', new Blob([thumbnailFile.buffer], { type: thumbnailFile.mimetype }), thumbnailFile.originalname);
+
+      const baseUrl = requireMetaguardUrl();
+      const upstream = await fetch(`${baseUrl}/v1/audit`, {
+        method: 'POST',
+        headers: metaguardHeaders({
+          ...videoFallbackHeaders(videoFallback),
+          ...checkAdsHeaders,
+          ...generateAdsHeaders,
+        }),
+        body: form,
+        signal: AbortSignal.timeout(METAGUARD_TIMEOUT_MS),
+      });
+
+      const data: any = await upstream.json();
+      if (!upstream.ok) {
+        logger.warn(`[VideoGuard] metaguard_service /v1/audit menolak: ${upstream.status} ${JSON.stringify(data)}`);
+      } else if (typeof data?.audit_id === 'string') {
+        try {
+          await prisma.videoAdAudit.create({
+            data: {
+              id: data.audit_id,
+              businessId,
+              adTitle: String(ad_title),
+              layersApplied: parseLayers(presentation_layers_applied),
+            },
+          });
+        } catch (e) {
+          logger.warn(`[VideoGuard] Gagal simpan VideoAdAudit awal ${data.audit_id}: ${(e as Error).message}`);
+        }
+      }
+      res.status(upstream.status).json(data);
+    } catch (e) { next(e); }
+  },
+);
+
+/** Baca report ComplianceAuditReport (dari GET status atau POST clarify) lalu simpan ke baris
+ *  VideoAdAudit yang sudah dibuat saat submit. Di-scope ke businessId (updateMany, bukan update)
+ *  supaya audit_id business lain tidak bisa ke-update lewat tebakan id -- meski metaguard_service
+ *  sendiri tidak men-scope audit_id per-tenant, DB kita tetap harus. Gagal simpan tidak boleh
+ *  menggagalkan response ke client -- realtime state dari metaguard_service tetap dikirim apa
+ *  adanya, ini murni best-effort utk histori. */
+/** [2026-08-26] Blueprint Batch B Bagian 4.2/4.3: metaguard_service menaruh JPEG evidence sbg
+ *  base64 SEMENTARA di `raw_assessment.violations[].evidence.frame_jpeg_base64` -- transport-only,
+ *  TIDAK BOLEH sampai ke frontend (lihat docstring ViolationEvidence di engine.py). Fungsi ini:
+ *  (1) decode + upsert tiap evidence yang ada ke tabel VideoAdAuditEvidence (key unik
+ *  auditId+violationId -- aman dipanggil ulang lewat alur klarifikasi tanpa numpuk baris
+ *  duplikat), (2) MUTASI `report` in-place membuang field frame_jpeg_base64. `report` di sini
+ *  adalah OBJECT YANG SAMA yang nanti dikirim balik ke frontend lewat res.json(data) di caller
+ *  (lihat router.get('/audit/:auditId') & router.post('/audit/:auditId/clarify') di bawah) --
+ *  jadi mutasi ini otomatis mencegah base64 bocor ke response API SEKALIGUS mencegah dobel-simpan
+ *  bytes yang sama di kolom rawReportJson (JSONB) dan di tabel evidence (bytea) -- lihat catatan
+ *  "dicompres biar kecil" Bossfren, blueprint Bagian 4.3. Best-effort per-violation -- satu
+ *  evidence gagal disimpan TIDAK BOLEH menggagalkan audit atau violation lain. */
+async function persistAndStripEvidence(auditId: string, report: Record<string, unknown>): Promise<void> {
+  const violations = (report as any)?.raw_assessment?.violations;
+  if (!Array.isArray(violations)) return;
+  for (const v of violations) {
+    const evidence = v?.evidence;
+    const b64 = evidence?.frame_jpeg_base64;
+    if (!evidence || typeof b64 !== 'string' || !b64) continue;
+    try {
+      const frameJpeg = Buffer.from(b64, 'base64');
+      await prisma.videoAdAuditEvidence.upsert({
+        where: { auditId_violationId: { auditId, violationId: String(v.id) } },
+        create: {
+          auditId,
+          violationId: String(v.id),
+          evidenceType: String(evidence.evidence_type ?? 'video_frame'),
+          frameJpeg,
+          evidenceText: typeof evidence.evidence_text === 'string' ? evidence.evidence_text : null,
+        },
+        update: {
+          evidenceType: String(evidence.evidence_type ?? 'video_frame'),
+          frameJpeg,
+          evidenceText: typeof evidence.evidence_text === 'string' ? evidence.evidence_text : null,
+        },
+      });
+    } catch (e) {
+      logger.warn(`[VideoGuard] Gagal simpan evidence violation ${v?.id} audit ${auditId}: ${(e as Error).message}`);
+    } finally {
+      // WAJIB tetap dibuang walau upsert di atas gagal -- field ini tidak boleh pernah sampai ke
+      // frontend atau ikut tersimpan di rawReportJson.
+      delete evidence.frame_jpeg_base64;
+    }
+  }
+}
+
+async function persistAuditReport(auditId: string, businessId: string, report: Record<string, unknown>): Promise<void> {
+  try {
+    // [2026-08-26] Blueprint Batch B: decode+simpan evidence frame (kalau ada) SEBELUM apa pun
+    // lain di bawah -- `report` (object yang sama) akan dikirim balik ke frontend oleh caller
+    // lewat res.json(), jadi field transport-only frame_jpeg_base64 WAJIB dibuang sebelum
+    // rawReportJson ditulis di bawah maupun sebelum function ini return ke caller.
+    await persistAndStripEvidence(auditId, report);
+
+    // FIX 2026-08-25 (feedback Bossfren -- kolom Status di Riwayat Audit): metaguard_service
+    // sekarang mengisi `channels_used`, BUKAN `presentation_layers_applied` (field itu selalu
+    // kosong -- drift lama antara kontrak Node<->metaguard_service, baru ketahuan lewat investigasi
+    // "kok video jarang ke-cek" hari ini). Prioritaskan channels_used, fallback field lama.
+    const layers = parseLayers((report as any).channels_used ?? report.presentation_layers_applied);
+
+    // _ad_context (adName asli + copy asli sebelum diaudit, lihat POST /meta-rejected-creatives/
+    // :adId/audit) ditulis saat baris dibuat (submit) -- HARUS dipertahankan di sini, kalau tidak
+    // hilang tertimpa waktu rawReportJson diisi penuh dgn hasil report akhir.
+    const existingRow = await prisma.videoAdAudit.findUnique({ where: { id: auditId }, select: { rawReportJson: true } });
+    const existingAdContext = (existingRow?.rawReportJson as any)?._ad_context;
+
+    await prisma.videoAdAudit.updateMany({
+      where: { id: auditId, businessId },
+      data: {
+        overallScore: typeof report.overall_compliance_score === 'number' ? report.overall_compliance_score : undefined,
+        verdict: typeof report.verdict === 'string' ? report.verdict : undefined,
+        layersApplied: layers,
+        rawReportJson: (existingAdContext ? { ...report, _ad_context: existingAdContext } : report) as Prisma.InputJsonValue,
+      },
+    });
+  } catch (e) {
+    logger.warn(`[VideoGuard] Gagal update VideoAdAudit ${auditId}: ${(e as Error).message}`);
+  }
+}
+
+/** Tempel _ad_context (adName/originalHeadline/originalPrimaryText yg sudah tersimpan di DB) ke
+ *  object report yang mau dikirim ke frontend. report dari metaguard_service sendiri (in-memory)
+ *  TIDAK tahu-menahu soal _ad_context krn itu murni ditambahkan Node di sini -- jadi wajib digabung
+ *  manual tiap kali baca (GET /audit/:auditId & POST /audit/:auditId/clarify), bukan cuma sekali
+ *  waktu persist. Best-effort, tidak boleh menggagalkan response utama. */
+/** Ambil thumbnail/preview iframe utk audit yang berasal dari flow "Meta Ads Creative" (punya
+ *  metaAdId tersimpan) -- dipakai tab "Media Analysis" halaman detail audit (Round D poin 4,
+ *  Bossfren 2026-08-25) supaya video/gambar asli bisa dirender inline TANPA download, reuse
+ *  mekanisme Graph API `/previews` yang sudah proven jalan di /meta-rejected-creatives di bawah.
+ *  Di-cache Redis per metaAdId (bukan per auditId -- satu ad Meta yang sama bisa dipakai lintas
+ *  audit) krn ini ikut kepanggil tiap kali GET /audit/:auditId di-poll (setiap ~4 detik selama
+ *  status belum "done" -- lihat frontend page.tsx). Best-effort murni -- null kalau ad/token
+ *  sudah tidak valid lagi (BM dicabut, ad dihapus, dst), JANGAN gagalkan response utama.
+ *  `resolveAdOwnerToken`/`extractMetaVideoId`/`META_GRAPH_VERSION` didefinisikan di bawah file
+ *  ini (bagian /meta-rejected-creatives) -- aman dipanggil dari sini krn function declaration
+ *  di-hoist dan baris ini baru benar-benar jalan saat ada request masuk, jauh setelah seluruh
+ *  modul selesai dimuat. */
+async function fetchAdMediaPreview(
+  businessId: string,
+  metaAdId: string,
+): Promise<{ thumbnailUrl: string | null; previewIframe: string | null; mediaType: 'VIDEO' | 'IMAGE' } | null> {
+  const cacheKey = `salespintar:video-guard:ad-media:${metaAdId}`;
+  try {
+    const { redisCache } = await import('../config/redis');
+    const cached = await redisCache.get(cacheKey).catch(() => null);
+    if (cached) return JSON.parse(cached);
+
+    const token = await resolveAdOwnerToken(businessId, metaAdId);
+    if (!token) return null;
+
+    const q = new URLSearchParams({
+      fields: 'id,creative{thumbnail_url,image_url,video_id,object_story_spec}',
+      access_token: token,
+    });
+    const adResp = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${metaAdId}?${q.toString()}`);
+    const adData = (await adResp.json()) as any;
+    if (!adResp.ok || adData.error) return null;
+
+    const creative = adData.creative || {};
+    const metaVideoId = extractMetaVideoId(creative);
+    const mediaType: 'VIDEO' | 'IMAGE' = metaVideoId ? 'VIDEO' : 'IMAGE';
+    const thumbnailUrl = creative.thumbnail_url || creative.image_url || null;
+
+    let previewIframe: string | null = null;
+    try {
+      const prevRes = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${metaAdId}/previews?ad_format=MOBILE_FEED_STANDARD&access_token=${token}`);
+      if (prevRes.ok) {
+        const prevData = (await prevRes.json()) as any;
+        previewIframe = prevData.data?.[0]?.body || null;
+      }
+    } catch { /* opsional, biarkan null */ }
+
+    const result = { thumbnailUrl, previewIframe, mediaType };
+    await redisCache.set(cacheKey, JSON.stringify(result), 'EX', 15 * 60).catch(() => {});
+    return result;
+  } catch (e) {
+    logger.warn(`[VideoGuard] Gagal ambil media preview utk metaAdId ${metaAdId}: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+async function attachAdContext(auditId: string, businessId: string, report: Record<string, unknown>): Promise<void> {
+  try {
+    const row = await prisma.videoAdAudit.findUnique({ where: { id: auditId }, select: { rawReportJson: true, metaAdId: true } });
+    const ctx = (row?.rawReportJson as any)?._ad_context;
+    if (ctx) {
+      (report as any).ad_name = ctx.adName ?? null;
+      (report as any).original_headline = ctx.originalHeadline ?? null;
+      (report as any).original_primary_text = ctx.originalPrimaryText ?? null;
+    }
+    // [2026-08-25] Round D poin 4 (Bossfren): tab "Media Analysis" butuh render video/gambar asli
+    // inline. Cuma tersedia utk audit yg berasal dari flow "Meta Ads Creative" (punya metaAdId) --
+    // audit manual (upload file langsung) TIDAK PERNAH menyimpan bytes-nya di backend ini (multer
+    // memoryStorage dibuang abis request selesai), jadi tidak ada apa pun yg bisa direkonstruksi.
+    (report as any).media = row?.metaAdId ? await fetchAdMediaPreview(businessId, row.metaAdId) : null;
+  } catch { /* best-effort */ }
+}
+
+/** [2026-08-25] Fallback Postgres kalau metaguard_service 404 -- lihat catatan panjang di atas
+ *  file patch ini utk root cause lengkap (restart service = in-memory dict AUDIT_STATUS kosong).
+ *  Row yang SUDAH selesai (verdict + rawReportJson ada) direkonstruksi persis ke bentuk
+ *  {status:'done', report:{...}} yang biasanya datang dari metaguard_service -- termasuk
+ *  ad_name/media attachment (logic sama dgn attachAdContext, di-inline di sini supaya tidak baca
+ *  row 2x). Row yang ADA tapi verdict-nya masih null (bener2 kepotong di tengah proses krn restart,
+ *  bukan sekadar "belum sempat di-cek" -- itu beda kasus) dikembalikan sbg status 'error' yang
+ *  jelas, BUKAN dibiarkan polling selamanya atau nge-throw 404 generik. Return null kalau baris
+ *  memang tidak ada sama sekali (auditId asli-asli salah/tidak pernah dibuat) -- caller lempar
+ *  NotFoundError seperti biasa utk kasus itu. */
+async function tryFallbackFromDb(auditId: string, businessId: string): Promise<Record<string, unknown> | null> {
+  try {
+    const row = await prisma.videoAdAudit.findUnique({ where: { id: auditId } });
+    if (!row || row.businessId !== businessId) return null;
+    if (!row.verdict || !row.rawReportJson) {
+      return {
+        status: 'error',
+        error: 'Audit ini tidak bisa dimuat lagi karena layanan AI sempat direstart sebelum prosesnya selesai. Silakan jalankan audit baru untuk iklan ini.',
+      };
+    }
+    const stored = row.rawReportJson as any;
+    const ctx = stored?._ad_context;
+    const report: Record<string, unknown> = { ...stored };
+    delete report._ad_context;
+    if (ctx) {
+      report.ad_name = ctx.adName ?? null;
+      report.original_headline = ctx.originalHeadline ?? null;
+      report.original_primary_text = ctx.originalPrimaryText ?? null;
+    }
+    report.media = row.metaAdId ? await fetchAdMediaPreview(businessId, row.metaAdId) : null;
+    return { status: 'done', report };
+  } catch (e) {
+    logger.warn(`[VideoGuard] Fallback DB gagal utk audit ${auditId}: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+router.get('/audit/:auditId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const auditId = String(req.params.auditId);
+    const baseUrl = requireMetaguardUrl();
+    const upstream = await fetch(`${baseUrl}/v1/audit/${encodeURIComponent(auditId)}`, {
+      headers: metaguardHeaders(),
+      signal: AbortSignal.timeout(METAGUARD_TIMEOUT_MS),
+    });
+    if (upstream.status === 404) {
+      const fallback = await tryFallbackFromDb(auditId, businessId);
+      if (fallback) return res.json(fallback);
+      throw new NotFoundError('Audit');
+    }
+    const data: any = await upstream.json();
+    if (upstream.ok && data?.status === 'done' && data?.report) {
+      await persistAuditReport(auditId, businessId, data.report);
+      await attachAdContext(auditId, businessId, data.report);
+    }
+    res.status(upstream.status).json(data);
+  } catch (e) { next(e); }
+});
+
+const clarifySchema = z.object({
+  violation_id: z.string().min(1),
+  user_context: z.string().min(1),
+});
+
+router.post('/audit/:auditId/clarify', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const auditId = String(req.params.auditId);
+    const payload = clarifySchema.parse(req.body);
+    const baseUrl = requireMetaguardUrl();
+    const upstream = await fetch(`${baseUrl}/v1/audit/${encodeURIComponent(auditId)}/clarify`, {
+      method: 'POST',
+      headers: metaguardHeaders({ 'Content-Type': 'application/json' }),
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(METAGUARD_TIMEOUT_MS),
+    });
+    if (upstream.status === 404) {
+      // Beda dari GET /audit/:auditId -- klarifikasi butuh state percakapan LIVE di metaguard_service
+      // (in-memory), tidak bisa direkonstruksi dari Postgres kalau service-nya sudah restart. Kasih
+      // pesan jelas drpd nge-forward 404 mentah dari metaguard_service.
+      throw new ValidationError('Audit ini tidak bisa diklarifikasi lagi karena layanan AI sempat direstart sebelum menyimpan progresnya. Jalankan audit baru untuk iklan ini.');
+    }
+    const data: any = await upstream.json();
+    // Beda dari GET /audit/:auditId -- clarify_audit() di metaguard_service balikin
+    // ComplianceAuditReport LANGSUNG (bukan dibungkus {status, report}), lihat main.py.
+    if (upstream.ok && typeof data?.verdict === 'string') {
+      await persistAuditReport(auditId, businessId, data);
+      await attachAdContext(auditId, businessId, data);
+    }
+    res.status(upstream.status).json(data);
+  } catch (e) { next(e); }
+});
+
+/** [2026-08-26] Blueprint Batch B Bagian 4.3: serve 1 evidence frame (JPEG) tersimpan di tabel
+ *  VideoAdAuditEvidence. Di-scope ke businessId lewat findFirst({id, businessId}) dulu -- bukan
+ *  cuma percaya auditId di URL, konsisten dgn pola scoping updateMany/findUnique di seluruh file
+ *  ini. 404 kalau audit bukan milik business ini, atau evidence-nya memang tidak ada (mis.
+ *  violation channel Text/Landing_Page yang tidak pernah punya frame, atau ekstraksi cv2 gagal
+ *  best-effort di metaguard_service). */
+router.get('/audit/:auditId/evidence/:violationId', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const auditId = String(req.params.auditId);
+    const violationId = String(req.params.violationId);
+
+    const audit = await prisma.videoAdAudit.findFirst({ where: { id: auditId, businessId }, select: { id: true } });
+    if (!audit) throw new NotFoundError('Audit');
+
+    const evidence = await prisma.videoAdAuditEvidence.findUnique({
+      where: { auditId_violationId: { auditId, violationId } },
+      select: { frameJpeg: true },
+    });
+    if (!evidence?.frameJpeg) throw new NotFoundError('Evidence');
+
+    // [2026-08-27] fix ROOT CAUSE "gambar tanda tanya" (ikon broken-image di tab Pelanggaran):
+    // Prisma balikin kolom Bytes sbg Uint8Array MURNI, BUKAN instance Buffer asli --
+    // Buffer.isBuffer(evidence.frameJpeg) === false (dikonfirmasi via query langsung).
+    // Express res.send() cuma treat chunk sbg binary kalau Buffer.isBuffer(chunk) true;
+    // kalau false (walau tetap object/Uint8Array), res.send() DIAM-DIAM fallback ke
+    // res.json(chunk) -- serialize jadi JSON berindeks {"0":255,"1":216,...} SEKALIPUN
+    // Content-Type sudah eksplisit di-set 'image/jpeg' duluan (res.json tidak override
+    // header yang sudah ada). Browser dapat 200 OK + Content-Type image/jpeg tapi body-nya
+    // teks JSON, bukan byte JPEG asli -> gagal didekode -> ikon broken-image. Fix: bungkus
+    // eksplisit ke Buffer asli sebelum res.send() supaya Buffer.isBuffer() true dan Express
+    // kirim raw binary sebagaimana mestinya.
+    res.setHeader('Content-Type', 'image/jpeg');
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.send(Buffer.from(evidence.frameJpeg));
+  } catch (e) { next(e); }
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// POST /video-guard/reinforce — proxy ke metaguard_service /v1/presentation/reinforce
+// ══════════════════════════════════════════════════════════════════════════
+
+router.post(
+  '/reinforce',
+  upload.single('video_file'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const videoFile = req.file;
+      const { layers } = req.body;
+      if (!videoFile) throw new ValidationError('video_file wajib diisi');
+      if (!layers) throw new ValidationError('layers wajib diisi (comma-separated)');
+
+      const form = new FormData();
+      form.set('layers', String(layers));
+      form.set('video_file', new Blob([videoFile.buffer], { type: videoFile.mimetype }), videoFile.originalname);
+
+      const baseUrl = requireMetaguardUrl();
+      const upstream = await fetch(`${baseUrl}/v1/presentation/reinforce`, {
+        method: 'POST',
+        headers: metaguardHeaders(),
+        body: form,
+        signal: AbortSignal.timeout(METAGUARD_TIMEOUT_MS),
+      });
+      const data = await upstream.json();
+      res.status(upstream.status).json(data);
+    } catch (e) { next(e); }
+  },
+);
+
+router.get('/reinforce/:jobId/status', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const baseUrl = requireMetaguardUrl();
+    const upstream = await fetch(`${baseUrl}/v1/presentation/reinforce/${encodeURIComponent(String(req.params.jobId))}/status`, {
+      headers: metaguardHeaders(),
+      signal: AbortSignal.timeout(METAGUARD_TIMEOUT_MS),
+    });
+    if (upstream.status === 404) throw new NotFoundError('Reinforcement job');
+    const data = await upstream.json();
+    res.status(upstream.status).json(data);
+  } catch (e) { next(e); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// GET /video-guard/history — daftar VideoAdAudit milik business ini, dari DB kita sendiri (BUKAN
+// proxy ke metaguard_service -- statusnya in-memory & tidak survive restart, lihat catatan header
+// modul). Dipakai halaman Dashboard (2.3) & Riwayat Audit (2.3); dashboard menghitung ringkasan
+// (success rate, dsb) dari list yang sama di sisi client supaya tidak perlu endpoint agregasi
+// terpisah untuk MVP ini.
+// ══════════════════════════════════════════════════════════════════════════
+
+const TOTAL_AUDIT_CHANNELS = 5; // visual, audio, teks, thumbnail, landing page -- lihat CHANNEL_LABELS di frontend page.tsx
+
+router.get('/history', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const take = Math.min(Number(req.query.take) || 50, 200);
+    const rows = await prisma.videoAdAudit.findMany({
+      where: { businessId },
+      orderBy: { createdAt: 'desc' },
+      take,
+      select: {
+        id: true,
+        adTitle: true,
+        overallScore: true,
+        verdict: true,
+        layersApplied: true,
+        rawReportJson: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+    // Feedback Bossfren 2026-08-25: (1) judul Riwayat harus konsisten dgn kartu "Ads Creative" --
+    // pakai adName asli (dari _ad_context) kalau ada; (2) kolom status kelengkapan channel, krn
+    // investigasi hari ini nemu banyak audit diam-diam cuma pakai teks+thumbnail (video gagal
+    // diambil dari Meta) tanpa ada tanda apa pun di UI. `rawReportJson` SENGAJA tidak diteruskan
+    // utuh ke response (bisa berat, ada raw_assessment lengkap) -- cuma dipakai hitung 2 field di
+    // bawah lalu dibuang.
+    const audits = rows.map((r) => {
+      const ctx = (r.rawReportJson as any)?._ad_context;
+      return {
+        id: r.id,
+        adTitle: r.adTitle,
+        adName: ctx?.adName ?? null,
+        // [2026-08-25] Round D point 1 (Bossfren): tabel Riwayat baru butuh tahu channel MANA yang
+        // berhasil (bukan cuma hitung N/5) supaya bisa render icon Text/Image/Video/Link per baris --
+        // sebelumnya cuma channelsCompleted (angka) yang diteruskan, sekarang array-nya juga.
+        channels: r.layersApplied || [],
+        description: ctx?.originalPrimaryText ?? null,
+        overallScore: r.overallScore,
+        verdict: r.verdict,
+        channelsCompleted: (r.layersApplied || []).length,
+        channelsTotal: TOTAL_AUDIT_CHANNELS,
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+      };
+    });
+    res.json({ audits });
+  } catch (e) { next(e); }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// GET /video-guard/meta-rejected-creatives — creative yang DITOLAK Meta sendiri (Ad Review),
+// di semua Business Manager yang terkoneksi di salespintar utk business ini. Pola fetch Graph API
+// SAMA PERSIS dgn /business/meta-top-creatives (business.routes.ts) -- loop BM aktif -> ad account
+// -> fetch ads -- tapi filter `effective_status=DISAPPROVED` (bukan sort-by-CTR), dan ambil
+// `ad_review_feedback` (alasan reject asli dari Meta) alih-alih quality_ranking. SENGAJA hanya
+// DISAPPROVED, bukan WITH_ISSUES -- WITH_ISSUES itu masalah teknis/akun (pixel hilang, akun
+// nonaktif), bukan pelanggaran konten, jadi tidak relevan buat menu MetaGuard ini (keputusan
+// Bossfren 2026-08-25).
+//
+// Tidak menjalankan audit MetaGuard AI apa pun di sini -- itu murni proxy baca Graph API (murah,
+// cepat), di-cache Redis pendek. Audit sungguhan (mahal, panggil agy) BARU jalan kalau user klik
+// tombol "Audit MetaGuard AI" di popup, lihat POST /meta-rejected-creatives/:adId/audit di bawah.
+// ══════════════════════════════════════════════════════════════════════════
+
+const META_GRAPH_VERSION = 'v21.0';
+
+async function getActiveBmTokens(businessId: string): Promise<Array<{ bmId: string; token: string }>> {
+  const bms = await prisma.metaBusinessManager.findMany({
+    where: { businessId, isActive: true, tokenStatus: 'ACTIVE' },
+  });
+  const out: Array<{ bmId: string; token: string }> = [];
+  for (const bm of bms) {
+    const token = decrypt(bm.accessToken);
+    if (token) out.push({ bmId: bm.id, token });
+  }
+  return out;
+}
+
+// TEMUAN 2026-08-25 (smoke test nyata dgn video produksi asli 15MB): kalau audit sebelumnya gagal
+// secara TEKNIS (agy exit non-zero / timeout AGY_TIMEOUT_MS 300s di api-bridge -- lihat ledger entry
+// hari ini), metaguard_service TETAP membalikin status "done" dgn verdict MANUAL_REVIEW +
+// overallScore 0 (bukan error HTTP) -- laporan "sukses" secara struktur tapi isinya cuma placeholder
+// gagal-parse. Kalau baris begini dianggap "sudah diaudit" oleh dedup, user TERKUNCI PERMANEN tanpa
+// jalan retry.
+function looksLikeTechnicalFailure(row: { verdict: string | null; overallScore: number | null; rawReportJson: unknown } | null): boolean {
+  if (!row) return false;
+  if (row.verdict !== 'MANUAL_REVIEW' || row.overallScore !== 0) return false;
+  const summary = (row.rawReportJson as any)?.raw_assessment?.executive_summary as string | undefined;
+  return typeof summary === 'string' && (
+    summary.includes('gagal diparse') || (summary.includes('invoker') && summary.includes('gagal'))
+  );
+}
+
+// [2026-08-25] TEMUAN KEDUA (Round E, Bossfren -- "tombol audit semua mati"): baris yang DIBUAT
+// (agy sempat balikin audit_id) tapi verdict-nya TETAP null selamanya -- krn job in-memory-nya
+// hilang duluan (metaguard_service restart) sebelum sempat "done". Beda dari looksLikeTechnicalFailure
+// (yang verdict-nya SUDAH ada, cuma isinya placeholder gagal) -- ini malah verdict-nya belum pernah
+// keisi sama sekali. STALE_AUDIT_MS digenerouskan jauh di atas AGY_TIMEOUT_MS (10 menit, lihat ledger
+// hari ini) supaya audit yang MASIH beneran diproses lama tidak salah dianggap orphan.
+const STALE_AUDIT_MS = 20 * 60 * 1000;
+function looksLikeOrphanedAudit(row: { verdict: string | null; createdAt: Date } | null): boolean {
+  if (!row) return false;
+  if (row.verdict !== null) return false;
+  return Date.now() - row.createdAt.getTime() > STALE_AUDIT_MS;
+}
+
+/** Dipakai di 2 tempat: dedup single-audit (POST /meta-rejected-creatives/:adId/audit) DAN
+ *  perhitungan existingAuditId/pendingCount di list (GET /meta-rejected-creatives) -- row yang
+ *  retriable TIDAK dihitung sbg "sudah diaudit" di keduanya, supaya "Audit Semua" tidak macet cuma
+ *  krn ada baris orphan/gagal-teknis yang bikin pendingCount keitung 0 padahal masih ada yg beneran
+ *  perlu diaudit ulang. */
+function isAuditRetriable(row: { verdict: string | null; overallScore: number | null; rawReportJson: unknown; createdAt: Date } | null): boolean {
+  return looksLikeTechnicalFailure(row) || looksLikeOrphanedAudit(row);
+}
+
+/** Ambil video_id "asli" yang bisa dipakai buat resolve source url mp4 -- lewat pengalaman empiris
+ *  (2026-08-25): `creative.video_id` level atas SERING BEDA dari
+ *  `creative.object_story_spec.video_data.video_id` dan yang terakhir ini yang benar-benar bisa
+ *  di-resolve `?fields=source`-nya, bukan yang pertama. Fallback ke level atas kalau nested nggak ada. */
+function extractMetaVideoId(creative: any): string | null {
+  return creative?.object_story_spec?.video_data?.video_id || creative?.video_id || null;
+}
+
+function extractLandingPageUrl(creative: any): string | null {
+  return creative?.object_story_spec?.video_data?.call_to_action?.value?.link
+    || creative?.object_story_spec?.link_data?.link
+    || null;
+}
+
+function extractCreativeCopy(creative: any): { headline?: string; primaryText?: string } {
+  const headline = creative?.object_story_spec?.video_data?.title || creative?.title || undefined;
+  const primaryText = creative?.object_story_spec?.video_data?.message || creative?.body || undefined;
+  return { headline, primaryText };
+}
+
+router.get('/meta-rejected-creatives', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const limit = Math.min(parseInt(req.query.limit as string) || 30, 100);
+
+    const cacheKey = `salespintar:video-guard:meta-rejected:${businessId}`;
+    const { redisCache } = await import('../config/redis');
+    const forceRefresh = req.query.forceRefresh === 'true';
+    const cached = await redisCache.get(cacheKey).catch(() => null);
+    if (cached && !forceRefresh) {
+      return res.json(JSON.parse(cached));
+    }
+
+    const bmTokens = await getActiveBmTokens(businessId);
+    const rejected: any[] = [];
+    const uniqueAdAccounts = new Set<string>();
+
+    for (const { token } of bmTokens) {
+      try {
+        const adAccResp = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/me/adaccounts?fields=id&access_token=${token}`);
+        if (!adAccResp.ok) continue;
+        const adAccounts = ((await adAccResp.json()) as any).data || [];
+
+        await Promise.allSettled(adAccounts.map(async (act: any) => {
+          const actId = act.id;
+          const dedupeKey = `${actId}:${token.slice(0, 8)}`;
+          if (uniqueAdAccounts.has(dedupeKey)) return;
+          uniqueAdAccounts.add(dedupeKey);
+
+          const q = new URLSearchParams({
+            fields: 'id,name,campaign{name},ad_review_feedback,creative{id,name,thumbnail_url,image_url,video_id,object_story_spec,body}',
+            effective_status: JSON.stringify(['DISAPPROVED']),
+            limit: '50',
+            access_token: token,
+          });
+          const adsResp = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${actId}/ads?${q.toString()}`);
+          if (!adsResp.ok) return;
+          const ads = ((await adsResp.json()) as any).data || [];
+
+          for (const ad of ads) {
+            const feedback = ad.ad_review_feedback?.global || {};
+            const violationKeys = Object.keys(feedback);
+            if (violationKeys.length === 0) continue; // DISAPPROVED tapi tanpa feedback terbaca -- skip drpd nampilin badge kosong
+            const violationLabel = violationKeys[0];
+            const violationMessage = feedback[violationLabel];
+            const creative = ad.creative || {};
+            const metaVideoId = extractMetaVideoId(creative);
+            const isVideo = Boolean(metaVideoId);
+
+            rejected.push({
+              metaAdId: ad.id,
+              adAccountId: actId,
+              adName: ad.name,
+              campaignName: ad.campaign?.name || '-',
+              thumbnailUrl: creative.thumbnail_url || creative.image_url || null,
+              mediaType: isVideo ? 'VIDEO' : 'IMAGE',
+              metaVideoId,
+              violationLabel,
+              violationMessage,
+              token, // dipakai step berikutnya (insight + preview), DIHAPUS sebelum dikirim ke client
+            });
+          }
+        }));
+      } catch (e) {
+        logger.warn(`[VideoGuard] Gagal fetch rejected creatives dari salah satu BM: ${(e as Error).message}`);
+      }
+    }
+
+    const limited = rejected.slice(0, limit);
+
+    // Insight (spend/ctr/impressions) lifetime -- disapproved bisa jadi sempat tayang sebelum
+    // ketahuan, atau belum tayang sama sekali (spend 0). Best-effort, gagal per-item tidak fatal.
+    // Preview iframe interaktif -- pola sama dgn /business/meta-top-creatives.
+    await Promise.allSettled(limited.map(async (item) => {
+      try {
+        const insQ = new URLSearchParams({
+          level: 'ad',
+          fields: 'ad_id,spend,ctr,impressions',
+          date_preset: 'maximum',
+          filtering: JSON.stringify([{ field: 'ad.id', operator: 'IN', value: [item.metaAdId] }]),
+          access_token: item.token,
+        });
+        const insResp = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${item.adAccountId}/insights?${insQ.toString()}`);
+        if (insResp.ok) {
+          const row = ((await insResp.json()) as any).data?.[0];
+          item.spend = parseFloat(row?.spend || '0');
+          item.ctr = parseFloat(row?.ctr || '0');
+          item.impressions = parseInt(row?.impressions || '0', 10);
+        } else {
+          item.spend = 0; item.ctr = 0; item.impressions = 0;
+        }
+      } catch { item.spend = 0; item.ctr = 0; item.impressions = 0; }
+
+      try {
+        const prevRes = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${item.metaAdId}/previews?ad_format=MOBILE_FEED_STANDARD&access_token=${item.token}`);
+        if (prevRes.ok) {
+          const prevData = (await prevRes.json()) as any;
+          item.previewIframe = prevData.data?.[0]?.body || null;
+        }
+      } catch { /* opsional, biarkan null */ }
+
+      delete item.token;
+    }));
+
+    // Tandai yang SUDAH pernah diaudit MetaGuard AI -- 1 query findMany drpd N findFirst.
+    const metaAdIds = limited.map((i) => i.metaAdId);
+    const existingAudits = metaAdIds.length
+      ? await prisma.videoAdAudit.findMany({
+          where: { businessId, metaAdId: { in: metaAdIds } },
+          select: { id: true, metaAdId: true, overallScore: true, verdict: true, createdAt: true, rawReportJson: true },
+        })
+      : [];
+    const auditByAdId = new Map(existingAudits.map((a) => [a.metaAdId as string, a]));
+    for (const item of limited) {
+      const existing = auditByAdId.get(item.metaAdId);
+      // [2026-08-25] Row retriable (gagal teknis ATAU orphan krn metaguard_service restart) TIDAK
+      // dihitung sbg "sudah diaudit" -- supaya item ini tetap muncul sbg pending & "Audit Semua"
+      // tidak salah kira semuanya sudah kelar.
+      const retriable = existing ? isAuditRetriable(existing) : false;
+      item.existingAuditId = existing && !retriable ? existing.id : null;
+      item.existingOverallScore = existing && !retriable ? existing.overallScore : null;
+      item.existingVerdict = existing && !retriable ? existing.verdict : null;
+    }
+
+    const payload = { data: limited };
+    await redisCache.set(cacheKey, JSON.stringify(payload), 'EX', 15 * 60).catch(() => {});
+    res.json(payload);
+  } catch (e) { next(e); }
+});
+
+const MAX_META_VIDEO_DOWNLOAD_MS = 60_000; // download video dari CDN Meta bisa lebih lama drpd
+// panggilan API biasa -- beda dgn METAGUARD_TIMEOUT_MS yang buat submit/poll ringan ke metaguard_service.
+
+/** Cari token BM (dari business ini) yang punya akses ke adId tertentu -- ad Meta di-scope per BM,
+ *  jadi harus dicoba satu-satu (persis pola yang kepakai pas investigasi manual 2026-08-25: token
+ *  yang bukan pemilik ad akan dapat error "does not exist ... missing permissions", BUKAN exception
+ *  fatal -- itu sinyal normal buat lanjut coba token berikutnya). */
+async function resolveAdOwnerToken(businessId: string, adId: string): Promise<string | null> {
+  const bmTokens = await getActiveBmTokens(businessId);
+  for (const { token } of bmTokens) {
+    try {
+      const r = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${adId}?fields=id&access_token=${token}`);
+      const j = (await r.json()) as any;
+      if (r.ok && !j.error) return token;
+    } catch { /* coba token berikutnya */ }
+  }
+  return null;
+}
+
+async function downloadUrlAsBuffer(url: string, timeoutMs: number): Promise<{ buffer: Buffer; contentType: string } | null> {
+  const resp = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!resp.ok) return null;
+  const contentLength = resp.headers.get('content-length');
+  if (contentLength && parseInt(contentLength, 10) > MAX_VIDEO_BYTES) {
+    throw new ValidationError(`File dari Meta terlalu besar (${contentLength} bytes, batas ${MAX_VIDEO_BYTES}).`);
+  }
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  if (buffer.byteLength > MAX_VIDEO_BYTES) {
+    throw new ValidationError(`File dari Meta terlalu besar (${buffer.byteLength} bytes, batas ${MAX_VIDEO_BYTES}).`);
+  }
+  return { buffer, contentType: resp.headers.get('content-type') || 'application/octet-stream' };
+}
+
+/** Fallback kalau Graph API `?fields=source` ditolak Meta (error #10 "Application does not have
+ *  permission for this action") -- ditemukan 2026-08-26 lewat investigasi Bossfren: video yang
+ *  GAGAL diakses langsung via field `source` TERNYATA tetap bisa di-preview/play normal di ad
+ *  preview kita sendiri (endpoint `/{adId}/previews`, jalur akses BEDA dari fetch video object
+ *  langsung). HTML hasil iframe preview itu (business.facebook.com/ads/api/preview_iframe.php)
+ *  memuat JSON inline berisi `videoURIHD`/`videoURISD` -- URL CDN fbcdn.net yang bisa langsung
+ *  didownload TANPA butuh permission video-object yang diblokir. Best-effort murni: return null
+ *  kalau langkah manapun gagal, caller tetap fallback ke text+thumbnail seperti sebelumnya. */
+async function resolveVideoUrlViaPreview(adId: string, token: string): Promise<string | null> {
+  try {
+    const prevRes = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${adId}/previews?ad_format=MOBILE_FEED_STANDARD&access_token=${token}`);
+    if (!prevRes.ok) return null;
+    const prevData = (await prevRes.json()) as any;
+    const body: string | undefined = prevData.data?.[0]?.body;
+    if (!body) return null;
+    const iframeMatch = body.match(/<iframe[^>]+src="([^"]+)"/i);
+    if (!iframeMatch) return null;
+    const iframeSrc = iframeMatch[1].replace(/&amp;/g, '&');
+    const fullUrl = iframeSrc.startsWith('http') ? iframeSrc : `https://www.facebook.com${iframeSrc}`;
+    const iframeResp = await fetch(fullUrl, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(20_000) });
+    if (!iframeResp.ok) return null;
+    const html = await iframeResp.text();
+    const hdMatch = html.match(/"videoURIHD":"([^"]+)"/);
+    const sdMatch = html.match(/"videoURISD":"([^"]+)"/);
+    const raw = hdMatch?.[1] || sdMatch?.[1];
+    if (!raw) return null;
+    return JSON.parse(`"${raw}"`); // unescape \/ dan unicode escape dari JSON literal Facebook
+  } catch (e) {
+    logger.warn(`[VideoGuard] resolveVideoUrlViaPreview gagal utk ad ${adId}: ${(e as Error).message}`);
+    return null;
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// POST /video-guard/meta-rejected-creatives/:adId/audit — tombol "Audit MetaGuard AI" di popup.
+// Dedup WAJIB (permintaan eksplisit Bossfren 2026-08-25): kalau ad ini SUDAH pernah diaudit
+// (baris VideoAdAudit dgn metaAdId yang sama sudah ada), balikin audit_id yang lama LANGSUNG,
+// JANGAN jalankan audit baru -- supaya video yang sama tidak berkali-kali kena biaya agy/LLM.
+// Kalau belum pernah: download video+thumbnail dari Meta CDN, forward ke metaguard_service PERSIS
+// seperti alur upload manual POST /audit di atas (multipart form yang sama), supaya nol perubahan
+// dibutuhkan di metaguard_service sendiri.
+// ══════════════════════════════════════════════════════════════════════════
+
+router.post('/meta-rejected-creatives/:adId/audit', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = req.user!.businessId;
+    const adId = String(req.params.adId);
+
+    const existing = await prisma.videoAdAudit.findFirst({ where: { businessId, metaAdId: adId } });
+    if (existing && !isAuditRetriable(existing)) {
+      return res.json({ audit_id: existing.id, already_audited: true });
+    }
+    if (existing) {
+      logger.warn(`[VideoGuard] Baris audit lama utk meta ad ${adId} kelihatan gagal teknis (bukan hasil AI beneran) -- audit ulang, baris lama akan ditimpa metaAdId-nya.`);
+      // Lepas metaAdId dari baris lama supaya tidak bentrok sama unique constraint saat baris baru
+      // dibuat -- baris lama tetap ada (histori percobaan gagal), cuma tidak lagi "terikat" ke ad ini.
+      await prisma.videoAdAudit.update({ where: { id: existing.id }, data: { metaAdId: null } });
+    }
+
+    const token = await resolveAdOwnerToken(businessId, adId);
+    if (!token) throw new NotFoundError('Ad Meta (tidak ditemukan di BM manapun yang terkoneksi utk business ini)');
+
+    const q = new URLSearchParams({
+      fields: 'id,name,ad_review_feedback,creative{id,name,thumbnail_url,image_url,video_id,object_story_spec,body}',
+      access_token: token,
+    });
+    const adResp = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${adId}?${q.toString()}`);
+    const adData = (await adResp.json()) as any;
+    if (!adResp.ok || adData.error) {
+      throw new ValidationError(`Gagal ambil detail ad dari Meta: ${adData.error?.message || 'unknown error'}`);
+    }
+
+    const creative = adData.creative || {};
+    const metaVideoId = extractMetaVideoId(creative);
+    const landingPageUrl = extractLandingPageUrl(creative);
+    const { headline, primaryText } = extractCreativeCopy(creative);
+    const adTitle = creative.name || adData.name || `Meta Ad ${adId}`;
+
+    let videoBuffer: Buffer | null = null;
+    let videoContentType = 'video/mp4';
+    if (metaVideoId) {
+      const srcResp = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${metaVideoId}?fields=source&access_token=${token}`);
+      const srcData = (await srcResp.json()) as any;
+      let resolvedVideoUrl: string | null = null;
+      if (srcResp.ok && srcData.source) {
+        resolvedVideoUrl = srcData.source;
+      } else {
+        logger.warn(`[VideoGuard] video_id ${metaVideoId} (ad ${adId}) tidak bisa di-resolve source-nya langsung: ${JSON.stringify(srcData).slice(0, 300)} -- coba fallback lewat ad preview iframe.`);
+        resolvedVideoUrl = await resolveVideoUrlViaPreview(adId, token);
+        if (resolvedVideoUrl) {
+          logger.info(`[VideoGuard] Fallback preview-iframe BERHASIL dapat video URL utk ad ${adId} (video_id ${metaVideoId}) -- Graph API ?fields=source ditolak (error #10) tapi ad-preview iframe tetap bisa diakses.`);
+        } else {
+          logger.warn(`[VideoGuard] Fallback preview-iframe JUGA gagal dapat video URL utk ad ${adId} (video_id ${metaVideoId}).`);
+        }
+      }
+      if (resolvedVideoUrl) {
+        const downloaded = await downloadUrlAsBuffer(resolvedVideoUrl, MAX_META_VIDEO_DOWNLOAD_MS);
+        if (downloaded) { videoBuffer = downloaded.buffer; videoContentType = downloaded.contentType; }
+      }
+    }
+
+    let thumbnailBuffer: Buffer | null = null;
+    let thumbnailContentType = 'image/jpeg';
+    const thumbUrl = creative.thumbnail_url || creative.image_url;
+    if (thumbUrl) {
+      try {
+        const downloaded = await downloadUrlAsBuffer(thumbUrl, 20_000);
+        if (downloaded) { thumbnailBuffer = downloaded.buffer; thumbnailContentType = downloaded.contentType; }
+      } catch (e) {
+        logger.warn(`[VideoGuard] Gagal download thumbnail ad ${adId}: ${(e as Error).message}`);
+      }
+    }
+
+    if (!videoBuffer && !thumbnailBuffer && !landingPageUrl) {
+      throw new ValidationError('Tidak ada video/thumbnail/landing page yang bisa diambil dari creative Meta ini.');
+    }
+
+    // fix Fase B (2026-08-27): sama seperti POST /audit -- lihat komentar di sana.
+    const [videoFallback, checkAdsHeaders, generateAdsHeaders] = await Promise.all([
+      resolveVideoFallbackConfig(businessId),
+      resolveCopywritingLlmHeadersForAudit(businessId, 'check'),
+      resolveCopywritingLlmHeadersForAudit(businessId, 'generate'),
+    ]);
+    const form = new FormData();
+    form.set('ad_title', String(adTitle));
+    if (primaryText) form.set('primary_text', String(primaryText));
+    if (headline) form.set('headline', String(headline));
+    if (landingPageUrl) form.set('landing_page_url', String(landingPageUrl));
+    if (videoBuffer) form.set('video_file', new Blob([videoBuffer], { type: videoContentType }), `meta-ad-${adId}.mp4`);
+    if (thumbnailBuffer) form.set('thumbnail_file', new Blob([thumbnailBuffer], { type: thumbnailContentType }), `meta-ad-${adId}-thumb.jpg`);
+
+    const baseUrl = requireMetaguardUrl();
+    const upstream = await fetch(`${baseUrl}/v1/audit`, {
+      method: 'POST',
+      headers: metaguardHeaders({
+        ...videoFallbackHeaders(videoFallback),
+        ...checkAdsHeaders,
+        ...generateAdsHeaders,
+      }),
+      body: form,
+      signal: AbortSignal.timeout(METAGUARD_TIMEOUT_MS),
+    });
+    const data: any = await upstream.json();
+    if (!upstream.ok) {
+      logger.warn(`[VideoGuard] metaguard_service /v1/audit menolak (dari Meta ad ${adId}): ${upstream.status} ${JSON.stringify(data)}`);
+    } else if (typeof data?.audit_id === 'string') {
+      try {
+        await prisma.videoAdAudit.create({
+          data: {
+            id: data.audit_id,
+            businessId,
+            adTitle: String(adTitle),
+            metaAdId: adId,
+            metaVideoId: metaVideoId || undefined,
+            // _ad_context (2026-08-25, feedback Bossfren): simpan nama ad ASLI (adData.name --
+            // yang tampil di kartu "Ads Creative") + copy asli SEBELUM diaudit, supaya halaman
+            // Riwayat & Laporan bisa konsisten dgn kartu Ads Creative (bukan cuma nama creative
+            // yg dipakai `adTitle`), dan "Saran Caption" bisa dibandingkan versi asli vs saran.
+            rawReportJson: {
+              _ad_context: {
+                adName: adData.name || null,
+                originalHeadline: headline || null,
+                originalPrimaryText: primaryText || null,
+              },
+            } as Prisma.InputJsonValue,
+          },
+        });
+      } catch (e) {
+        logger.warn(`[VideoGuard] Gagal simpan VideoAdAudit awal (Meta ad ${adId}) ${data.audit_id}: ${(e as Error).message}`);
+      }
+    }
+    res.status(upstream.status).json(data);
+  } catch (e) { next(e); }
+});
+
+export default router;

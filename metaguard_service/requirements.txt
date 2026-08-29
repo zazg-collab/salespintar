@@ -1,0 +1,22 @@
+# metaguard_service — dependencies
+#
+# Pin ke versi mayor yang cocok dengan kode di engine.py/main.py (Pydantic v2 API: model_dump,
+# model_validate_json, model_validate). Belum pernah di-`pip install` beneran di lingkungan manapun —
+# WAJIB `pip install -r requirements.txt` + jalankan smoke test sebelum deploy pertama, ada
+# kemungkinan versi minor perlu disesuaikan begitu ketemu konflik nyata (belum diverifikasi,
+# lihat Blueprint Section 9 item terbuka soal smoke-test pipeline).
+
+fastapi>=0.111,<1.0
+uvicorn[standard]>=0.30,<1.0
+python-multipart>=0.0.9        # wajib untuk Form()/File() di FastAPI
+
+pydantic>=2.7,<3.0
+tenacity>=8.3,<9.0
+httpx>=0.27,<1.0                # AgyCliInvoker -> HTTP call ke api-bridge /v1/run
+
+google-genai>=0.3.0             # GeminiSdkInvoker fallback (`from google import genai`)
+
+opencv-python-headless>=4.9,<5.0  # validate_video_asset() + _soften_highlights() (Layer 6)
+numpy>=1.26,<2.0
+
+playwright>=1.44,<2.0           # LandingPageAuditor -- WAJIB `playwright install chromium` pasca-install

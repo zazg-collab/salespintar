@@ -1,0 +1,1847 @@
+
+/**
+ * Profil toko — nama yang dilihat PELANGGAN + sakelar jeda Human Learning.
+ *
+ * GET   /business                     — profil ringkas toko + status jeda HL
+ * PATCH /business                     — ubah nama toko
+ * PATCH /business/human-learning-jeda — jeda/lanjutkan Human Learning (ADMIN)
+ * GET   /business/meta-capi           — status konfigurasi Meta CAPI (Fase 40, TIDAK PERNAH
+ *                                        balikin token mentah -- lihat audit Fase 39 temuan #1)
+ * PATCH /business/meta-capi           — ubah konfigurasi Meta CAPI (ADMIN)
+ * POST  /business/meta-capi/test-connection — kirim 1 test event via test_event_code (ADMIN)
+ * POST  /business/meta-capi/reconcile — rekonsiliasi event CAPI yang terlewat (Fase 45, ADMIN)
+ *
+ * ── Kenapa route ini ada ────────────────────────────────────────────────────
+ * `Business.name` bukan label administratif. Ia disuntikkan langsung ke prompt
+ * sistem (`getSystemPrompt(businessName)`), jadi kalimat pertama yang dibaca
+ * pelanggan berbunyi "Kamu customer service untuk <nama ini>". Selama ini isinya
+ * `SalesPintar MVP` — nama internal produk — sehingga bot menyapa pelanggan
+ * toko golok dengan "Selamat datang di SalesPintar!". Ketahuan 2 Agustus 2026
+ * dari tangkapan layar percakapan sungguhan, bukan dari audit: tidak ada satu
+ * pun pertanyaan audit yang menguji bot menyebut namanya sendiri.
+ *
+ * Nilainya dulu hanya bisa diubah lewat SQL langsung ke database. Untuk sesuatu
+ * yang dibaca pelanggan di setiap sapaan, itu terlalu jauh dari tangan pemilik
+ * toko — maka dipindah ke Pengaturan.
+ *
+ * PATCH, bukan PUT: mengikuti konvensi repo (`llm-settings.routes.ts`), dan
+ * `lib/api.ts` di frontend memang tidak punya `apiPut`.
+ *
+ * Berlaku tanpa restart: `getSystemPrompt()` membaca nama dari objek business
+ * yang diambil per balasan, bukan dari variabel yang dibekukan saat boot.
+ *
+ * ── Jawaban DATAR, bukan berbungkus `{ data: … }` ───────────────────────────
+ * Fase 107: versi lama route ini menjawab berbungkus dan mematikan seluruh
+ * dashboard karena frontend membacanya seolah datar (`apiRequest()` tidak
+ * pernah membuka bungkus apa pun). Diukur 2 Agustus 2026: 65 dari 73 jawaban
+ * `res.json()` di seluruh repo sudah datar — datar adalah konvensi de-facto.
+ * Route ini (dan `human-learning-jeda` yang baru) DIRATAKAN mengikuti itu,
+ * bukan dibungkus lagi.
+ */
+
+import { Router, Request, Response, NextFunction } from 'express';
+import { prisma } from '../config/prisma';
+import { Prisma } from '@prisma/client';
+import { authenticate, authorize } from '../middleware/auth';
+import { ValidationError } from '../utils/errors';
+import { logger } from '../utils/logger';
+import { getHlJedaStatus, setHlJeda, getCrmJedaStatus, setCrmJeda } from '../services/human-learning.service';
+import { MengantarService } from '../services/mengantar.service';
+import { encrypt, decrypt, maskedPreview } from '../services/crypto.service';
+import { syncAllActiveTokensToBridge } from '../services/token-vault-sync.service'; // [2026-08-25] Multi-BM Token Vault Tahap 1
+import { getWibDateRange } from '../utils/timezone';
+import crypto from 'crypto';
+import { z } from 'zod';
+
+const router = Router();
+router.use(authenticate);
+
+/**
+ * Batas panjang nama toko.
+ */
+const MAKS_NAMA = 60;
+
+// ── GET /business ─────────────────────────────────────────────────────────────
+router.get('/', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const b = await prisma.business.findUnique({
+      where: { id: businessId },
+      select: { id: true, name: true, mengantarApiKey: true, updatedAt: true },
+    });
+    if (!b) throw new ValidationError('Bisnis tidak ditemukan');
+    const jedaHl = await getHlJedaStatus(businessId);
+    const jedaCrm = await getCrmJedaStatus(businessId);
+    res.json({ ...b, maksNama: MAKS_NAMA, ...jedaHl, ...jedaCrm });
+  } catch (e) { next(e); }
+});
+
+// ── PATCH /business ───────────────────────────────────────────────────────────
+router.patch('/', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const body = req.body ?? {};
+    const mentah = body.name;
+    const mengantarApiKey = body.mengantarApiKey;
+
+    const dataToUpdate: any = {};
+
+    if (mentah !== undefined) {
+      if (typeof mentah !== 'string') throw new ValidationError('Nama toko wajib teks');
+      const nama = mentah.trim().replace(/\s+/g, ' ');
+      if (nama.length === 0) throw new ValidationError('Nama toko tidak boleh kosong');
+      if (nama.length > MAKS_NAMA) {
+        throw new ValidationError(`Nama toko maksimal ${MAKS_NAMA} karakter (sekarang ${nama.length})`);
+      }
+      if (/[\r\n]/.test(mentah)) throw new ValidationError('Nama toko tidak boleh memuat baris baru');
+      dataToUpdate.name = nama;
+    }
+
+    if (mengantarApiKey !== undefined) {
+      dataToUpdate.mengantarApiKey = typeof mengantarApiKey === 'string' ? mengantarApiKey.trim() : null;
+    }
+
+    if (Object.keys(dataToUpdate).length === 0) {
+      res.json({ message: 'Tidak ada perubahan data' });
+      return;
+    }
+
+    const b = await prisma.business.update({
+      where: { id: businessId },
+      data: dataToUpdate,
+      select: { id: true, name: true, mengantarApiKey: true, updatedAt: true },
+    });
+
+    logger.info(`[Business] Pengaturan toko diperbarui (business ${businessId})`);
+    res.json({ ...b, message: 'Pengaturan berhasil disimpan.' });
+  } catch (e) { next(e); }
+});
+
+// ── POST /business/mengantar-test ─────────────────────────────────────────────
+router.post('/mengantar-test', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    let apiKey = (req.body ?? {}).apiKey;
+
+    if (!apiKey) {
+      const b = await prisma.business.findUnique({
+        where: { id: businessId },
+        select: { mengantarApiKey: true },
+      });
+      apiKey = b?.mengantarApiKey;
+    }
+
+    if (!apiKey || typeof apiKey !== 'string' || apiKey.trim().length === 0) {
+      throw new ValidationError('API Key Mengantar belum diisi');
+    }
+
+    const testRes = await MengantarService.testConnection(apiKey.trim());
+    res.json(testRes);
+  } catch (e) { next(e); }
+});
+
+/**
+ * PATCH /business/human-learning-jeda — jeda atau lanjutkan Auto-Learning (Pilar 2).
+ *
+ * Body:
+ *   { aksi: 'jeda', mode: 'permanen' }          — jeda permanen (bebas on/off)
+ *   { aksi: 'jeda', mode: 'durasi', jam: number } — jeda `jam` jam ke depan (1–24)
+ *   { aksi: 'lanjut' }                          — aktifkan kembali sekarang juga
+ */
+router.patch(
+  '/human-learning-jeda',
+  authorize('ADMIN'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { businessId } = req.user!;
+      const aksi = (req.body ?? {}).aksi;
+      const mode = (req.body ?? {}).mode;
+
+      if (aksi === 'lanjut') {
+        await setHlJeda(businessId, false, null);
+        logger.info(`[HL] Jeda Auto-Learning dibatalkan (business ${businessId})`);
+        res.json({
+          humanLearningPaused: false,
+          humanLearningPausedUntil: null,
+          message: 'Knowledge Base Auto-Learning diaktifkan kembali.',
+        });
+        return;
+      }
+
+      if (aksi === 'jeda') {
+        if (mode === 'permanen' || req.body?.jam === 'permanen') {
+          await setHlJeda(businessId, true, null);
+          res.json({
+            humanLearningPaused: true,
+            humanLearningPausedUntil: null,
+            message: 'Knowledge Base Auto-Learning dijeda permanen (bisa diaktifkan kapan saja).',
+          });
+          return;
+        }
+
+        const jamMentah = (req.body ?? {}).jam;
+        const jam = Number(jamMentah);
+        if (!Number.isFinite(jam) || !Number.isInteger(jam) || jam < 1 || jam > 24) {
+          throw new ValidationError('Durasi jeda wajib bilangan bulat 1–24 jam');
+        }
+        const sampai = new Date(Date.now() + jam * 60 * 60 * 1000).toISOString();
+        await setHlJeda(businessId, true, sampai);
+        res.json({
+          humanLearningPaused: true,
+          humanLearningPausedUntil: sampai,
+          message: `Knowledge Base Auto-Learning dijeda selama ${jam} jam.`,
+        });
+        return;
+      }
+
+      throw new ValidationError('aksi wajib "jeda" atau "lanjut"');
+    } catch (e) { next(e); }
+  },
+);
+
+/**
+ * PATCH /business/crm-jeda — jeda atau lanjutkan AI CRM Lead Profiling (Pilar 1).
+ *
+ * Body:
+ *   { aksi: 'jeda', mode: 'permanen' }          — jeda permanen (bebas on/off)
+ *   { aksi: 'jeda', mode: 'durasi', jam: number } — jeda `jam` jam ke depan (1–24)
+ *   { aksi: 'lanjut' }                          — aktifkan kembali sekarang juga
+ */
+router.patch(
+  '/crm-jeda',
+  authorize('ADMIN'),
+  async (req: Request, res: Response, next: NextFunction) => {
+    try {
+      const { businessId } = req.user!;
+      const aksi = (req.body ?? {}).aksi;
+      const mode = (req.body ?? {}).mode;
+
+      if (aksi === 'lanjut') {
+        await setCrmJeda(businessId, false, null);
+        logger.info(`[CRM] Jeda AI Lead Profiler dibatalkan (business ${businessId})`);
+        res.json({
+          crmIntelligencePaused: false,
+          crmIntelligencePausedUntil: null,
+          message: 'AI Lead Profiler & CRM Intelligence diaktifkan kembali.',
+        });
+        return;
+      }
+
+      if (aksi === 'jeda') {
+        if (mode === 'permanen' || req.body?.jam === 'permanen') {
+          await setCrmJeda(businessId, true, null);
+          res.json({
+            crmIntelligencePaused: true,
+            crmIntelligencePausedUntil: null,
+            message: 'AI Lead Profiler & CRM Intelligence dijeda permanen (bisa diaktifkan kapan saja).',
+          });
+          return;
+        }
+
+        const jamMentah = (req.body ?? {}).jam;
+        const jam = Number(jamMentah);
+        if (!Number.isFinite(jam) || !Number.isInteger(jam) || jam < 1 || jam > 24) {
+          throw new ValidationError('Durasi jeda wajib bilangan bulat 1–24 jam');
+        }
+        const sampai = new Date(Date.now() + jam * 60 * 60 * 1000).toISOString();
+        await setCrmJeda(businessId, true, sampai);
+        res.json({
+          crmIntelligencePaused: true,
+          crmIntelligencePausedUntil: sampai,
+          message: `AI Lead Profiler & CRM Intelligence dijeda selama ${jam} jam.`,
+        });
+        return;
+      }
+
+      throw new ValidationError('aksi wajib "jeda" atau "lanjut"');
+    } catch (e) { next(e); }
+  },
+);
+
+/**
+ * ── Fase 40 (2026-08-20): Konfigurasi Meta Conversions API (CAPI) ──────────────
+ * Rencana lengkap: projek-ceo/20260820-rencana-integrasi-meta-capi.md
+ *
+ * ⚠️ ATURAN WAJIB (audit Fase 39, temuan #1): endpoint di bawah ini TIDAK PERNAH
+ * mengembalikan `metaCapiAccessToken` mentah ATAU terenkripsi dalam bentuk apa pun.
+ * Frontend hanya diberi tahu "sudah diisi/belum" (metaCapiConfigured) + preview
+ * tersamar (metaCapiTokenPreview, mis. "EAAbc1••••"). Ini SENGAJA beda dari pola
+ * `mengantarApiKey` di atas (yang balikin nilai mentah) -- access token Meta System
+ * User jauh lebih sensitif kalau bocor ke Network tab browser.
+ */
+
+const META_CAPI_SELECT = {
+  metaCapiEnabled: true,
+  metaCapiPixelId: true,
+  metaCapiAccessToken: true, // dibaca di server, TIDAK PERNAH ikut ke response mentah
+  metaCapiTestEventCode: true,
+  metaCapiWabaId: true,
+  metaCapiCurrency: true,
+  metaCapiEventMap: true,
+  updatedAt: true,
+} as const;
+
+function shapeMetaCapiResponse(b: {
+  metaCapiEnabled: boolean;
+  metaCapiPixelId: string | null;
+  metaCapiAccessToken: string | null;
+  metaCapiTestEventCode: string | null;
+  metaCapiWabaId: string | null;
+  metaCapiCurrency: string;
+  metaCapiEventMap: any;
+  updatedAt: Date;
+}) {
+  let metaCapiTokenPreview: string | null = null;
+  if (b.metaCapiAccessToken) {
+    try {
+      metaCapiTokenPreview = maskedPreview(decrypt(b.metaCapiAccessToken));
+    } catch (e) {
+      // Ciphertext rusak/ENCRYPTION_KEY beda dari saat disimpan -- jangan bikin
+      // seluruh halaman Konfigurasi gagal load, cukup tandai butuh isi ulang.
+      logger.warn(`[Business/MetaCapi] Gagal decrypt token utk preview: ${(e as Error).message}`);
+      metaCapiTokenPreview = '(gagal dibaca, isi ulang token)';
+    }
+  }
+  return {
+    metaCapiEnabled: b.metaCapiEnabled,
+    metaCapiConfigured: Boolean(b.metaCapiAccessToken && b.metaCapiPixelId),
+    metaCapiPixelId: b.metaCapiPixelId,
+    metaCapiTestEventCode: b.metaCapiTestEventCode,
+    metaCapiWabaId: b.metaCapiWabaId,
+    metaCapiCurrency: b.metaCapiCurrency,
+    metaCapiTokenPreview,
+    metaCapiEventMap: b.metaCapiEventMap,
+    updatedAt: b.updatedAt,
+  };
+}
+
+// ── GET /business/meta-capi ─────────────────────────────────────────────────────
+router.get('/meta-capi', async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const b = await prisma.business.findUnique({ where: { id: businessId }, select: META_CAPI_SELECT });
+    if (!b) throw new ValidationError('Bisnis tidak ditemukan');
+    res.json(shapeMetaCapiResponse(b));
+  } catch (e) { next(e); }
+});
+
+// ── PATCH /business/meta-capi ───────────────────────────────────────────────────
+router.patch('/meta-capi', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const body = req.body ?? {};
+    const dataToUpdate: any = {};
+
+    if (body.metaCapiPixelId !== undefined) {
+      dataToUpdate.metaCapiPixelId = typeof body.metaCapiPixelId === 'string' && body.metaCapiPixelId.trim()
+        ? body.metaCapiPixelId.trim()
+        : null;
+    }
+    if (body.metaCapiTestEventCode !== undefined) {
+      dataToUpdate.metaCapiTestEventCode = typeof body.metaCapiTestEventCode === 'string' && body.metaCapiTestEventCode.trim()
+        ? body.metaCapiTestEventCode.trim()
+        : null;
+    }
+    if (body.metaCapiWabaId !== undefined) {
+      dataToUpdate.metaCapiWabaId = typeof body.metaCapiWabaId === 'string' && body.metaCapiWabaId.trim()
+        ? body.metaCapiWabaId.trim()
+        : null;
+    }
+    if (body.metaCapiCurrency !== undefined) {
+      const cur = typeof body.metaCapiCurrency === 'string' ? body.metaCapiCurrency.trim().toUpperCase() : '';
+      if (!/^[A-Z]{3}$/.test(cur)) throw new ValidationError('metaCapiCurrency wajib kode 3 huruf, mis. IDR');
+      dataToUpdate.metaCapiCurrency = cur;
+    }
+    if (body.metaCapiEventMap !== undefined) {
+      dataToUpdate.metaCapiEventMap = body.metaCapiEventMap && typeof body.metaCapiEventMap === 'object'
+        ? body.metaCapiEventMap
+        : null;
+    }
+    // Token: string kosong = hapus (set null), string berisi = enkripsi & simpan,
+    // undefined = tidak diubah (JANGAN pernah timpa dgn null krn field tidak dikirim).
+    if (body.metaCapiAccessToken !== undefined) {
+      const raw = typeof body.metaCapiAccessToken === 'string' ? body.metaCapiAccessToken.trim() : '';
+      dataToUpdate.metaCapiAccessToken = raw ? encrypt(raw) : null;
+    }
+
+    if (body.metaCapiEnabled !== undefined) {
+      if (typeof body.metaCapiEnabled !== 'boolean') throw new ValidationError('metaCapiEnabled wajib boolean');
+      if (body.metaCapiEnabled) {
+        // GERBANG (sama seperti §6 hook rencana): tidak boleh aktif tanpa pixel+token
+        // lengkap -- cek nilai YANG AKAN TERSIMPAN (baru ATAU lama), bukan cuma yang lama.
+        const existing = await prisma.business.findUnique({
+          where: { id: businessId },
+          select: { metaCapiPixelId: true, metaCapiAccessToken: true },
+        });
+        const finalPixelId = dataToUpdate.metaCapiPixelId !== undefined ? dataToUpdate.metaCapiPixelId : existing?.metaCapiPixelId;
+        const finalToken = dataToUpdate.metaCapiAccessToken !== undefined ? dataToUpdate.metaCapiAccessToken : existing?.metaCapiAccessToken;
+        if (!finalPixelId || !finalToken) {
+          throw new ValidationError('Isi Pixel ID dan Access Token dulu sebelum mengaktifkan Meta CAPI');
+        }
+      }
+      dataToUpdate.metaCapiEnabled = body.metaCapiEnabled;
+    }
+
+    if (Object.keys(dataToUpdate).length === 0) {
+      res.json({ message: 'Tidak ada perubahan data' });
+      return;
+    }
+
+    const b = await prisma.business.update({ where: { id: businessId }, data: dataToUpdate, select: META_CAPI_SELECT });
+    logger.info(`[Business/MetaCapi] Konfigurasi diperbarui (business ${businessId})`);
+    res.json({ ...shapeMetaCapiResponse(b), message: 'Konfigurasi Meta CAPI tersimpan.' });
+  } catch (e) { next(e); }
+});
+
+/**
+ * POST /business/meta-capi/test-connection — kirim SATU test event ke Meta pakai
+ * `test_event_code` (masuk tab Test Events di Events Manager, TIDAK terhitung
+ * sbg konversi asli). Pakai kredensial YANG SUDAH TERSIMPAN -- form Konfigurasi
+ * harus disimpan (PATCH) dulu sebelum tombol "Tes Koneksi" dipakai, supaya
+ * kredensial yg diuji sama persis dgn yg akan dipakai hook produksi nanti.
+ *
+ * Implementasi payload minimal di sini (bukan lewat capi.service.ts) SENGAJA --
+ * capi.service.ts (Tahap 3 rencana) baru dibangun belakangan; route ini cukup
+ * dulu utk memverifikasi kredensial & konektivitas dasar. Akan direfactor
+ * memakai capi.service.ts begitu itu ada, hindari payload-building ganda.
+ */
+router.post('/meta-capi/test-connection', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const b = await prisma.business.findUnique({
+      where: { id: businessId },
+      select: { metaCapiPixelId: true, metaCapiAccessToken: true, metaCapiTestEventCode: true },
+    });
+    if (!b?.metaCapiPixelId || !b?.metaCapiAccessToken) {
+      throw new ValidationError('Isi & simpan Pixel ID dan Access Token dulu sebelum tes koneksi');
+    }
+    if (!b?.metaCapiTestEventCode) {
+      throw new ValidationError('Isi & simpan Test Event Code dulu -- tanpa ini tes koneksi bisa terhitung sbg event asli');
+    }
+
+    const accessToken = decrypt(b.metaCapiAccessToken);
+    const dummyPhoneHash = crypto.createHash('sha256').update('6280000000000').digest('hex');
+
+    const graphRes = await fetch(`https://graph.facebook.com/v21.0/${encodeURIComponent(b.metaCapiPixelId)}/events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        data: [{
+          event_name: 'Lead',
+          event_time: Math.floor(Date.now() / 1000),
+          action_source: 'chat',
+          user_data: { ph: [dummyPhoneHash] },
+        }],
+        test_event_code: b.metaCapiTestEventCode,
+        access_token: accessToken,
+      }),
+    });
+    const graphJson: any = await graphRes.json().catch(() => ({}));
+
+    if (!graphRes.ok) {
+      logger.warn(`[Business/MetaCapi] Tes koneksi gagal (business ${businessId}): ${JSON.stringify(graphJson)}`);
+      res.status(200).json({
+        success: false,
+        message: graphJson?.error?.message || 'Meta menolak request -- cek Pixel ID/Access Token/Test Event Code.',
+        detail: graphJson,
+      });
+      return;
+    }
+
+    logger.info(`[Business/MetaCapi] Tes koneksi sukses (business ${businessId}): ${JSON.stringify(graphJson)}`);
+    res.json({
+      success: true,
+      message: 'Test event terkirim. Cek tab "Test Events" di Meta Events Manager utk konfirmasi.',
+      detail: graphJson,
+    });
+  } catch (e) { next(e); }
+});
+
+// ── MetaPixelConfig CRUD ──────────────────────────────────────────────
+router.get('/meta-pixels', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const pixels = await prisma.metaPixelConfig.findMany({
+      where: { businessId: req.user!.businessId },
+      select: {
+        id: true,
+        businessId: true,
+        name: true,
+        pixelId: true,
+        landingPageUrls: true,
+        isActive: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+      orderBy: { createdAt: 'asc' }
+    });
+    res.json(pixels);
+  } catch (e) { next(e); }
+});
+
+router.post('/meta-pixels', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { name, pixelId, accessToken, landingPageUrls, isActive, bmId } = req.body;
+    if (!name || typeof name !== 'string' || !name.trim()) {
+      throw new ValidationError('Nama pixel wajib diisi');
+    }
+    if (!pixelId || typeof pixelId !== 'string' || !pixelId.trim()) {
+      throw new ValidationError('Pixel ID wajib diisi');
+    }
+
+    let resolvedAccessToken: string;
+
+    // ── Mode BM: Salin token dari MetaBusinessManager secara server-side ──
+    // Token TIDAK pernah dikirim ke frontend (sesuai aturan keamanan), jadi kita
+    // ambil langsung dari DB pakai bmId yang dikirim frontend.
+    if (bmId && typeof bmId === 'string' && bmId.trim()) {
+      const bm = await prisma.metaBusinessManager.findFirst({
+        where: { id: bmId.trim(), businessId: req.user!.businessId, isActive: true },
+        select: { accessToken: true },
+      });
+      if (!bm) {
+        throw new ValidationError('BM terdaftar tidak ditemukan atau tidak aktif');
+      }
+      // token di DB sudah terenkripsi — langsung disalin ke MetaPixelConfig (tetap terenkripsi)
+      resolvedAccessToken = bm.accessToken;
+    } else {
+      // ── Mode Manual: validasi & enkripsi token dari input user ──
+      if (!accessToken || typeof accessToken !== 'string' || !accessToken.trim()) {
+        throw new ValidationError('Access Token wajib diisi untuk pixel baru');
+      }
+      resolvedAccessToken = encrypt(accessToken.trim());
+    }
+
+    const normalizedUrls = Array.isArray(landingPageUrls)
+      ? landingPageUrls
+          .filter((u): u is string => typeof u === 'string')
+          .map(u => u.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, ''))
+          .filter(Boolean)
+      : [];
+
+    const pixel = await prisma.metaPixelConfig.create({
+      data: {
+        businessId: req.user!.businessId,
+        name: name.trim(),
+        pixelId: pixelId.trim(),
+        accessToken: resolvedAccessToken,
+        landingPageUrls: normalizedUrls,
+        isActive: isActive !== undefined ? Boolean(isActive) : true
+      },
+      select: {
+        id: true,
+        businessId: true,
+        name: true,
+        pixelId: true,
+        landingPageUrls: true,
+        isActive: true,
+        createdAt: true,
+        updatedAt: true,
+      }
+    });
+
+    // Fix #7 (Fase 47): bust Redis cache pixel config supaya perubahan langsung berlaku
+    const { redisCache } = await import('../config/redis');
+    await redisCache.del(`salespintar:capi:pixels:${req.user!.businessId}`).catch(() => {});
+
+    res.json(pixel);
+  } catch (e) { next(e); }
+});
+
+
+router.put('/meta-pixels/:id', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { name, pixelId, accessToken, landingPageUrls, isActive } = req.body;
+    const dataToUpdate: Record<string, unknown> = {};
+    if (typeof name === 'string' && name.trim()) dataToUpdate.name = name.trim();
+    if (typeof pixelId === 'string' && pixelId.trim()) dataToUpdate.pixelId = pixelId.trim();
+    if (typeof isActive === 'boolean') dataToUpdate.isActive = isActive;
+    if (typeof accessToken === 'string' && accessToken.trim()) {
+      dataToUpdate.accessToken = encrypt(accessToken.trim());
+    }
+    if (Array.isArray(landingPageUrls)) {
+      dataToUpdate.landingPageUrls = landingPageUrls
+        .filter((u): u is string => typeof u === 'string')
+        .map(u => u.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/\/+$/, ''))
+        .filter(Boolean);
+    }
+
+    await prisma.metaPixelConfig.updateMany({
+      where: { id: req.params.id as string, businessId: req.user!.businessId },
+      data: dataToUpdate
+    });
+
+    // Fix #7 (Fase 47): bust Redis cache pixel config supaya perubahan langsung berlaku
+    const { redisCache } = await import('../config/redis');
+    await redisCache.del(`salespintar:capi:pixels:${req.user!.businessId}`).catch(() => {});
+
+    res.json({ success: true });
+  } catch (e) { next(e); }
+});
+
+router.delete('/meta-pixels/:id', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    await prisma.metaPixelConfig.deleteMany({
+      where: { id: req.params.id as string, businessId: req.user!.businessId }
+    });
+
+    // Fix #7 (Fase 47): bust Redis cache pixel config supaya perubahan langsung berlaku
+    const { redisCache } = await import('../config/redis');
+    await redisCache.del(`salespintar:capi:pixels:${req.user!.businessId}`).catch(() => {});
+
+    res.json({ success: true });
+  } catch (e) { next(e); }
+});
+
+router.get('/meta-capi-stats', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    
+    const startDate = req.query.startDate as string;
+    const endDate = req.query.endDate as string;
+    const period = (req.query.period as string) || 'today';
+    
+    let gte: Date | undefined;
+    let lte: Date | undefined;
+    
+    if (startDate && endDate) {
+      gte = new Date(startDate + 'T00:00:00.000+07:00');
+      lte = new Date(endDate + 'T23:59:59.999+07:00');
+    } else {
+      const now = new Date();
+      if (period === 'today') {
+        gte = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        lte = new Date(gte.getTime() + 24 * 60 * 60 * 1000 - 1);
+      } else if (period === 'yesterday') {
+        gte = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1);
+        lte = new Date(gte.getTime() + 24 * 60 * 60 * 1000 - 1);
+      } else if (period === 'this_month') {
+        gte = new Date(now.getFullYear(), now.getMonth(), 1);
+        lte = new Date(now.getFullYear(), now.getMonth() + 1, 0, 23, 59, 59, 999);
+      }
+    }
+    
+    const whereClause: any = { businessId, leadCategory: 'PROSPEK_IKLAN' };
+    if (gte && lte) {
+      whereClause.createdAt = { gte, lte };
+    }
+    
+    const customPixelId = req.query.pixelId as string;
+    if (customPixelId && customPixelId !== 'all') {
+      whereClause.metaCapiPixelId = customPixelId;
+    }
+    
+    const leads = await prisma.lead.findMany({
+      where: whereClause,
+      select: { capiEventsSent: true, confirmedCodAmount: true }
+    });
+    
+    const b = await prisma.business.findUnique({
+      where: { id: businessId },
+      select: { metaCapiEventMap: true, metaCapiEnabled: true }
+    });
+    
+    const DEFAULT_EVENT_MAP: Record<string, string> = {
+      NEW_LEAD: 'ViewContent',
+      WARM: 'Lead',
+      HOT: 'AddToCart',
+      CLOSING: 'Purchase'
+    };
+    
+    const eventMap = (b?.metaCapiEventMap && typeof b.metaCapiEventMap === 'object')
+      ? (b.metaCapiEventMap as Record<string, string>)
+      : DEFAULT_EVENT_MAP;
+      
+    const evNewLead = eventMap.NEW_LEAD || 'ViewContent';
+    const evWarm = eventMap.WARM || 'Lead';
+    const evHot = eventMap.HOT || 'AddToCart';
+    const evClosing = eventMap.CLOSING || 'Purchase';
+    
+    let funnelViewContent = 0;
+    let funnelLead = 0;
+    let funnelAddToCart = 0;
+    let funnelPurchase = 0;
+    let totalNilaiClosing = 0;
+    
+    for (const lead of leads) {
+      if (lead.capiEventsSent.includes(evNewLead)) funnelViewContent++;
+      if (lead.capiEventsSent.includes(evWarm)) funnelLead++;
+      if (lead.capiEventsSent.includes(evHot)) funnelAddToCart++;
+      if (lead.capiEventsSent.includes(evClosing)) funnelPurchase++;
+      
+      if (lead.capiEventsSent.includes(evClosing) && lead.confirmedCodAmount) {
+        totalNilaiClosing += lead.confirmedCodAmount;
+      }
+    }
+    
+    res.json({
+      period,
+      metaCapiEnabled: b?.metaCapiEnabled || false,
+      totalSpend: 0,
+      totalLeadProspek: leads.length,
+      funnelViewContent,
+      funnelLead,
+      funnelAddToCart,
+      funnelPurchase,
+      totalNilaiClosing,
+      eventMap
+    });
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /business/meta-capi/reconcile — Rekonsiliasi event CAPI yang terlewat (Fase 45)
+//
+// Memanggil reconcileCapiEvents() dari capi.service.ts yang menggunakan
+// enqueueCapiIfNeeded (state-based, sudah difix). Idempoten dan aman dijalankan
+// berkali-kali — Meta auto-dedupe via event_id deterministik.
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/meta-capi/reconcile', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = (req as any).user.businessId;
+    const { reconcileCapiEvents } = await import('../services/capi.service');
+    const result = await reconcileCapiEvents(businessId);
+    res.json({
+      message: 'Rekonsiliasi selesai',
+      ...result,
+    });
+  } catch (e) { next(e); }
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POST /business/meta-capi/reconcile-purchase — Rekonsiliasi retroaktif Purchase (Fase 48)
+//
+// Khusus untuk CLOSING leads yang Purchase-nya terlewat karena mereka sudah CLOSING
+// sebelum CAPI dipasang. Reconcile biasa tidak mengirim Purchase.
+// Idempoten — aman dijalankan berkali-kali (Meta auto-dedupe via event_id).
+// ─────────────────────────────────────────────────────────────────────────────
+router.post('/meta-capi/reconcile-purchase', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const businessId = (req as any).user.businessId;
+    const { reconcilePurchaseEvents } = await import('../services/capi.service');
+    const result = await reconcilePurchaseEvents(businessId);
+    res.json({
+      message: 'Rekonsiliasi Purchase selesai',
+      ...result,
+    });
+  } catch (e) { next(e); }
+});
+
+// ── Fase 51 (2026-08-22): Multi-BM System User Token Registry ────────────────────
+// Mendaftarkan banyak Meta Business Manager (BM) dengan System User Token.
+// Token selalu dienkripsi AES-256-GCM sebelum disimpan (sama dengan MetaPixelConfig).
+// API TIDAK PERNAH mengembalikan token mentah — hanya tokenPreview (EAAbc1••••).
+
+const META_GRAPH_BASE = 'https://graph.facebook.com/v21.0';
+
+async function validateMetaToken(token: string): Promise<{ valid: boolean; metaBusinessId?: string; error?: string }> {
+  try {
+    const url = `${META_GRAPH_BASE}/me?fields=id,name&access_token=${encodeURIComponent(token)}`;
+    const res = await fetch(url);
+    const data = await res.json() as any;
+    if (data.error) {
+      return { valid: false, error: data.error.message ?? 'Token tidak valid' };
+    }
+    // Ambil Business ID dari token level BM
+    const bizRes = await fetch(`${META_GRAPH_BASE}/me/businesses?fields=id,name&access_token=${encodeURIComponent(token)}`);
+    const bizData = await bizRes.json() as any;
+    const metaBusinessId: string | undefined = bizData?.data?.[0]?.id;
+    return { valid: true, metaBusinessId };
+  } catch (e: any) {
+    return { valid: false, error: e?.message ?? 'Gagal menghubungi Meta Graph API' };
+  }
+}
+
+// GET /business/meta-bms — Daftar BM terdaftar (token tidak pernah dikembalikan)
+router.get('/meta-bms', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const bms = await prisma.metaBusinessManager.findMany({
+      where: { businessId: req.user!.businessId },
+      select: {
+        id: true,
+        name: true,
+        metaBusinessId: true,
+        picName: true,
+        tokenPreview: true,
+        tokenStatus: true,
+        isActive: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+      orderBy: { createdAt: 'asc' },
+    });
+    res.json(bms);
+  } catch (e) { next(e); }
+});
+
+// POST /business/meta-bms — Tambah BM baru (validasi token ke Meta sebelum simpan)
+router.post('/meta-bms', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { name, picName, accessToken, metaBusinessId: manualBizId } = req.body;
+    if (!name?.trim()) throw new ValidationError('Nama / Label BM wajib diisi');
+    if (!picName?.trim()) throw new ValidationError('Nama PIC Marketing wajib diisi');
+    if (!accessToken?.trim()) throw new ValidationError('System User Access Token wajib diisi');
+
+    // Validasi ke Meta Graph API sebelum simpan
+    const validation = await validateMetaToken(accessToken.trim());
+    if (!validation.valid) {
+      throw new ValidationError(`Token tidak valid: ${validation.error}`);
+    }
+
+    const resolvedBizId = manualBizId?.trim() || validation.metaBusinessId;
+    const preview = maskedPreview(accessToken.trim());
+
+    const bm = await prisma.metaBusinessManager.create({
+      data: {
+        businessId: req.user!.businessId,
+        name: name.trim(),
+        picName: picName.trim(),
+        metaBusinessId: resolvedBizId ?? null,
+        accessToken: encrypt(accessToken.trim()),
+        tokenPreview: preview,
+        tokenStatus: 'ACTIVE',
+        isActive: true,
+      },
+      select: {
+        id: true,
+        name: true,
+        metaBusinessId: true,
+        picName: true,
+        tokenPreview: true,
+        tokenStatus: true,
+        isActive: true,
+        createdAt: true,
+        updatedAt: true,
+      },
+    });
+    res.json(bm);
+    // [2026-08-25] Multi-BM Token Vault Tahap 1 (§1.B.2): sync snapshot token aktif ke VPS45 bridge
+    // SETELAH response dikirim -- kegagalan sync tidak boleh memblokir/menunda operasi CRUD utama.
+    void syncAllActiveTokensToBridge(req.user!.businessId);
+  } catch (e) { next(e); }
+});
+
+// PUT /business/meta-bms/:id — Update label BM, PIC, atau perbarui token
+router.put('/meta-bms/:id', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { name, picName, accessToken, isActive } = req.body;
+    const update: Record<string, unknown> = {};
+    if (typeof name === 'string' && name.trim()) update.name = name.trim();
+    if (typeof picName === 'string' && picName.trim()) update.picName = picName.trim();
+    if (typeof isActive === 'boolean') update.isActive = isActive;
+
+    if (typeof accessToken === 'string' && accessToken.trim()) {
+      // Validasi token baru ke Meta sebelum update
+      const validation = await validateMetaToken(accessToken.trim());
+      if (!validation.valid) {
+        throw new ValidationError(`Token tidak valid: ${validation.error}`);
+      }
+      update.accessToken = encrypt(accessToken.trim());
+      update.tokenPreview = maskedPreview(accessToken.trim());
+      update.tokenStatus = 'ACTIVE';
+      if (validation.metaBusinessId) update.metaBusinessId = validation.metaBusinessId;
+    }
+
+    await prisma.metaBusinessManager.updateMany({
+      where: { id: req.params.id as string, businessId: req.user!.businessId },
+      data: update,
+    });
+    res.json({ success: true });
+    // [2026-08-25] Multi-BM Token Vault Tahap 1 -- resync (token bisa berubah, isActive/tokenStatus
+    // bisa berubah, dan keduanya menentukan keanggotaan snapshot yang dikirim).
+    void syncAllActiveTokensToBridge(req.user!.businessId);
+  } catch (e) { next(e); }
+});
+
+// DELETE /business/meta-bms/:id — Hapus BM
+router.delete('/meta-bms/:id', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    await prisma.metaBusinessManager.deleteMany({
+      where: { id: req.params.id as string, businessId: req.user!.businessId },
+    });
+    res.json({ success: true });
+    // [2026-08-25] Multi-BM Token Vault Tahap 1 -- BM yang dihapus otomatis tidak lagi ikut di
+    // snapshot berikutnya (full-replace-per-namespace), tanpa perlu logic "hapus 1 entry" terpisah.
+    void syncAllActiveTokensToBridge(req.user!.businessId);
+  } catch (e) { next(e); }
+});
+
+// POST /business/meta-bms/:id/test — Uji koneksi token BM ke Meta Graph API
+router.post('/meta-bms/:id/test', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const bm = await prisma.metaBusinessManager.findFirst({
+      where: { id: req.params.id as string, businessId: req.user!.businessId },
+    });
+    if (!bm) throw new ValidationError('BM tidak ditemukan');
+
+    const plainToken = decrypt(bm.accessToken);
+    const validation = await validateMetaToken(plainToken);
+
+    const newStatus = validation.valid ? 'ACTIVE' : 'ERROR';
+    await prisma.metaBusinessManager.update({
+      where: { id: bm.id },
+      data: {
+        tokenStatus: newStatus as any,
+        ...(validation.metaBusinessId ? { metaBusinessId: validation.metaBusinessId } : {}),
+      },
+    });
+
+    res.json({
+      success: validation.valid,
+      tokenStatus: newStatus,
+      metaBusinessId: validation.metaBusinessId ?? bm.metaBusinessId,
+      message: validation.valid ? 'Token aktif dan valid ✓' : `Token error: ${validation.error}`,
+    });
+  } catch (e) { next(e); }
+});
+
+// GET /business/meta-bms/:id/assets — Ambil connected assets (Ad Accounts, Pixels/Datasets, Permissions)
+router.get('/meta-bms/:id/assets', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const id = req.params.id as string;
+
+    const bm = await prisma.metaBusinessManager.findFirst({
+      where: { id, businessId },
+    });
+    if (!bm) throw new ValidationError('Akun BM tidak ditemukan');
+
+    const token = decrypt(bm.accessToken);
+    if (!token) throw new ValidationError('Token BM tidak valid');
+
+    // 1. Fetch Ad Accounts yang dapat diakses token ini
+    let adAccounts: any[] = [];
+    try {
+      const adAccResp = await fetch(`https://graph.facebook.com/v21.0/me/adaccounts?fields=id,name,account_id,account_status,currency,timezone_name,amount_spent&access_token=${token}`);
+      if (adAccResp.ok) {
+        const adAccData = (await adAccResp.json()) as any;
+        adAccounts = (adAccData.data || []).map((a: any) => ({
+          id: a.id,
+          accountId: a.account_id,
+          name: a.name || a.id,
+          status: a.account_status === 1 ? 'ACTIVE' : 'DISABLED',
+          currency: a.currency || 'IDR',
+          timezone: a.timezone_name || 'Asia/Jakarta',
+          amountSpent: parseFloat(a.amount_spent || '0')
+        }));
+      }
+    } catch (adErr) {
+      logger.warn(`[Business/MetaAssets] Gagal fetch ad accounts: ${adErr}`);
+    }
+
+    // 2. Fetch Pixels / Datasets across Ad Accounts
+    const pixelMap = new Map<string, any>();
+    await Promise.allSettled(
+      adAccounts.map(async (act) => {
+        try {
+          const pxResp = await fetch(`https://graph.facebook.com/v21.0/${act.id}/adspixels?fields=id,name,data_use_setting,creation_time&access_token=${token}`);
+          if (pxResp.ok) {
+            const pxData = (await pxResp.json()) as any;
+            for (const px of (pxData.data || [])) {
+              if (!pixelMap.has(px.id)) {
+                pixelMap.set(px.id, {
+                  id: px.id,
+                  name: px.name,
+                  setting: px.data_use_setting,
+                  creationTime: px.creation_time,
+                  connectedAdAccount: act.name
+                });
+              }
+            }
+          }
+        } catch (pxErr) {
+          logger.warn(`[Business/MetaAssets] Gagal fetch pixels untuk ${act.id}: ${pxErr}`);
+        }
+      })
+    );
+
+    // 3. Permissions yang dimiliki System User Token
+    let permissions: string[] = [];
+    try {
+      const permResp = await fetch(`https://graph.facebook.com/v21.0/me/permissions?access_token=${token}`);
+      if (permResp.ok) {
+        const permData = (await permResp.json()) as any;
+        permissions = (permData.data || [])
+          .filter((p: any) => p.status === 'granted')
+          .map((p: any) => p.permission);
+      }
+    } catch (permErr) {
+      logger.warn(`[Business/MetaAssets] Gagal fetch permissions: ${permErr}`);
+    }
+
+    res.json({
+      bm: {
+        id: bm.id,
+        name: bm.name,
+        picName: bm.picName,
+        metaBusinessId: bm.metaBusinessId,
+        tokenStatus: bm.tokenStatus,
+        createdAt: bm.createdAt
+      },
+      assets: {
+        adAccounts,
+        pixels: Array.from(pixelMap.values()),
+        permissions
+      }
+    });
+  } catch (e) { next(e); }
+});
+
+// ============================================================================
+// AI Media Buyer Automation — default & toggle per BM (redesign UX Fase 3,
+// hasil brainstorming 2026-08-24)
+// ============================================================================
+// Layer "umum": tiap BM bisa mengaktifkan Threshold Shift / Spend Anomaly /
+// Landing Page Check untuk SEMUA campaign di akun-akun iklan BM ini, dengan
+// satu set nilai default -- diaktifkan & diisi langsung di modal "Kelola Aset
+// BM" ini (bukan di tab Pengaturan). Kalau ada campaign yang butuh angka beda
+// dari default, override diatur terpisah di /ai-ads/settings (Threshold
+// Shift) & /ai-ads/spend-anomaly-settings (Spend Anomaly), keduanya di-scope
+// per bmId yang sama (lihat ai-ads.routes.ts). Landing Page TIDAK ada
+// override per-campaign -- daftar URL-nya murni global (/ai-ads/landing-pages),
+// campaign yang dipause ditentukan otomatis lewat pencocokan destination URL
+// saat down (menyusul di Fase 3 Langkah 2, sama seperti wiring run_shift.py).
+//
+// Disimpan di Business.settings.bmAutomationDefaults, keyed by
+// MetaBusinessManager.id -- BUKAN migration baru, pola sama seperti
+// aiAdsShiftTargets di ai-ads.routes.ts.
+
+const morningEarlyKillSchema = z.object({
+  costThreshold: z.number().positive(),
+  cpcKillMultiplier: z.number().positive(),
+});
+const middayPacingSchema = z.object({
+  dailyBudget: z.number().positive(),
+  dailyLeadsTarget: z.number().nonnegative(),
+  spendPaceThreshold: z.number().min(0).max(1),
+  leadsPaceThreshold: z.number().min(0).max(1),
+  reducePct: z.number().min(0).max(1),
+});
+const goldenHourScalingSchema = z.object({
+  roasTarget: z.number().positive(),
+  scalePct: z.number().min(0).max(1),
+  maxDailyBudgetCeiling: z.number().positive(),
+});
+
+const bmAutomationDefaultsPayloadSchema = z.object({
+  thresholdShift: z.object({
+    enabled: z.boolean().default(false),
+    default: z.object({
+      morningEarlyKill: morningEarlyKillSchema,
+      middayPacing: middayPacingSchema,
+      goldenHourScaling: goldenHourScalingSchema,
+    }),
+  }),
+  spendAnomaly: z.object({
+    enabled: z.boolean().default(false),
+    default: z.object({
+      spendIncreasePctThreshold: z.number().positive().max(1000).default(50),
+    }),
+  }),
+  landingPageCheck: z.object({
+    enabled: z.boolean().default(false),
+    autoPauseOnDown: z.boolean().default(false),
+    timeoutSeconds: z.number().int().positive().max(60).default(10),
+  }),
+});
+
+const BM_AUTOMATION_DEFAULTS_FALLBACK = {
+  thresholdShift: {
+    enabled: false,
+    default: {
+      morningEarlyKill: { costThreshold: 100000, cpcKillMultiplier: 3 },
+      middayPacing: { dailyBudget: 200000, dailyLeadsTarget: 5, spendPaceThreshold: 0.5, leadsPaceThreshold: 0.5, reducePct: 0.2 },
+      goldenHourScaling: { roasTarget: 3, scalePct: 0.2, maxDailyBudgetCeiling: 400000 },
+    },
+  },
+  spendAnomaly: { enabled: false, default: { spendIncreasePctThreshold: 50 } },
+  landingPageCheck: { enabled: false, autoPauseOnDown: false, timeoutSeconds: 10 },
+};
+
+// GET /business/meta-bms/:id/automation-defaults
+router.get('/meta-bms/:id/automation-defaults', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const id = req.params.id as string;
+    const bm = await prisma.metaBusinessManager.findFirst({ where: { id, businessId } });
+    if (!bm) throw new ValidationError('Akun BM tidak ditemukan');
+
+    const b = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+    const settings = (b?.settings ?? {}) as Record<string, unknown>;
+    const byBm = (settings['bmAutomationDefaults'] ?? {}) as Record<string, unknown>;
+    const saved = (byBm[id] ?? {}) as Partial<typeof BM_AUTOMATION_DEFAULTS_FALLBACK>;
+
+    res.json({
+      thresholdShift: saved.thresholdShift ?? BM_AUTOMATION_DEFAULTS_FALLBACK.thresholdShift,
+      spendAnomaly: saved.spendAnomaly ?? BM_AUTOMATION_DEFAULTS_FALLBACK.spendAnomaly,
+      landingPageCheck: saved.landingPageCheck ?? BM_AUTOMATION_DEFAULTS_FALLBACK.landingPageCheck,
+    });
+  } catch (e) { next(e); }
+});
+
+// PUT /business/meta-bms/:id/automation-defaults
+router.put('/meta-bms/:id/automation-defaults', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const id = req.params.id as string;
+    const bm = await prisma.metaBusinessManager.findFirst({ where: { id, businessId } });
+    if (!bm) throw new ValidationError('Akun BM tidak ditemukan');
+
+    const parsed = bmAutomationDefaultsPayloadSchema.safeParse(req.body);
+    if (!parsed.success) {
+      res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+      return;
+    }
+
+    const b = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+    const settingsLama = (b?.settings ?? {}) as Record<string, unknown>;
+    const byBmLama = (settingsLama['bmAutomationDefaults'] ?? {}) as Record<string, unknown>;
+
+    await prisma.business.update({
+      where: { id: businessId },
+      data: {
+        settings: ({
+          ...settingsLama,
+          bmAutomationDefaults: { ...byBmLama, [id]: parsed.data },
+        } as Prisma.InputJsonValue),
+      },
+    });
+
+    logger.info(`[BM/Automation] Setelan default AI Ads BM ${id} (bisnis ${businessId}) disimpan.`);
+    res.json({ ok: true, ...parsed.data, message: 'Setelan default AI Media Buyer buat BM ini disimpan.' });
+  } catch (e) { next(e); }
+});
+
+// GET /business/meta-bms/:id/campaigns -- daftar campaign live lintas semua
+// akun iklan BM ini, buat isi dropdown override (bukan input Object ID manual).
+router.get('/meta-bms/:id/campaigns', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const id = req.params.id as string;
+    const bm = await prisma.metaBusinessManager.findFirst({ where: { id, businessId } });
+    if (!bm) throw new ValidationError('Akun BM tidak ditemukan');
+
+    const token = decrypt(bm.accessToken);
+    if (!token) throw new ValidationError('Token BM tidak valid');
+
+    let adAccounts: { id: string; name: string }[] = [];
+    try {
+      const adAccResp = await fetch(`https://graph.facebook.com/v21.0/me/adaccounts?fields=id,name&access_token=${token}`);
+      if (adAccResp.ok) {
+        const adAccData = (await adAccResp.json()) as any;
+        adAccounts = (adAccData.data || []).map((a: any) => ({ id: a.id, name: a.name || a.id }));
+      }
+    } catch (adErr) {
+      logger.warn(`[Business/MetaCampaigns] Gagal fetch ad accounts: ${adErr}`);
+    }
+
+    const campaigns: { id: string; name: string; status: string; adAccountId: string; adAccountName: string }[] = [];
+    await Promise.allSettled(
+      adAccounts.map(async (act) => {
+        try {
+          const cResp = await fetch(`https://graph.facebook.com/v21.0/${act.id}/campaigns?fields=id,name,effective_status&limit=200&access_token=${token}`);
+          if (cResp.ok) {
+            const cData = (await cResp.json()) as any;
+            for (const c of (cData.data || [])) {
+              if (c.effective_status === 'DELETED' || c.effective_status === 'ARCHIVED') continue;
+              campaigns.push({
+                id: c.id,
+                name: c.name || c.id,
+                status: c.effective_status || 'UNKNOWN',
+                adAccountId: act.id,
+                adAccountName: act.name,
+              });
+            }
+          }
+        } catch (cErr) {
+          logger.warn(`[Business/MetaCampaigns] Gagal fetch campaigns untuk ${act.id}: ${cErr}`);
+        }
+      })
+    );
+
+    res.json({ campaigns });
+  } catch (e) { next(e); }
+});
+
+// GET /business/meta-ads-performance — Agregasi Performa & ROAS (Fase 4)
+router.get('/meta-ads-performance', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const startDate = (req.query.startDate as string) || new Date().toISOString().split('T')[0];
+    const endDate = (req.query.endDate as string) || new Date().toISOString().split('T')[0];
+
+    const cacheKey = `salespintar:meta-perf:${businessId}:${startDate}:${endDate}`;
+    const { redisCache } = await import('../config/redis');
+    
+    const forceRefresh = req.query.forceRefresh === 'true';
+    const cached = await redisCache.get(cacheKey).catch(() => null);
+    if (cached && !forceRefresh) {
+      return res.json(JSON.parse(cached));
+    }
+
+    // 1. Ambil semua BM
+    const bms = await prisma.metaBusinessManager.findMany({
+      where: { businessId, isActive: true }
+    });
+
+    // 2 & 4. Kumpulkan Ad Accounts dan Insights
+    const metaCampaignsMap = new Map<string, { spend: number, clicks: number, impressions: number, ctr: number, frequency: number, campaignName: string, accountName: string, accountId: string, picName: string, bmId: string, status: string, objective?: string, actions?: any[], cost_per_action_type?: any[] }>();
+    const uniqueAdAccounts = new Set<string>();
+    let activeBmCount = 0;
+    let errorBmCount = 0;
+
+    for (const bm of bms) {
+      const token = decrypt(bm.accessToken);
+      if (!token) {
+        errorBmCount++;
+        continue;
+      }
+
+      try {
+        // Ambil ad accounts yg bisa diakses token ini
+        const adAccResp = await fetch(`https://graph.facebook.com/v21.0/me/adaccounts?fields=id,name&access_token=${token}`);
+        if (!adAccResp.ok) {
+          errorBmCount++;
+          const errText = await adAccResp.text();
+          logger.warn(`[Business/MetaAds] Gagal me/adaccounts: ${errText}`);
+          if (errText.includes('"code":190') || errText.includes('190')) {
+            await prisma.metaBusinessManager.update({ where: { id: bm.id }, data: { tokenStatus: 'ERROR' as any } });
+          }
+          continue;
+        }
+
+        activeBmCount++;
+        const adAccData = (await adAccResp.json()) as any;
+        const adAccounts = adAccData.data || [];
+        
+        // Fetch per Ad Account secara paralel & terisolasi (Promise.allSettled)
+        await Promise.allSettled(
+          adAccounts.map(async (act: any) => {
+            const actId = act.id;
+            const accName = act.name || act.id;
+            if (uniqueAdAccounts.has(actId)) return;
+            uniqueAdAccounts.add(actId);
+
+            try {
+              // 1. Ambil daftar kampanye di Ad Account
+              const campResp = await fetch(`https://graph.facebook.com/v21.0/${actId}/campaigns?fields=id,name,status,objective&limit=250&access_token=${token}`);
+              if (campResp.ok) {
+                const campData = (await campResp.json()) as any;
+                for (const camp of (campData.data || [])) {
+                  if (!metaCampaignsMap.has(camp.id)) {
+                    metaCampaignsMap.set(camp.id, {
+                      spend: 0,
+                      clicks: 0,
+                      impressions: 0,
+                      ctr: 0,
+                      frequency: 0,
+                      actions: [],
+                      cost_per_action_type: [],
+                      campaignName: camp.name,
+                      accountName: accName,
+                      accountId: actId,
+                      bmId: bm.id,
+                      picName: bm.picName,
+                      status: camp.status === 'ACTIVE' ? 'Active' : 'Paused',
+                      objective: camp.objective || 'UNKNOWN'
+                    });
+                  }
+                }
+              }
+            } catch (campErr) {
+              logger.warn(`[Business/MetaAds] Gagal fetch campaigns untuk ${actId}: ${campErr}`);
+            }
+
+            try {
+              // 2. Fetch insights per ad account untuk rentang tanggal yang dipilih
+              const query = new URLSearchParams({
+                level: 'campaign',
+                fields: 'spend,campaign_name,campaign_id,clicks,ctr,frequency,impressions,cpc,cpm,actions,cost_per_action_type',
+                time_range: JSON.stringify({ since: startDate, until: endDate }),
+                access_token: token
+              });
+              const insResp = await fetch(`https://graph.facebook.com/v21.0/${actId}/insights?${query}`);
+              if (insResp.ok) {
+                const insData = (await insResp.json()) as any;
+                const insights = insData.data || [];
+                for (const row of insights) {
+                  const cid = row.campaign_id;
+                  const spend = parseFloat(row.spend || '0');
+                  const clicks = parseInt(row.clicks || '0', 10);
+                  const ctr = parseFloat(row.ctr || '0');
+                  const frequency = parseFloat(row.frequency || '0');
+                  const impressions = parseInt(row.impressions || '0', 10);
+                  const actions = row.actions || [];
+                  const cost_per_action_type = row.cost_per_action_type || [];
+
+                  if (!metaCampaignsMap.has(cid)) {
+                    metaCampaignsMap.set(cid, {
+                      spend: 0,
+                      clicks: 0,
+                      impressions: 0,
+                      ctr: 0,
+                      frequency: 0,
+                      actions: [],
+                      cost_per_action_type: [],
+                      objective: 'UNKNOWN',
+                      campaignName: row.campaign_name,
+                      accountName: accName,
+                      accountId: actId,
+                      bmId: bm.id,
+                      picName: bm.picName,
+                      status: 'Active'
+                    });
+                  }
+                  
+                  const camp = metaCampaignsMap.get(cid)!;
+                  camp.spend += spend;
+                  camp.clicks += clicks;
+                  camp.impressions += impressions;
+                  // Untuk rasio seperti CTR dan Frequency, ambil dari insight kampanye
+                  camp.ctr = ctr; 
+                  camp.frequency = frequency;
+                  if (actions.length > 0) {
+                    camp.actions = actions;
+                  }
+                  if (cost_per_action_type.length > 0) {
+                    camp.cost_per_action_type = cost_per_action_type;
+                  }
+                }
+              }
+            } catch (insErr) {
+              logger.warn(`[Business/MetaAds] Gagal fetch insights untuk ${actId}: ${insErr}`);
+            }
+          })
+        );
+      } catch (bmErr: any) {
+        logger.error(`[Business/MetaAds] Error pada BM loop: ${bmErr}`);
+      }
+    }
+
+    // 5. JOIN dengan data Closing CS dari database
+    const dateFilter = getWibDateRange(startDate, endDate);
+    const whereLead: any = { businessId };
+    if (dateFilter) {
+      whereLead.createdAt = dateFilter;
+    }
+
+    const leads = await prisma.lead.findMany({
+      where: whereLead,
+      select: { metaCampaignId: true, confirmedCodAmount: true, leadStage: true, conversionStatus: true, score: true, capiEventsSent: true }
+    });
+
+    let totalOmset = 0;
+    let totalSpend = 0;
+    const campaignData: any[] = [];
+    const picMap = new Map<string, { spend: number, omset: number, closing: number }>();
+
+    // Mapping Omset per campaign (Hanya transaksi yang SUKSES DITEMBAK SEBAGAI PURCHASE di CAPI)
+    const omsetByCampaign = new Map<string, { omset: number, leads: number, closing: number }>();
+    for (const lead of leads) {
+      const cid = lead.metaCampaignId || 'ORGANIC';
+      // Bossfren's rule: ONLY count if Meta actually received it!
+      const isCapiPurchase = Array.isArray(lead.capiEventsSent) && lead.capiEventsSent.includes('Purchase');
+      const amount = isCapiPurchase ? (Number(lead.confirmedCodAmount) || 0) : 0;
+      totalOmset += amount;
+      
+      if (!omsetByCampaign.has(cid)) {
+        omsetByCampaign.set(cid, { omset: 0, leads: 0, closing: 0 });
+      }
+      omsetByCampaign.get(cid)!.omset += amount;
+      omsetByCampaign.get(cid)!.leads += 1;
+      if (isCapiPurchase) omsetByCampaign.get(cid)!.closing += 1;
+    }
+
+    for (const [cid, metaData] of metaCampaignsMap.entries()) {
+      totalSpend += metaData.spend;
+      const csData = omsetByCampaign.get(cid) || { omset: 0, leads: 0, closing: 0 };
+      
+      campaignData.push({
+        campaignId: cid,
+        campaignName: metaData.campaignName,
+        accountName: metaData.accountName || '-',
+        accountId: metaData.accountId || '-',
+        bmId: metaData.bmId,
+        picName: metaData.picName,
+        status: metaData.status,
+        spend: metaData.spend,
+        clicks: (metaData as any).clicks || 0,
+        ctr: (metaData as any).ctr || 0,
+        frequency: (metaData as any).frequency || 0,
+        impressions: (metaData as any).impressions || 0,
+        objective: (metaData as any).objective || 'UNKNOWN',
+        actions: (metaData as any).actions || [],
+        cost_per_action_type: (metaData as any).cost_per_action_type || [],
+        leads: csData.leads,
+        closing: csData.closing,
+        omset: csData.omset,
+        roas: metaData.spend > 0 ? (csData.omset / metaData.spend) : 0
+      });
+
+      // Aggregate for PIC
+      if (!picMap.has(metaData.picName)) picMap.set(metaData.picName, { spend: 0, omset: 0, closing: 0 });
+      const pData = picMap.get(metaData.picName)!;
+      pData.spend += metaData.spend;
+      pData.omset += csData.omset;
+      pData.closing += csData.closing;
+    }
+
+    // Add Organic to Campaign Table
+    if (omsetByCampaign.has('ORGANIC')) {
+      const orgData = omsetByCampaign.get('ORGANIC')!;
+      campaignData.push({
+        campaignId: 'ORGANIC',
+        campaignName: 'Organik / Tidak Terlacak',
+        accountName: 'Organik',
+        accountId: '-',
+        bmId: null,
+        picName: '-',
+        status: '-',
+        spend: 0,
+        leads: orgData.leads,
+        closing: orgData.closing,
+        omset: orgData.omset,
+        roas: 0
+      });
+    }
+
+    // Funnel CAPI BENAR-BENAR menghitung data yang SUDAH SUKSES DIKIRIM ke Meta CAPI:
+    // Mencegah false flag jika token error/kosong atau Meta CAPI gagal.
+    const funnelStats = {
+      viewContent: leads.filter((l: any) => l.capiEventsSent && l.capiEventsSent.includes('ViewContent')).length,
+      lead: leads.filter((l: any) => l.capiEventsSent && l.capiEventsSent.includes('Lead')).length,
+      addToCart: leads.filter((l: any) => l.capiEventsSent && l.capiEventsSent.includes('AddToCart')).length,
+      purchase: leads.filter((l: any) => l.capiEventsSent && l.capiEventsSent.includes('Purchase')).length
+    };
+
+    // Hitung status akun & summary teks BM
+    let accountStatus = '⚪ Belum Ada BM';
+    if (bms.length > 0) {
+      if (errorBmCount === 0) {
+        accountStatus = '🟢 Semua BM Aktif';
+      } else if (activeBmCount > 0) {
+        accountStatus = '⚠️ Sebagian BM Error';
+      } else {
+        accountStatus = '🔴 Semua BM Diskonek';
+      }
+    }
+
+    const bmSummaryText = bms.length > 0
+      ? `${activeBmCount} BM Aktif, ${errorBmCount} Diskonek`
+      : '0 BM Terkoneksi';
+
+    // 6 & 7 & 9. Struktur respon
+    const payload = {
+      execSummary: { 
+        totalOmset, 
+        totalSpend, 
+        realRoas: totalSpend > 0 ? (totalOmset / totalSpend) : 0, 
+        accountStatus,
+        totalBm: bms.length,
+        activeBm: activeBmCount,
+        errorBm: errorBmCount,
+        bmSummaryText
+      },
+      picScorecard: Array.from(picMap.entries()).map(([name, data]) => ({
+        picName: name,
+        spend: data.spend,
+        omset: data.omset,
+        closing: data.closing,
+        roas: data.spend > 0 ? (data.omset / data.spend) : 0
+      })),
+      campaignTable: campaignData,
+      funnelStats
+    };
+
+    await redisCache.set(cacheKey, JSON.stringify(payload), 'EX', 20 * 60).catch(() => {});
+    res.json(payload);
+  } catch (err) {
+    next(err);
+  }
+});
+
+
+// GET /business/meta-ads-breakdowns
+router.get('/meta-ads-breakdowns', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const startDate = (req.query.startDate as string) || new Date().toISOString().split('T')[0];
+    const endDate = (req.query.endDate as string) || new Date().toISOString().split('T')[0];
+
+    const cacheKey = `salespintar:meta-breakdowns:${businessId}:${startDate}:${endDate}`;
+    const { redisCache } = await import('../config/redis');
+    
+    const forceRefresh = req.query.forceRefresh === 'true';
+    const cached = await redisCache.get(cacheKey).catch(() => null);
+    if (cached && !forceRefresh) {
+      return res.json(JSON.parse(cached));
+    }
+
+    const bms = await prisma.metaBusinessManager.findMany({
+      where: { businessId, tokenStatus: 'ACTIVE' },
+      select: { accessToken: true }
+    });
+
+    const geoMap = new Map<string, any>();
+    const placementMap = new Map<string, any>();
+
+    for (const bm of bms) {
+      if (!bm.accessToken) continue;
+      
+      const token = decrypt(bm.accessToken);
+      
+
+      let accountIds: string[] = [];
+      try {
+        const adAccResp = await fetch(`https://graph.facebook.com/v21.0/me/adaccounts?fields=id&access_token=${token}`);
+        if (adAccResp.ok) {
+          const adAccData = await adAccResp.json() as any;
+          accountIds = (adAccData.data || []).map((a: any) => a.id);
+        }
+      } catch (e) { continue; }
+
+
+      const insightPromises = accountIds.map(async (actId) => {
+        const geoQuery = new URLSearchParams({
+          level: 'ad',
+          breakdowns: 'region',
+          fields: 'spend,clicks,impressions,cpc,inline_link_click_ctr,ctr',
+          time_range: JSON.stringify({ since: startDate, until: endDate }),
+          access_token: token
+        });
+        const placementQuery = new URLSearchParams({
+          level: 'ad',
+          breakdowns: 'publisher_platform',
+          fields: 'spend,clicks,impressions,cpc,inline_link_click_ctr,ctr',
+          time_range: JSON.stringify({ since: startDate, until: endDate }),
+          access_token: token
+        });
+
+        try {
+          const [geoResp, plResp] = await Promise.all([
+            fetch(`https://graph.facebook.com/v21.0/${actId}/insights?${geoQuery}`),
+            fetch(`https://graph.facebook.com/v21.0/${actId}/insights?${placementQuery}`)
+          ]);
+
+          if (geoResp.ok) {
+            const geoData = await geoResp.json() as any;
+            for (const row of (geoData.data || [])) {
+              const region = row.region || 'Unknown';
+              const spend = parseFloat(row.spend || '0');
+              const clicks = parseInt(row.clicks || '0', 10);
+              if (spend === 0 && clicks === 0) continue;
+              
+              if (!geoMap.has(region)) geoMap.set(region, { location: region, spend: 0, clicks: 0, impressions: 0 });
+              const current = geoMap.get(region);
+              current.spend += spend;
+              current.clicks += clicks;
+              current.impressions += parseInt(row.impressions || '0', 10);
+            }
+          }
+
+          if (plResp.ok) {
+            const plData = await plResp.json() as any;
+            for (const row of (plData.data || [])) {
+              let platform = row.publisher_platform || 'Unknown';
+              if (platform === 'facebook') platform = 'Facebook';
+              else if (platform === 'instagram') platform = 'Instagram';
+              else if (platform === 'audience_network') platform = 'Audience Network';
+              else if (platform === 'messenger') platform = 'Messenger';
+              
+              const spend = parseFloat(row.spend || '0');
+              const clicks = parseInt(row.clicks || '0', 10);
+              if (spend === 0 && clicks === 0) continue;
+              
+              if (!placementMap.has(platform)) placementMap.set(platform, { placement: platform, spend: 0, clicks: 0, impressions: 0 });
+              const current = placementMap.get(platform);
+              current.spend += spend;
+              current.clicks += clicks;
+              current.impressions += parseInt(row.impressions || '0', 10);
+            }
+          }
+        } catch (err) {}
+      });
+      await Promise.allSettled(insightPromises);
+    }
+
+    const payload = {
+      geographic: Array.from(geoMap.values()).map(g => ({
+        ...g,
+        ctr: g.impressions > 0 ? (g.clicks / g.impressions) * 100 : 0,
+        cpc: g.clicks > 0 ? g.spend / g.clicks : 0
+      })).sort((a, b) => b.spend - a.spend).slice(0, 10), // Top 10
+      placement: Array.from(placementMap.values()).map(p => ({
+        ...p,
+        ctr: p.impressions > 0 ? (p.clicks / p.impressions) * 100 : 0,
+        cpc: p.clicks > 0 ? p.spend / p.clicks : 0
+      })).sort((a, b) => b.spend - a.spend)
+    };
+
+    await redisCache.set(cacheKey, JSON.stringify(payload), 'EX', 20 * 60).catch(() => {});
+    res.json(payload);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /business/meta-ads-best-day — Hybrid Analyzer (Fase 4 - Best Day to Run Ads)
+router.get('/meta-ads-best-day', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    // Default to last 30 days if not provided
+    const end = new Date();
+    const start = new Date();
+    start.setDate(end.getDate() - 30);
+    
+    const startDate = (req.query.startDate as string) || start.toISOString().split('T')[0];
+    const endDate = (req.query.endDate as string) || end.toISOString().split('T')[0];
+
+    const cacheKey = `salespintar:meta-best-day:${businessId}:${startDate}:${endDate}`;
+    const { redisCache } = await import('../config/redis');
+    const forceRefresh = req.query.forceRefresh === 'true';
+    const cached = await redisCache.get(cacheKey).catch(() => null);
+    if (cached && !forceRefresh) {
+      return res.json(JSON.parse(cached));
+    }
+
+    // Initialize 7 days data (0 = Sunday, 1 = Monday, ..., 6 = Saturday)
+    const days = [0, 1, 2, 3, 4, 5, 6].map(d => ({
+      dayOfWeek: d,
+      spend: 0,
+      clicks: 0,
+      impressions: 0,
+      leads: 0,
+      closing: 0,
+      omset: 0,
+      roas: 0,
+      cpa: 0,
+      closingRate: 0,
+      score: 0
+    }));
+
+    const bms = await prisma.metaBusinessManager.findMany({
+      where: { businessId, isActive: true, tokenStatus: 'ACTIVE' }
+    });
+
+    let totalSpendAll = 0;
+    const uniqueAdAccounts = new Set<string>();
+
+    for (const bm of bms) {
+      const token = decrypt(bm.accessToken);
+      if (!token) continue;
+      try {
+        const adAccResp = await fetch(`https://graph.facebook.com/v21.0/me/adaccounts?fields=id&access_token=${token}`);
+        if (!adAccResp.ok) continue;
+        const adAccounts = ((await adAccResp.json()) as any).data || [];
+        
+        await Promise.allSettled(adAccounts.map(async (act: any) => {
+          const actId = act.id;
+          if (uniqueAdAccounts.has(actId)) return;
+          uniqueAdAccounts.add(actId);
+
+          const query = new URLSearchParams({
+            level: 'account',
+            fields: 'spend,clicks,impressions',
+            time_range: JSON.stringify({ since: startDate, until: endDate }),
+            time_increment: '1', // daily
+            access_token: token
+          });
+          const insResp = await fetch(`https://graph.facebook.com/v21.0/${actId}/insights?${query}`);
+          if (insResp.ok) {
+            const insights = ((await insResp.json()) as any).data || [];
+            for (const row of insights) {
+              if (row.date_start) {
+                // Meta returns YYYY-MM-DD
+                const dateObj = new Date(row.date_start + 'T12:00:00.000+07:00'); 
+                const dow = dateObj.getDay();
+                const spend = parseFloat(row.spend || '0');
+                days[dow].spend += spend;
+                days[dow].clicks += parseInt(row.clicks || '0', 10);
+                days[dow].impressions += parseInt(row.impressions || '0', 10);
+                totalSpendAll += spend;
+              }
+            }
+          }
+        }));
+      } catch (err) {}
+    }
+
+    // Fetch DB Leads
+    const dateFilter = getWibDateRange(startDate, endDate);
+    const whereLead: any = { businessId };
+    if (dateFilter) {
+      whereLead.createdAt = dateFilter;
+    }
+    const leads = await prisma.lead.findMany({
+      where: whereLead,
+      select: { createdAt: true, confirmedCodAmount: true, capiEventsSent: true }
+    });
+
+    for (const lead of leads) {
+      // Adjusted to WIB explicitly
+      const dateWibStr = lead.createdAt.toLocaleString('en-US', { timeZone: 'Asia/Jakarta' });
+      const dow = new Date(dateWibStr).getDay();
+      days[dow].leads += 1;
+      
+      const isCapiPurchase = Array.isArray(lead.capiEventsSent) && lead.capiEventsSent.includes('Purchase');
+      if (isCapiPurchase) {
+        days[dow].closing += 1;
+        days[dow].omset += Number(lead.confirmedCodAmount) || 0;
+      }
+    }
+
+    // Compute Derived & Norm Metrics
+    let maxRoas = 0;
+    let maxOmset = 0;
+    let maxClosingRate = 0;
+    let maxVolume = 0;
+
+    for (const d of days) {
+      d.roas = d.spend > 0 ? d.omset / d.spend : 0;
+      d.cpa = d.closing > 0 ? d.spend / d.closing : 0;
+      d.closingRate = d.leads > 0 ? d.closing / d.leads : 0;
+
+      // Ambang batas (Gate): 5% spend & >= 3 leads
+      if (d.spend >= totalSpendAll * 0.05 && d.leads >= 3) {
+        if (d.roas > maxRoas) maxRoas = d.roas;
+        if (d.omset > maxOmset) maxOmset = d.omset;
+        if (d.closingRate > maxClosingRate) maxClosingRate = d.closingRate;
+        if (d.leads > maxVolume) maxVolume = d.leads;
+      }
+    }
+
+    // Score
+    for (const d of days) {
+      if (d.spend >= totalSpendAll * 0.05 && d.leads >= 3) {
+        const normRoas = maxRoas > 0 ? d.roas / maxRoas : 0;
+        const normOmset = maxOmset > 0 ? d.omset / maxOmset : 0;
+        const normClosingRate = maxClosingRate > 0 ? d.closingRate / maxClosingRate : 0;
+        const normVolume = maxVolume > 0 ? d.leads / maxVolume : 0;
+
+        d.score = (0.40 * normRoas) + (0.35 * normOmset) + (0.15 * normClosingRate) + (0.10 * normVolume);
+      } else {
+        d.score = 0;
+      }
+    }
+
+    const dayNames = ['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'];
+    const sorted = [...days].sort((a, b) => b.score - a.score);
+    const bestDay = sorted[0]?.score > 0 ? dayNames[sorted[0].dayOfWeek] : null;
+    const lowDay = sorted.filter(d => d.score > 0).pop();
+    const lowDayName = lowDay ? dayNames[lowDay.dayOfWeek] : null;
+
+    const payload = {
+      days,
+      bestDay,
+      lowDayName,
+      recommendation: bestDay ? `Berdasarkan ROAS dan konversi, ${bestDay} adalah Peak Day Anda. Pertimbangkan menaikkan budget di hari ini.` : 'Belum cukup data konversi untuk rekomendasi Peak Day.'
+    };
+
+    await redisCache.set(cacheKey, JSON.stringify(payload), 'EX', 20 * 60).catch(() => {});
+    res.json(payload);
+  } catch (e) { next(e); }
+});
+
+// GET /business/meta-top-creatives — Two-Step Fetch (Fase 4)
+router.get('/meta-top-creatives', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const startDate = (req.query.startDate as string) || new Date().toISOString().split('T')[0];
+    const endDate = (req.query.endDate as string) || new Date().toISOString().split('T')[0];
+    const limit = parseInt(req.query.limit as string) || 10;
+
+    const cacheKey = `salespintar:meta-top-creatives:${businessId}:${startDate}:${endDate}:${limit}`;
+    const { redisCache } = await import('../config/redis');
+    const forceRefresh = req.query.forceRefresh === 'true';
+    const cached = await redisCache.get(cacheKey).catch(() => null);
+    if (cached && !forceRefresh) {
+      return res.json(JSON.parse(cached));
+    }
+
+    const bms = await prisma.metaBusinessManager.findMany({
+      where: { businessId, isActive: true, tokenStatus: 'ACTIVE' }
+    });
+
+    let allAds: any[] = [];
+    const uniqueAdAccounts = new Set<string>();
+
+    for (const bm of bms) {
+      const token = decrypt(bm.accessToken);
+      if (!token) continue;
+      try {
+        const adAccResp = await fetch(`https://graph.facebook.com/v21.0/me/adaccounts?fields=id&access_token=${token}`);
+        if (!adAccResp.ok) continue;
+        const adAccounts = ((await adAccResp.json()) as any).data || [];
+        
+        await Promise.allSettled(adAccounts.map(async (act: any) => {
+          const actId = act.id;
+          if (uniqueAdAccounts.has(actId)) return;
+          uniqueAdAccounts.add(actId);
+
+          // Step 1: Ambil insight ad-level TANPA creative field
+          const query = new URLSearchParams({
+            level: 'ad',
+            fields: 'ad_id,ad_name,campaign_name,spend,ctr,impressions,quality_ranking,engagement_rate_ranking,conversion_rate_ranking',
+            time_range: JSON.stringify({ since: startDate, until: endDate }),
+            access_token: token
+          });
+          const insResp = await fetch(`https://graph.facebook.com/v21.0/${actId}/insights?${query}`);
+          if (insResp.ok) {
+            const insights = ((await insResp.json()) as any).data || [];
+            for (const row of insights) {
+              const imp = parseInt(row.impressions || '0', 10);
+              if (imp >= 100) { // Filter min 100 tayangan
+                allAds.push({
+                  adId: row.ad_id,
+                  adName: row.ad_name,
+                  campaignName: row.campaign_name,
+                  spend: parseFloat(row.spend || '0'),
+                  ctr: parseFloat(row.ctr || '0'),
+                  impressions: imp,
+                  qualityRanking: row.quality_ranking || 'UNKNOWN',
+                  engagementRanking: row.engagement_rate_ranking || 'UNKNOWN',
+                  conversionRanking: row.conversion_rate_ranking || 'UNKNOWN',
+                  token // simpan untuk fetch step 2
+                });
+              }
+            }
+          }
+        }));
+      } catch (err) {}
+    }
+
+    // Urutkan CTR DESC dan potong sesuai limit
+    allAds.sort((a, b) => b.ctr - a.ctr);
+    const topAds = allAds.slice(0, limit);
+
+    // Step 2: Fetch creative thumbnails and interactive preview HANYA untuk topAds
+    await Promise.allSettled(topAds.map(async (ad) => {
+      try {
+        const adResp = await fetch(`https://graph.facebook.com/v21.0/${ad.adId}?fields=creative{id,name,title,body,thumbnail_url,image_url,video_id,object_story_spec,asset_feed_spec,status}&access_token=${ad.token}`);
+        if (adResp.ok) {
+          const data = (await adResp.json()) as any;
+          const creative = data.creative || {};
+          ad.thumbnailUrl = creative.thumbnail_url || creative.image_url || creative.object_story_spec?.video_data?.image_url || creative.object_story_spec?.link_data?.picture || creative.object_story_spec?.photo_data?.url || creative.asset_feed_spec?.images?.[0]?.url || null;
+          
+          const isVideo = Boolean(creative.video_id || creative.object_story_spec?.video_data?.video_id || creative.asset_feed_spec?.videos?.[0]?.video_id);
+          ad.mediaType = isVideo ? 'VIDEO' : 'IMAGE';
+          ad.adTitle = creative.title || creative.object_story_spec?.video_data?.title || creative.name || '';
+          ad.adBody = creative.body || creative.object_story_spec?.video_data?.message || '';
+        }
+
+        // Fetch interactive preview iframe (playable video & interactive post)
+        const prevRes = await fetch(`https://graph.facebook.com/v21.0/${ad.adId}/previews?ad_format=MOBILE_FEED_STANDARD&access_token=${ad.token}`);
+        if (prevRes.ok) {
+          const prevData = (await prevRes.json()) as any;
+          ad.previewIframe = prevData.data?.[0]?.body || null;
+        }
+      } catch (err) {}
+      delete ad.token; // Jangan bocorkan token
+    }));
+
+    const payload = { data: topAds };
+    await redisCache.set(cacheKey, JSON.stringify(payload), 'EX', 20 * 60).catch(() => {});
+    res.json(payload);
+  } catch (e) { next(e); }
+});
+
+export default router;

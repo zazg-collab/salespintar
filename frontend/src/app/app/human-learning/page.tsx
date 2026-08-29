@@ -1,0 +1,963 @@
+'use client';
+
+import { useState, useEffect, useCallback, useRef } from 'react';
+import { apiGet, apiPost, apiDelete } from '../../../lib/api';
+import {
+  Users, Plus, Wifi, WifiOff, Loader2, QrCode, Trash2,
+  RefreshCw, BookOpen, Phone, CheckCircle, AlertCircle,
+  Activity, Upload, X, ChevronDown, ChevronUp, MessageSquare, ShieldAlert,
+  Reply, Inbox, FileCheck,
+} from 'lucide-react';
+
+// ─── Types ────────────────────────────────────────────────────────────────────
+type SessionStatus = 'CONNECTED' | 'CONNECTING' | 'DISCONNECTED' | 'BANNED';
+
+interface CsSession {
+  id: string;
+  csPhone: string;
+  csName: string;
+  status: SessionStatus;
+  liveStatus: SessionStatus;
+  linkedAt: string | null;
+  lastSeenAt: string | null;
+  totalPairsCaptured: number;
+  /** Pesan yang dibalas CS = kolom DB + hitungan Redis yang belum dititipkan. */
+  csReplies: number;
+  /** Pesan masuk dari pembeli, dihitung dengan cara yang sama. */
+  buyerMessages: number;
+  totalFactsSaved: number;
+  /** Dokumen yang BENAR-BENAR ditulis ke vault — bukan sekadar vonis Lapis 1. */
+  totalDocsWritten: number;
+  totalFactsDiscarded: number;
+  totalClosingDetected: number;
+  totalLostDetected: number;
+  intentStats: Record<string, number> | null;
+  qrCode: string | null;
+  qrExpiresAt: string | null;
+  createdAt: string;
+  /** Nomor yang SUNGGUH menscan QR (dari creds.json). Bisa beda dari csPhone. */
+  linkedPhone: string | null;
+}
+
+interface BufferContact {
+  contactJid: string;
+  lines: number;
+  readyToFlush: boolean;
+  secondsSinceLastMessage: number | null;
+  preview: string[];
+}
+
+interface BufferReport {
+  /** Idle (detik) yang harus terlampaui sebelum penyapu `hl-idle-flush` mengirim buffer. */
+  idleSec: number;
+  /** Baris MINIMUM supaya buffer layak dikirim sama sekali. Bukan pemicu. */
+  minMessages: number;
+  /** Baris yang MEMICU pengiriman seketika, tanpa menunggu idle. */
+  flushAtLines: number;
+  liveStatus: string;
+  lastSeenAt: string | null;
+  csReplies: number;
+  buyerMessages: number;
+  contacts: BufferContact[];
+}
+
+// ─── Status helpers ───────────────────────────────────────────────────────────
+const STATUS_CONFIG: Record<SessionStatus, { label: string; color: string; icon: React.ReactNode }> = {
+  CONNECTED: {
+    label: 'Terhubung',
+    color: 'text-green-600 bg-green-50 border-green-200',
+    icon: <CheckCircle className="w-3.5 h-3.5" />,
+  },
+  CONNECTING: {
+    label: 'Menghubungkan...',
+    color: 'text-amber-600 bg-amber-50 border-amber-200',
+    icon: <Loader2 className="w-3.5 h-3.5 animate-spin" />,
+  },
+  DISCONNECTED: {
+    label: 'Terputus',
+    color: 'text-gray-500 bg-gray-50 border-gray-200',
+    icon: <WifiOff className="w-3.5 h-3.5" />,
+  },
+  BANNED: {
+    label: 'Diblokir WA',
+    color: 'text-red-600 bg-red-50 border-red-200',
+    icon: <AlertCircle className="w-3.5 h-3.5" />,
+  },
+};
+
+function StatusBadge({ status }: { status: SessionStatus }) {
+  const cfg = STATUS_CONFIG[status] ?? STATUS_CONFIG.DISCONNECTED;
+  return (
+    <span className={`inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full border ${cfg.color}`}>
+      {cfg.icon}
+      {cfg.label}
+    </span>
+  );
+}
+
+function formatRelative(iso: string | null): string {
+  if (!iso) return '—';
+  const diff = Date.now() - new Date(iso).getTime();
+  const mins = Math.floor(diff / 60_000);
+  if (mins < 1) return 'Baru saja';
+  if (mins < 60) return `${mins} mnt lalu`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} jam lalu`;
+  return `${Math.floor(hrs / 24)} hari lalu`;
+}
+
+// ─── QR Modal ─────────────────────────────────────────────────────────────────
+/**
+ * Empat keadaan yang MUNGKIN, dan semuanya punya tampilan.
+ *
+ * Versi sebelumnya merender tiga blok terpisah:
+ *   {loading && …} {error && …} {!loading && !error && qrCode && …}
+ * Kombinasi keempat — loading=false, error kosong, qrCode kosong — tidak
+ * ditangani siapa pun, jadi badan modal jadi PUTIH KOSONG. Itu bukan bug
+ * kosmetik: `setError(e.message ?? '…')` meloloskan pesan galat string kosong
+ * (`??` hanya menangkap null/undefined), dan `useState(!session.qrCode)`
+ * membuat loading=false untuk qrCode string kosong. Dengan state machine
+ * eksplisit + cabang `else` terakhir, layar putih tidak bisa terjadi lagi.
+ */
+type QrPhase = 'requesting' | 'waiting' | 'ready' | 'error';
+
+/** QR hanya dipakai kalau masa berlakunya belum lewat. */
+function liveQr(qrCode?: string | null, qrExpiresAt?: string | null): string | null {
+  if (!qrCode) return null;
+  if (qrExpiresAt && new Date(qrExpiresAt).getTime() <= Date.now()) return null;
+  return qrCode;
+}
+
+interface QrPayload {
+  status?: string;
+  liveStatus?: string;
+  qrCode?: string | null;
+  qrExpiresAt?: string | null;
+}
+
+function QrModal({
+  session,
+  onClose,
+  onConnected,
+}: {
+  session: CsSession;
+  onClose: () => void;
+  onConnected: () => void;
+}) {
+  const seeded = liveQr(session.qrCode, session.qrExpiresAt);
+  const [qrCode, setQrCode] = useState<string | null>(seeded);
+  const [phase, setPhase] = useState<QrPhase>(seeded ? 'ready' : 'requesting');
+  const [error, setError] = useState<string | null>(null);
+  const [waitedSec, setWaitedSec] = useState(0);
+
+  // Callback induk disimpan di ref supaya identitasnya tidak jadi dependensi
+  // effect. Dulu `onConnected` adalah arrow baru pada setiap render SessionCard,
+  // jadi `fetchQr` ikut baru, effect ikut jalan ulang, dan setiap refresh 15
+  // detik dari halaman induk menembakkan GET /qr tambahan tanpa alasan.
+  const onConnectedRef = useRef(onConnected);
+  useEffect(() => { onConnectedRef.current = onConnected; }, [onConnected]);
+
+  const requestQr = useCallback(async () => {
+    setError(null);
+    setWaitedSec(0);
+    setPhase((prev) => (prev === 'ready' ? prev : 'requesting'));
+    try {
+      const data = await apiGet<QrPayload>(`/human-learning/sessions/${session.id}/qr`);
+
+      // Hanya 'CONNECTED' yang menutup modal. Dulu backend juga membalas
+      // 'CONNECTED' saat connect() mengembalikan undefined karena guard
+      // `connecting` — itu penyebab modal menutup sepersekian detik setelah
+      // dibuka. Sekarang keadaan itu dibalas 'PENDING' dan ditangani di bawah.
+      if (data.status === 'CONNECTED') {
+        onConnectedRef.current();
+        return;
+      }
+
+      const fresh = liveQr(data.qrCode, data.qrExpiresAt);
+      if (fresh) {
+        setQrCode(fresh);
+        setPhase('ready');
+        return;
+      }
+
+      // 'PENDING' / 'CONNECTING' tanpa QR → backend masih menyiapkan sesi.
+      // JANGAN tutup, JANGAN kosongkan: tunggu polling /status yang mengambil
+      // QR begitu terbit.
+      setPhase('waiting');
+    } catch (e: any) {
+      // `||`, bukan `??`: pesan galat string kosong harus tetap tergantikan,
+      // kalau tidak `error` jadi falsy dan tidak ada cabang yang menyala.
+      setError((e?.message as string) || 'Gagal meminta QR dari server');
+      setPhase('error');
+    }
+  }, [session.id]);
+
+  // Permintaan awal — sekali saja.
+  // `askedRef` wajib: React StrictMode (bawaan Next.js di dev) menjalankan
+  // effect DUA KALI saat mount. Tanpa penjaga ini, dua GET /qr berbarengan
+  // terkirim tanpa pengguna mengklik apa pun — dan permintaan kedua itulah yang
+  // dulu kena guard `connecting` di backend lalu dibalas 'CONNECTED' palsu.
+  const askedRef = useRef(false);
+  useEffect(() => {
+    if (askedRef.current) return;
+    askedRef.current = true;
+    if (!seeded) void requestQr();
+  }, [seeded, requestQr]);
+
+  // Polling status tiap 3 detik: deteksi scan + tangkap QR yang telat terbit.
+  useEffect(() => {
+    const timer = setInterval(async () => {
+      try {
+        const data = await apiGet<QrPayload>(`/human-learning/sessions/${session.id}/status`);
+        if (data.liveStatus === 'CONNECTED') {
+          onConnectedRef.current();
+          return;
+        }
+        const fresh = liveQr(data.qrCode, data.qrExpiresAt);
+        if (fresh) {
+          // Selalu terima QR TERBARU, bukan hanya saat state masih kosong.
+          // Baileys merotasi QR tiap ~20 detik; versi lama menjaga dengan
+          // `&& !qrCode` sehingga hanya QR pertama yang pernah tampil — dan
+          // setelah ~60 detik gambar di layar sudah mati walau server sudah
+          // menerbitkan yang baru. Nilai `qrCode` di sana juga terbaca dari
+          // closure lama, jadi penjaganya memang tidak bisa dipercaya.
+          setQrCode((prev) => (prev === fresh ? prev : fresh));
+          setPhase('ready');
+          setError(null);
+        }
+      } catch {
+        /* diamkan: ini polling latar, bukan aksi pengguna */
+      }
+    }, 3000);
+    return () => clearInterval(timer);
+  }, [session.id]);
+
+  // Penghitung detik menunggu — supaya jeda 10-15 detik terasa hidup, bukan hang.
+  useEffect(() => {
+    if (phase !== 'requesting' && phase !== 'waiting') return;
+    const t = setInterval(() => setWaitedSec((v) => v + 1), 1000);
+    return () => clearInterval(t);
+  }, [phase]);
+
+  const stillWaiting = phase === 'requesting' || phase === 'waiting';
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
+      <div className="bg-white rounded-2xl shadow-2xl w-full max-w-sm mx-4 overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-5 py-4 border-b">
+          <div>
+            <h3 className="font-semibold text-gray-900">Hubungkan WhatsApp</h3>
+            <p className="text-sm text-gray-500">{session.csName} · {session.csPhone}</p>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-gray-100 text-gray-400">
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        {/* Body — rantai if/else lengkap: selalu ada sesuatu yang tampil */}
+        <div className="p-6 flex flex-col items-center justify-center gap-4 min-h-[300px]">
+          {phase === 'error' ? (
+            <div className="text-center py-4">
+              <AlertCircle className="w-8 h-8 text-red-400 mx-auto mb-2" />
+              <p className="text-sm text-red-600">{error || 'Terjadi galat yang tidak dikenali'}</p>
+              <button
+                onClick={() => void requestQr()}
+                className="mt-3 text-sm text-blue-600 hover:underline"
+              >
+                Coba lagi
+              </button>
+            </div>
+          ) : phase === 'ready' && qrCode ? (
+            <>
+              <div className="p-3 bg-white border-2 border-gray-100 rounded-xl shadow-sm">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img src={qrCode} alt="QR Code WhatsApp" className="w-52 h-52" />
+              </div>
+              <div className="text-center space-y-1">
+                <p className="text-sm font-medium text-gray-700">Scan dengan WhatsApp</p>
+                <p className="text-xs text-gray-400">
+                  Buka WhatsApp → Setelan → Perangkat Tertaut → Tautkan Perangkat
+                </p>
+              </div>
+              <div className="flex items-center gap-2 text-xs text-amber-600 bg-amber-50 px-3 py-2 rounded-lg">
+                <Activity className="w-3.5 h-3.5 flex-shrink-0" />
+                <span>Mode shadow — CS tetap balas dari HP biasa, bot hanya mendengar</span>
+              </div>
+              <button
+                onClick={() => void requestQr()}
+                className="flex items-center gap-1.5 text-xs text-gray-400 hover:text-gray-600"
+              >
+                <RefreshCw className="w-3 h-3" /> Muat ulang QR
+              </button>
+            </>
+          ) : (
+            /* 'requesting' | 'waiting' | dan segala keadaan sisa lainnya.
+               Cabang penutup ini yang membuat modal tidak mungkin blank. */
+            <div className="flex flex-col items-center gap-3 py-6 text-center">
+              <Loader2 className="w-8 h-8 text-blue-500 animate-spin" />
+              <p className="text-sm font-medium text-gray-600">
+                {phase === 'requesting' ? 'Meminta QR Code...' : 'Menyiapkan sesi WhatsApp...'}
+              </p>
+              <p className="text-xs text-gray-400 max-w-[16rem] leading-relaxed">
+                Sesi baru perlu <strong>10–15 detik</strong> untuk membuat kunci enkripsi
+                sebelum QR bisa terbit. Biarkan jendela ini terbuka.
+              </p>
+              <p className="text-xs text-gray-300 tabular-nums">{waitedSec}s</p>
+              {stillWaiting && waitedSec >= 40 && (
+                <button
+                  onClick={() => void requestQr()}
+                  className="flex items-center gap-1.5 text-xs text-blue-600 hover:underline"
+                >
+                  <RefreshCw className="w-3 h-3" /> Terlalu lama — minta ulang
+                </button>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Add CS Form ──────────────────────────────────────────────────────────────
+function AddCsForm({ onAdded }: { onAdded: () => void }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState('');
+  const [phone, setPhone] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoading(true);
+    setError(null);
+    try {
+      await apiPost('/human-learning/sessions', { csName: name, csPhone: phone });
+      setName(''); setPhone('');
+      setOpen(false);
+      onAdded();
+    } catch (e: any) {
+      setError(e.message ?? 'Gagal menambah CS');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  if (!open) {
+    return (
+      <button
+        onClick={() => setOpen(true)}
+        className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-colors"
+      >
+        <Plus className="w-4 h-4" /> Tambah CS
+      </button>
+    );
+  }
+
+  return (
+    <form onSubmit={submit} className="flex flex-wrap items-end gap-3 bg-blue-50 border border-blue-100 rounded-xl p-4">
+      <div className="flex flex-col gap-1">
+        <label className="text-xs font-medium text-gray-600">Nama CS</label>
+        <input
+          value={name}
+          onChange={e => setName(e.target.value)}
+          placeholder="e.g. Rina"
+          required
+          className="px-3 py-2 text-sm border border-gray-200 rounded-lg w-40 focus:outline-none focus:ring-2 focus:ring-blue-400"
+        />
+      </div>
+      <div className="flex flex-col gap-1">
+        <label className="text-xs font-medium text-gray-600">Nomor HP (WA)</label>
+        <input
+          value={phone}
+          onChange={e => setPhone(e.target.value)}
+          placeholder="081234567890"
+          required
+          className="px-3 py-2 text-sm border border-gray-200 rounded-lg w-44 focus:outline-none focus:ring-2 focus:ring-blue-400"
+        />
+      </div>
+      {error && <p className="text-xs text-red-500 w-full">{error}</p>}
+      <div className="flex gap-2">
+        <button
+          type="submit"
+          disabled={loading}
+          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg disabled:opacity-50 flex items-center gap-1.5"
+        >
+          {loading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Plus className="w-3.5 h-3.5" />}
+          Simpan
+        </button>
+        <button
+          type="button"
+          onClick={() => setOpen(false)}
+          className="px-3 py-2 text-sm text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg"
+        >
+          Batal
+        </button>
+      </div>
+    </form>
+  );
+}
+
+// ─── Panel Buffer Hidup ───────────────────────────────────────────────────────
+/**
+ * Jendela pantau untuk pertanyaan "capture-nya jalan atau tidak?".
+ *
+ * Sebelum panel ini ada, satu-satunya angka yang terlihat adalah `pair
+ * terkirim` dan `Aktivitas terakhir` — dua-duanya baru bergerak SETELAH buffer
+ * di-flush (butuh cukup baris, atau lewat ambang idle). Jadi "belum ada chat masuk"
+ * dan "semua pesan dibuang oleh filter JID" terlihat sama persis: nol.
+ * Itulah yang menyembunyikan bug LID Baileys v7 selama berjam-jam.
+ */
+function BufferPanel({ sessionId }: { sessionId: string }) {
+  const [report, setReport] = useState<BufferReport | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [expanded, setExpanded] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try {
+      const data = await apiGet<BufferReport>(`/human-learning/sessions/${sessionId}/buffers`);
+      setReport(data);
+      setError(null);
+    } catch (e: any) {
+      setError((e?.message as string) || 'Gagal membaca buffer');
+    }
+  }, [sessionId]);
+
+  useEffect(() => {
+    void load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const fmtAgo = (sec: number | null) => {
+    if (sec === null) return 'tidak diketahui';
+    if (sec < 60) return `${sec} dtk lalu`;
+    if (sec < 3600) return `${Math.floor(sec / 60)} mnt lalu`;
+    return `${Math.floor(sec / 3600)} jam lalu`;
+  };
+
+  const totalLines = report?.contacts.reduce((a, c) => a + c.lines, 0) ?? 0;
+
+  return (
+    <div className="mt-4 bg-white border border-gray-200 rounded-lg overflow-hidden">
+      <div className="flex items-center justify-between px-3 py-2 bg-gray-50 border-b border-gray-200">
+        <span className="text-xs font-semibold text-gray-700 flex items-center gap-1.5">
+          <MessageSquare className="w-3.5 h-3.5 text-blue-400" />
+          Buffer chat hidup
+        </span>
+        <span className="flex items-center gap-2.5 text-[10px] text-gray-400">
+          {report && (
+            <>
+              <span className="flex items-center gap-1 text-blue-600 font-semibold">
+                <Reply className="w-3 h-3" />{report.csReplies.toLocaleString('id-ID')}
+              </span>
+              <span className="flex items-center gap-1 text-emerald-600 font-semibold">
+                <Inbox className="w-3 h-3" />{report.buyerMessages.toLocaleString('id-ID')}
+              </span>
+            </>
+          )}
+          <span>tiap 5 dtk</span>
+        </span>
+      </div>
+
+      {error ? (
+        <p className="px-3 py-4 text-xs text-red-600">{error}</p>
+      ) : !report ? (
+        <p className="px-3 py-4 text-xs text-gray-400 flex items-center gap-2">
+          <Loader2 className="w-3.5 h-3.5 animate-spin" /> Membaca buffer...
+        </p>
+      ) : report.contacts.length === 0 ? (
+        <div className="px-3 py-4 text-xs text-gray-500 space-y-1.5">
+          <p className="font-medium text-gray-600">Belum ada satu pun pesan ter-buffer.</p>
+          <p className="text-gray-400 leading-relaxed">
+            Kalau statusnya <strong>Terhubung</strong> dan sudah ada chat masuk tapi di sini tetap
+            kosong <em>dan</em> penghitung di kanan atas juga masih 0, berarti pesannya dibuang
+            sebelum sampai buffer — cek log backend untuk baris
+            <code className="mx-1 px-1 bg-gray-100 rounded">[HL] Pesan dari alamat bentuk … dilewati</code>.
+            Penghitung yang naik tapi buffer kosong berarti sebaliknya: sudah ter-flush ke Shadow Mining.
+          </p>
+        </div>
+      ) : (
+        <>
+          <div className="px-3 py-2 flex flex-wrap gap-x-4 gap-y-1 text-[11px] text-gray-500 border-b border-gray-100">
+            <span><strong className="text-gray-800">{report.contacts.length}</strong> kontak aktif</span>
+            <span><strong className="text-gray-800">{totalLines}</strong> baris ter-buffer</span>
+            {/* Baris ini dulu berbunyi "ambang kirim: 4 baris" — dan itu menyesatkan:
+                tidak ada apa pun yang terkirim di 4 baris. Empat itu ambang MINIMUM
+                supaya buffer layak dikirim; yang MEMICU pengiriman cuma dua hal, dan
+                keduanya sekarang ditulis apa adanya. Panel pemantau yang menyebut
+                angka yang salah lebih buruk daripada panel yang tidak menyebut
+                angka — orang jadi menunggu sesuatu yang tidak akan terjadi. */}
+            <span>
+              kirim seketika di <strong className="text-gray-800">{report.flushAtLines}</strong> baris
+            </span>
+            <span>
+              atau idle <strong className="text-gray-800">{Math.round(report.idleSec / 60)}</strong> mnt
+              {' '}(min <strong className="text-gray-800">{report.minMessages}</strong> baris)
+            </span>
+          </div>
+          <ul className="divide-y divide-gray-100">
+            {report.contacts.map((c) => (
+              <li key={c.contactJid} className="px-3 py-2">
+                <button
+                  onClick={() => setExpanded((v) => (v === c.contactJid ? null : c.contactJid))}
+                  className="w-full flex items-center gap-2 text-left"
+                >
+                  <span className="flex-1 min-w-0 truncate text-xs font-medium text-gray-700">
+                    {c.contactJid.replace(/@.*$/, '')}
+                    <span className="text-gray-300 font-normal">{c.contactJid.replace(/^[^@]*/, '')}</span>
+                  </span>
+                  {/* Tiga keadaan, bukan dua. `readyToFlush` dari backend cuma berarti
+                      "≥ minimum", jadi mewarnainya hijau membuat buffer yang masih
+                      menunggu idle 10 menit terlihat seperti sudah mau terkirim. */}
+                  <span
+                    className={`text-[10px] px-1.5 py-0.5 rounded ${
+                      c.lines >= report.flushAtLines
+                        ? 'bg-emerald-50 text-emerald-600'
+                        : c.readyToFlush
+                          ? 'bg-amber-50 text-amber-600'
+                          : 'bg-gray-100 text-gray-500'
+                    }`}
+                    title={
+                      c.lines >= report.flushAtLines
+                        ? 'Sudah melewati ambang — terkirim pada pesan berikutnya'
+                        : c.readyToFlush
+                          ? `Cukup panjang, menunggu idle ${Math.round(report.idleSec / 60)} mnt`
+                          : `Belum cukup panjang (butuh ${report.minMessages} baris)`
+                    }
+                  >
+                    {c.lines} baris
+                  </span>
+                  <span className="text-[10px] text-gray-400 whitespace-nowrap">
+                    {fmtAgo(c.secondsSinceLastMessage)}
+                  </span>
+                  {expanded === c.contactJid
+                    ? <ChevronUp className="w-3 h-3 text-gray-400" />
+                    : <ChevronDown className="w-3 h-3 text-gray-400" />}
+                </button>
+                {expanded === c.contactJid && (
+                  <div className="mt-2 bg-gray-50 rounded p-2 space-y-1">
+                    {c.preview.map((line, i) => (
+                      <p key={i} className="text-[11px] leading-snug text-gray-600 break-words">
+                        <span className={line.startsWith('[CS]') ? 'text-blue-600 font-semibold' : 'text-emerald-700 font-semibold'}>
+                          {line.startsWith('[CS]') ? 'CS' : 'Pembeli'}
+                        </span>
+                        {' '}{line.replace(/^\[(CS|BUYER)\]\s*/, '')}
+                      </p>
+                    ))}
+                    <p className="text-[10px] text-gray-400 pt-1">6 baris terakhir</p>
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
+// ─── Session Card ─────────────────────────────────────────────────────────────
+function SessionCard({
+  session,
+  onRefresh,
+}: {
+  session: CsSession;
+  onRefresh: () => void;
+}) {
+  const [showQr, setShowQr] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [flushing, setFlushing] = useState(false);
+  const [showDetail, setShowDetail] = useState(false);
+
+  const liveStatus = session.liveStatus;
+
+  // useCallback WAJIB di sini. Arrow inline (`onConnected={() => {…}}`) punya
+  // identitas baru setiap render SessionCard — dan halaman induk me-refresh
+  // daftar sesi tiap 15 detik, jadi identitas itu berubah terus. Di QrModal
+  // identitas itu dulu masuk dependensi useEffect, sehingga effect-nya jalan
+  // ulang berkala: GET /qr tambahan + interval polling di-reset.
+  const handleQrClose = useCallback(() => setShowQr(false), []);
+  const handleQrConnected = useCallback(() => { setShowQr(false); onRefresh(); }, [onRefresh]);
+
+  const handleDelete = async () => {
+    if (!confirm(`Hapus sesi CS ${session.csName}? Koneksi akan diputus.`)) return;
+    setDeleting(true);
+    try {
+      await apiDelete(`/human-learning/sessions/${session.id}`);
+      onRefresh();
+    } catch (e: any) {
+      alert(e.message ?? 'Gagal menghapus sesi');
+      setDeleting(false);
+    }
+  };
+
+  const handleFlush = async () => {
+    setFlushing(true);
+    try {
+      // `terlaluPendek` ikut ditampilkan: sebelum Fase 68 tombol ini MENGHAPUS
+      // buffer yang belum cukup panjang lalu melaporkan "0 buffer dikirim", dan
+      // pesan itu terbaca sebagai "tidak ada apa-apa" padahal artinya
+      // "tiga percakapan baru saja dibuang". Sekarang tidak ada yang dihapus,
+      // dan angkanya disebut supaya nol bisa dijelaskan.
+      const res = await apiPost<{
+        flushedBuffers: number;
+        terlaluPendek?: number;
+        ambangMinBaris?: number;
+        message?: string;
+      }>(`/human-learning/sessions/${session.id}/flush`, {});
+      alert(res.message ?? `${res.flushedBuffers} buffer dikirim ke Shadow Mining`);
+    } catch (e: any) {
+      alert(e.message ?? 'Gagal flush buffer');
+    } finally {
+      setFlushing(false);
+    }
+  };
+
+  return (
+    <>
+      {showQr && (
+        <QrModal
+          session={session}
+          onClose={handleQrClose}
+          onConnected={handleQrConnected}
+        />
+      )}
+
+      <div className="bg-white border border-gray-100 rounded-xl shadow-sm hover:shadow-md transition-shadow">
+        {/* Main row */}
+        <div className="flex items-center gap-4 p-4">
+          {/* Avatar */}
+          <div className="w-10 h-10 rounded-full bg-blue-100 flex items-center justify-center flex-shrink-0">
+            <span className="text-blue-700 font-semibold text-sm">
+              {session.csName.slice(0, 2).toUpperCase()}
+            </span>
+          </div>
+
+          {/* Info */}
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <span className="font-medium text-gray-900 text-sm">{session.csName}</span>
+              <StatusBadge status={liveStatus} />
+            </div>
+            <div className="flex items-center gap-1 text-xs text-gray-400 mt-0.5">
+              <Phone className="w-3 h-3" />
+              <span>+{session.csPhone}</span>
+            </div>
+            {/* Nomor yang menscan QR bisa berbeda dari yang didaftarkan —
+                Baileys menautkan HP siapa pun yang menscan. Ditampilkan supaya
+                tidak lagi tak terlihat. */}
+            {session.linkedPhone && session.linkedPhone !== session.csPhone && (
+              <div className="flex items-start gap-1.5 mt-1.5 text-xs text-red-600 bg-red-50 border border-red-100 rounded-md px-2 py-1.5">
+                <ShieldAlert className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
+                <span>
+                  Tertaut ke nomor <strong>+{session.linkedPhone}</strong>, bukan nomor yang
+                  didaftarkan. Chat yang terekam milik nomor itu.
+                </span>
+              </div>
+            )}
+          </div>
+
+          {/* Stats — angka yang paling sering dilihat: bukti sesi memang mendengar.
+              Dipilih `csReplies` karena bergerak per PESAN; `totalPairsCaptured`
+              baru bergerak setelah buffer di-flush (cukup baris, atau idle lewat ambang),
+              jadi tidak bisa dipakai membedakan "sepi" dari "rusak". */}
+          <div className="hidden sm:flex flex-col items-end gap-0.5">
+            <div className="flex items-center gap-1 text-sm font-semibold text-gray-900">
+              <Reply className="w-3.5 h-3.5 text-blue-400" />
+              {session.csReplies.toLocaleString('id-ID')}
+            </div>
+            <span className="text-xs text-gray-400">pesan terbalas</span>
+            <span className="text-[10px] text-gray-300">
+              {session.buyerMessages.toLocaleString('id-ID')} masuk · {session.totalPairsCaptured} buffer
+            </span>
+          </div>
+
+          {/* Actions */}
+          <div className="flex items-center gap-1.5 flex-shrink-0">
+            {liveStatus !== 'CONNECTED' && liveStatus !== 'BANNED' && (
+              <button
+                onClick={() => setShowQr(true)}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-blue-600 border border-blue-200 rounded-lg hover:bg-blue-50 transition-colors"
+              >
+                <QrCode className="w-3.5 h-3.5" />
+                Scan QR
+              </button>
+            )}
+            {liveStatus === 'CONNECTED' && (
+              <button
+                onClick={handleFlush}
+                disabled={flushing}
+                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-emerald-600 border border-emerald-200 rounded-lg hover:bg-emerald-50 transition-colors disabled:opacity-50"
+              >
+                {flushing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Upload className="w-3.5 h-3.5" />}
+                Flush
+              </button>
+            )}
+            <button
+              onClick={() => setShowDetail(v => !v)}
+              className="p-1.5 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg"
+              title="Detail"
+            >
+              {showDetail ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+            </button>
+            <button
+              onClick={handleDelete}
+              disabled={deleting}
+              className="p-1.5 text-red-400 hover:text-red-600 hover:bg-red-50 rounded-lg disabled:opacity-50"
+              title="Hapus sesi"
+            >
+              {deleting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Trash2 className="w-4 h-4" />}
+            </button>
+          </div>
+        </div>
+
+        {/* Detail panel */}
+        {showDetail && (
+          <div className="px-4 pb-4 pt-0 border-t border-gray-50">
+            <dl className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-3 text-xs">
+              <div>
+                <dt className="text-gray-400">Terhubung sejak</dt>
+                <dd className="font-medium text-gray-700 mt-0.5">{formatRelative(session.linkedAt)}</dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Aktivitas terakhir</dt>
+                <dd className="font-medium text-gray-700 mt-0.5">{formatRelative(session.lastSeenAt)}</dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Pesan Terbalas CS</dt>
+                <dd className="font-medium text-blue-600 mt-0.5">{session.csReplies.toLocaleString('id-ID')}</dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Pesan Pembeli</dt>
+                <dd className="font-medium text-emerald-600 mt-0.5">{session.buyerMessages.toLocaleString('id-ID')}</dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Buffer Terkirim</dt>
+                <dd className="font-medium text-gray-700 mt-0.5">{session.totalPairsCaptured} buffer</dd>
+              </div>
+              <div>
+                <dt className="text-gray-400">Closing / Lost</dt>
+                <dd className="font-medium text-gray-700 mt-0.5">
+                  <span className="text-emerald-600">{session.totalClosingDetected} closing</span>{' '}
+                  <span className="text-gray-300">|</span>{' '}
+                  <span className="text-red-500">{session.totalLostDetected} lost</span>
+                </dd>
+              </div>
+            </dl>
+            
+            {/* Analytics Progress Bar */}
+            <div className="mt-4 bg-gray-50 p-3 rounded-lg border border-gray-100">
+              <div className="flex justify-between items-end mb-1.5">
+                <span className="text-xs font-semibold text-gray-700">Progres Penyerapan AI (Knowledge Extraction)</span>
+                <span className="text-xs text-gray-500">
+                  {session.totalFactsSaved + session.totalFactsDiscarded} diproses
+                </span>
+              </div>
+              
+              <div className="h-2 flex rounded-full overflow-hidden bg-gray-200">
+                {session.totalFactsSaved + session.totalFactsDiscarded > 0 ? (
+                  <>
+                    <div 
+                      style={{ width: `${(session.totalFactsSaved / (session.totalFactsSaved + session.totalFactsDiscarded)) * 100}%` }}
+                      className="bg-blue-500 hover:bg-blue-600 transition-all"
+                      title={`${session.totalFactsSaved} disimpan`}
+                    />
+                    <div 
+                      style={{ width: `${(session.totalFactsDiscarded / (session.totalFactsSaved + session.totalFactsDiscarded)) * 100}%` }}
+                      className="bg-gray-300 hover:bg-gray-400 transition-all"
+                      title={`${session.totalFactsDiscarded} dibuang`}
+                    />
+                  </>
+                ) : (
+                  <div className="w-full bg-gray-200" />
+                )}
+              </div>
+              <div className="flex justify-between text-[10px] text-gray-400 mt-1 font-medium">
+                <span className="text-blue-600">{session.totalFactsSaved} dinilai bernilai</span>
+                <span>{session.totalFactsDiscarded} basa-basi/dibuang</span>
+              </div>
+
+              {/*
+                Dua angka yang berbeda artinya JANGAN dipaksa jadi satu label.
+                Bar di atas adalah vonis Lapis 1 ("percakapan ini layak digali").
+                Baris ini jumlah dokumen yang benar-benar jadi berkas. Selisihnya
+                = gugur saat ekstraksi Lapis 2 atau ditolak Lapis 3 sebagai
+                duplikat — dan selisih itu dulu TIDAK KELIHATAN sama sekali:
+                layar bilang 20 "fakta disimpan", isi Draft_AI cuma 18 berkas.
+              */}
+              <div className="flex justify-between items-center text-[10px] mt-1.5 pt-1.5 border-t border-gray-200">
+                <span className="text-gray-500">
+                  <span className="font-semibold text-emerald-600">{session.totalDocsWritten}</span> dokumen jadi di vault
+                </span>
+                {session.totalFactsSaved > session.totalDocsWritten && (
+                  <span className="text-gray-400" title="Gugur saat ekstraksi Lapis 2, atau ditolak Lapis 3 karena duplikat">
+                    {session.totalFactsSaved - session.totalDocsWritten} tidak jadi dokumen
+                  </span>
+                )}
+              </div>
+              
+              {/* Intent Stats */}
+              {session.intentStats && Object.keys(session.intentStats).length > 0 && (
+                <div className="mt-3 pt-3 border-t border-gray-200">
+                  <span className="text-[10px] font-semibold text-gray-500 mb-1.5 block uppercase tracking-wider">Top Topik Percakapan</span>
+                  <div className="flex flex-wrap gap-1.5">
+                    {Object.entries(session.intentStats)
+                      .sort(([,a], [,b]) => b - a)
+                      .slice(0, 5)
+                      .map(([intent, count]) => (
+                        <span key={intent} className="text-[10px] bg-white border border-gray-200 text-gray-600 px-1.5 py-0.5 rounded">
+                          {intent}: <strong>{count}</strong>
+                        </span>
+                      ))}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            <BufferPanel sessionId={session.id} />
+
+            <p className="mt-3 text-[11px] text-gray-400 flex gap-1.5">
+              <Activity className="w-3.5 h-3.5 flex-shrink-0" />
+              Mode shadow: CS tetap membalas pesan secara natural. AI Layer 1 akan mengklasifikasi intent & closing, lalu Layer 2 mengekstrak strateginya ke otak bot.
+            </p>
+          </div>
+        )}
+      </div>
+    </>
+  );
+}
+
+// ─── Main Page ────────────────────────────────────────────────────────────────
+export default function HumanLearningPage() {
+  const [sessions, setSessions] = useState<CsSession[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const fetchSessions = useCallback(async () => {
+    try {
+      const data = await apiGet<{ sessions: CsSession[] }>('/human-learning/sessions');
+      setSessions(data.sessions);
+      setError(null);
+    } catch (e: any) {
+      setError(e.message ?? 'Gagal memuat sesi');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    fetchSessions();
+    // Auto-refresh setiap 15 detik untuk update liveStatus
+    const timer = setInterval(fetchSessions, 15_000);
+    return () => clearInterval(timer);
+  }, [fetchSessions]);
+
+  const connected = sessions.filter(s => s.liveStatus === 'CONNECTED').length;
+  const totalPairs = sessions.reduce((acc, s) => acc + s.totalPairsCaptured, 0);
+  const totalDocs = sessions.reduce((acc, s) => acc + (s.totalDocsWritten ?? 0), 0);
+  const totalReplies = sessions.reduce((acc, s) => acc + s.csReplies, 0);
+  const totalIncoming = sessions.reduce((acc, s) => acc + s.buyerMessages, 0);
+
+  return (
+    <div className="max-w-3xl mx-auto space-y-6">
+      {/* Header */}
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <div>
+          <h1 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+            <Users className="w-5 h-5 text-blue-500" />
+            Human Learning
+          </h1>
+          <p className="text-sm text-gray-500 mt-1">
+            Pantau percakapan CS secara transparan — pengetahuan diekstrak otomatis 24/7
+          </p>
+        </div>
+        <button
+          onClick={fetchSessions}
+          className="p-2 text-gray-400 hover:text-gray-600 hover:bg-gray-100 rounded-lg"
+          title="Refresh"
+        >
+          <RefreshCw className="w-4 h-4" />
+        </button>
+      </div>
+
+      {/* Stats row */}
+      {sessions.length > 0 && (
+        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
+          {[
+            { label: 'CS Terdaftar', value: sessions.length, icon: <Users className="w-4 h-4 text-blue-400" />, sub: null },
+            { label: 'Aktif Sekarang', value: connected, icon: <Wifi className="w-4 h-4 text-green-400" />, sub: null },
+            {
+              label: 'Pesan Terbalas',
+              value: totalReplies,
+              icon: <Reply className="w-4 h-4 text-blue-400" />,
+              sub: `${totalIncoming.toLocaleString('id-ID')} pesan pembeli masuk`,
+            },
+            {
+              label: 'Buffer Terkirim',
+              value: totalPairs,
+              icon: <BookOpen className="w-4 h-4 text-purple-400" />,
+              sub: 'baru naik setelah buffer di-flush',
+            },
+            {
+              label: 'Dokumen Jadi',
+              value: totalDocs,
+              icon: <FileCheck className="w-4 h-4 text-emerald-500" />,
+              sub: 'berkas nyata di vault, bukan vonis Lapis 1',
+            },
+          ].map(({ label, value, icon, sub }) => (
+            <div key={label} className="bg-white border border-gray-100 rounded-xl p-4 shadow-sm">
+              <div className="flex items-center gap-2 text-gray-500 text-xs mb-1">{icon}{label}</div>
+              <div className="text-2xl font-bold text-gray-900">{value.toLocaleString('id-ID')}</div>
+              {sub && <div className="text-[10px] text-gray-400 mt-0.5 leading-tight">{sub}</div>}
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Add CS form */}
+      <AddCsForm onAdded={fetchSessions} />
+
+      {/* Info box */}
+      <div className="flex gap-3 bg-blue-50 border border-blue-100 rounded-xl p-4 text-sm text-blue-700">
+        <Activity className="w-4 h-4 flex-shrink-0 mt-0.5" />
+        <div>
+          <strong>Cara kerja:</strong> Setiap CS scan QR sekali. Setelah terhubung, semua percakapan WA mereka
+          di-capture secara transparan dan dikirim ke pipeline Shadow Mining (mode <em>lenient</em>) — memfilter pengetahuan CS
+          tanpa mengganggu cara kerja mereka.
+        </div>
+      </div>
+
+      {/* Sessions list */}
+      {loading && (
+        <div className="flex items-center justify-center py-12">
+          <Loader2 className="w-6 h-6 text-gray-400 animate-spin" />
+        </div>
+      )}
+
+      {error && (
+        <div className="flex items-center gap-2 text-sm text-red-600 bg-red-50 border border-red-100 rounded-xl p-4">
+          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+          {error}
+        </div>
+      )}
+
+      {!loading && !error && sessions.length === 0 && (
+        <div className="text-center py-16 text-gray-400">
+          <Users className="w-10 h-10 mx-auto mb-3 opacity-40" />
+          <p className="font-medium text-gray-600">Belum ada CS terdaftar</p>
+          <p className="text-sm mt-1">Tambah CS di atas dan minta mereka scan QR sekali.</p>
+        </div>
+      )}
+
+      {!loading && sessions.length > 0 && (
+        <div className="space-y-3">
+          {sessions.map(session => (
+            <SessionCard key={session.id} session={session} onRefresh={fetchSessions} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}

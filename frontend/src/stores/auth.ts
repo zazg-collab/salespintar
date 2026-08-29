@@ -14,6 +14,7 @@ interface Business {
   id: string;
   name: string;
   slug: string;
+  metaCapiEnabled?: boolean;
 }
 
 interface AuthState {
@@ -26,6 +27,7 @@ interface AuthState {
   register: (businessName: string, name: string, email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   checkAuth: () => void;
+  fetchMe: () => Promise<void>;
   clearError: () => void;
 }
 
@@ -82,6 +84,25 @@ export const useAuthStore = create<AuthState>((set) => ({
 
   checkAuth: () => {
     set({ isAuthenticated: !!getAccessToken() });
+  },
+
+  /**
+   * Pulihkan `user` & `business` dari server memakai token yang tersimpan.
+   *
+   * Store ini tidak memakai middleware `persist`, jadi yang bertahan setelah
+   * refresh hanya token di localStorage — objek user hilang. Tanpa pemulihan
+   * ini, `isAuthenticated` bernilai true sementara `user` null, dan semua UI
+   * yang bergantung pada role diam-diam menghilang.
+   */
+  fetchMe: async () => {
+    if (!getAccessToken()) return;
+    try {
+      const data = await apiGet<any>('/auth/me');
+      set({ user: data.user, business: data.business, isAuthenticated: true });
+    } catch {
+      // Token kedaluwarsa/tidak sah: apiRequest sudah menangani redirect ke
+      // /login saat refresh token ikut gagal, jadi di sini cukup diam.
+    }
   },
 
   clearError: () => set({ error: null }),

@@ -32,6 +32,7 @@ import {
   DisconnectReason,
   useMultiFileAuthState,
   fetchLatestBaileysVersion,
+  extractMessageContent,
   WASocket,
   proto,
 } from '@whiskeysockets/baileys';
@@ -47,6 +48,7 @@ import { redisCache as redisClient } from '../config/redis';
 import { shadowMiningQueue } from '../queues/shadow-mining.queue';
 import { hitungBarisBerisi } from '../utils/text-chunker';
 import { LeadProfilerService } from '../modules/leads/lead-profiler.service';
+import { SessionBoundaryParser } from '../modules/leads/session-parser';
 
 // ── Konfigurasi buffer ──────────────────────────────────────────────────────
 /** Minimal baris supaya sebuah buffer layak dikirim. */
@@ -390,18 +392,33 @@ async function appendToBuffer(
   const tgl = getJakartaDateStr();
   const key = bufferKey(businessId, csPhone, contactJid, tgl);
   const lKey = lastSeenKey(businessId, csPhone, contactJid);
-  const line = `[${role}] ${text.replace(/\n/g, ' ')}`;
   const fKey = fullHistoryKey(businessId, csPhone, contactJid);
   const ts = msgTimestampMs || Date.now();
-  
+  // Langkah C Kelompok 2 (Dual-View, Temuan 48h-gap-split dead code): sebelumnya baris ini
+  // "[${role}] ${text}" TANPA timestamp -- makanya `session-parser.ts::parseLines()` selalu
+  // set timestamp null untuk baris Tagged Buffer, dan logika jeda >48 jam di segmentSessions()
+  // tidak pernah bisa hidup. `ts` di atas SUDAH menyertakan timestamp pesan WA asli (via
+  // `msgTimestampMs`/`rawMsgTs` dari Baileys `msg.messageTimestamp`, fallback ke waktu server
+  // kalau tidak ada) -- tinggal disisipkan ke format baris lewat formatBufferLine().
+  const line = SessionBoundaryParser.formatBufferLine(role, text, ts);
+
   // Simpan ke partisi tanggal harian dengan TTL 7 hari
   await redisClient.rpush(key, line);
   await redisClient.expire(key, 7 * 24 * 3600);
   
-  // Simpan ke Full History (maks 100 baris, TTL 12 jam)
+  // Simpan ke Full History (maks 100 baris, TTL 72 jam — Langkah B Fase 24, Temuan C).
+  // Sebelumnya TTL 12 jam (43200s) padahal jeda CRM mode "durasi" mendukung sampai 24 jam
+  // (lihat business.routes.ts, validasi `jam < 1 || jam > 24`) — kontak yang diam >12 jam
+  // selama jeda kehilangan buffer-nya SEBELUM jeda itu sendiri berakhir, tanpa log/alert apa
+  // pun. 72 jam dipilih supaya ada margin operasional di atas batas 24 jam mode "durasi".
+  // CATATAN RISIKO RESIDUAL (sengaja tidak ditutup di fase ini): mode "permanen" (tanpa
+  // auto-expire) masih bisa melebihi TTL manapun yang dipasang di sini — perbaikan tuntas
+  // butuh penyimpanan transkrip yang tidak bergantung TTL Redis (mis. cadangan ke Postgres
+  // saat crmPaused terdeteksi aktif), sengaja belum dikerjakan di Langkah B ini (di luar
+  // cakupan "serialize Opsi A/B" yang jadi fokus utama fase ini).
   await redisClient.rpush(fKey, line);
   await redisClient.ltrim(fKey, -100, -1);
-  await redisClient.expire(fKey, 43200);
+  await redisClient.expire(fKey, 72 * 3600);
 
   await redisClient.set(lKey, String(ts), 'EX', 7 * 24 * 3600);
 }
@@ -704,12 +721,13 @@ class HumanLearningManager {
         const isFromMe = msgKey.fromMe === true;
         const role: 'CS' | 'BUYER' = isFromMe ? 'CS' : 'BUYER';
 
-        // Ekstrak teks
+        // Ekstrak teks (dukung ephemeralMessage / Pesan Sementara via extractMessageContent)
+        const rawContent = extractMessageContent(msg.message);
         const text =
-          msg.message?.conversation ||
-          msg.message?.extendedTextMessage?.text ||
-          msg.message?.imageMessage?.caption ||
-          msg.message?.videoMessage?.caption ||
+          rawContent?.conversation ||
+          rawContent?.extendedTextMessage?.text ||
+          rawContent?.imageMessage?.caption ||
+          rawContent?.videoMessage?.caption ||
           '';
         if (!text.trim()) continue; // skip media tanpa caption, sticker, dll
 
@@ -728,8 +746,18 @@ class HumanLearningManager {
 
         await appendToBuffer(businessId, csPhone, csName, contactJid, role, text, rawMsgTs);
 
-        // Penghitung per pesan
-        await redisClient.incr(`${HL_PEND_PREFIX}${sessionId}:${role === 'CS' ? 'cs' : 'buyer'}`);
+        // Penghitung per pesan.
+        // Langkah D Fase 26 (Temuan R3): sebelumnya kunci ini TIDAK PERNAH diberi TTL/dihapus --
+        // dibuat via INCR (auto-create), lalu di commitPendingCounts() hanya di-DECRBY balik ke 0
+        // (bukan DEL), sehingga setiap sesi Human Learning meninggalkan 2 kunci ("0" selamanya) di
+        // Redis tanpa mekanisme pembersih -- kebocoran keyspace lambat tapi nyata seiring
+        // bertambahnya sesi CS baru dari waktu ke waktu. Fix: EXPIRE 30 hari (diperpanjang tiap ada
+        // aktivitas baru, sama seperti pola TTL lain di file ini), + DEL eksplisit di
+        // commitPendingCounts() begitu kedua penghitung balik ke 0 (lihat di bawah) supaya kunci
+        // yang sudah lunas tidak menunggu TTL 30 hari kalau memang sudah tidak dipakai lagi.
+        const pendKey = `${HL_PEND_PREFIX}${sessionId}:${role === 'CS' ? 'cs' : 'buyer'}`;
+        await redisClient.incr(pendKey);
+        await redisClient.expire(pendKey, 30 * 24 * 3600);
         const todayDateStr = getJakartaDateStr();
         const HL_DAILY_TTL = 7 * 24 * 3600;
         const dailyRoleKey = `hl:daily:${businessId}:${todayDateStr}:${role === 'CS' ? 'cs' : 'buyer'}`;
@@ -777,20 +805,20 @@ class HumanLearningManager {
         const bufLen = await redisClient.llen(key);
 
         // ── Realtime CRM Profiler (0-Second Latency) ──────────────────────
+        // Langkah C Kelompok 2 (Dual-View, Temuan T1): SEBELUMNYA baris ini memotong riwayat
+        // jadi head(10)+tail(25) SEBELUM masuk ke LeadProfilerService.processConversation() --
+        // akibatnya Rule Engine (segmentSessions, isDeterministicClosing, matchKnownSku di
+        // dalam processConversation) ikut buta terhadap closing yang terjadi di baris tengah
+        // yang "disembunyikan". `hl:full_history:*` sendiri SUDAH dibatasi maks 100 baris via
+        // LTRIM (Fase 24) -- jadi baca penuh di sini murah (CPU lokal, <1ms, 0 token), TIDAK
+        // butuh dipotong lagi. Kompresi head-tail dipindah HANYA ke titik pembuatan payload LLM
+        // (lead-profiler.service.ts::compressForLlm, dipanggil tepat sebelum construct prompt),
+        // supaya biaya token tetap hemat tanpa mengorbankan ketajaman Rule Engine lokal.
         if (!crmPaused) {
           const fKey = fullHistoryKey(businessId, csPhone, contactJid);
-          const totalLen = await redisClient.llen(fKey);
-          let fullTranscript = '';
-          
-          if (totalLen <= 35) {
-            const lines = await redisClient.lrange(fKey, 0, -1);
-            if (lines && lines.length > 0) fullTranscript = lines.join('\n');
-          } else {
-            const head = await redisClient.lrange(fKey, 0, 9);
-            const tail = await redisClient.lrange(fKey, -25, -1);
-            fullTranscript = head.join('\n') + `\n\n[... ${totalLen - 35} pesan disembunyikan ...]\n\n` + tail.join('\n');
-          }
-          
+          const lines = await redisClient.lrange(fKey, 0, -1);
+          const fullTranscript = lines && lines.length > 0 ? lines.join('\n') : '';
+
           if (fullTranscript) {
             LeadProfilerService.processConversation({
                 businessId,
@@ -890,6 +918,17 @@ class HumanLearningManager {
       // Baru dikurangi SETELAH DB menerima.
       if (cs) await redisClient.decrby(csKey, cs);
       if (buyer) await redisClient.decrby(buyerKey, buyer);
+
+      // Langkah D Fase 26 (Temuan R3): kalau kedua kunci sudah lunas balik ke 0 (tidak ada
+      // pesan baru yang masuk di tengah proses ini), hapus SEKARANG alih-alih membiarkannya
+      // tertinggal bernilai "0" selamanya menunggu TTL 30 hari (lihat catatan di titik INCR).
+      // Baca ulang nilai TERKINI (bukan pakai `cs`/`buyer` di atas yang sudah basi) supaya tidak
+      // menghapus kunci yang kebetulan baru dapat increment lagi persis di celah waktu ini.
+      const [csAfter, buyerAfter] = await redisClient.mget(csKey, buyerKey);
+      const csAfterNum = parseInt(csAfter ?? '0', 10) || 0;
+      const buyerAfterNum = parseInt(buyerAfter ?? '0', 10) || 0;
+      if (csAfterNum <= 0) await redisClient.del(csKey);
+      if (buyerAfterNum <= 0) await redisClient.del(buyerKey);
     } catch (err: any) {
       logger.warn(`[HL] Gagal menitipkan hitungan pesan sesi ${sessionId} (dicoba lagi nanti): ${err?.message ?? err}`);
     }

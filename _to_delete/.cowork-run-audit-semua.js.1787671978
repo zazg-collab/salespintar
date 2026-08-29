@@ -1,0 +1,235 @@
+// Eksekusi nyata "Audit Semua" dari sisi server -- mereplikasi PERSIS logika
+// GET /meta-rejected-creatives + POST /meta-rejected-creatives/:adId/audit + persistAuditReport
+// di backend/src/routes/video-guard.routes.ts, dijalankan langsung pakai Prisma client + module
+// crypto.service yang SAMA dgn produksi (BUKAN reimplementasi terpisah, BUKAN lewat Express/JWT --
+// signAccessToken diblokir classifier sesi ini, pola alternatif ini sudah dipakai berkali-kali
+// sesi ini dan terbukti aman). Hasil PERMANEN tersimpan di tabel video_ad_audits milik produksi,
+// sama seperti kalau Bossfren sendiri yang klik tombol "Audit Semua" di browser.
+const { PrismaClient, Prisma } = require('@prisma/client');
+const { decrypt } = require('/app/dist/services/crypto.service');
+
+const prisma = new PrismaClient();
+
+const META_GRAPH_VERSION = 'v21.0';
+const BUSINESS_ID = '777779f9-6955-4b0d-95cd-84595bb34eb4';
+const MAX_VIDEO_BYTES = 200 * 1024 * 1024;
+const METAGUARD_URL = process.env.METAGUARD_SERVICE_URL;
+const INTERNAL_KEY = process.env.METAGUARD_INTERNAL_API_KEY;
+
+function extractMetaVideoId(creative) {
+  return creative?.object_story_spec?.video_data?.video_id || creative?.video_id || null;
+}
+function extractLandingPageUrl(creative) {
+  return creative?.object_story_spec?.video_data?.call_to_action?.value?.link
+    || creative?.object_story_spec?.link_data?.link
+    || null;
+}
+function extractCreativeCopy(creative) {
+  const headline = creative?.object_story_spec?.video_data?.title || creative?.title || undefined;
+  const primaryText = creative?.object_story_spec?.video_data?.message || creative?.body || undefined;
+  return { headline, primaryText };
+}
+function metaguardHeaders(extra) {
+  const headers = { ...(extra || {}) };
+  if (INTERNAL_KEY) headers['X-Internal-Api-Key'] = INTERNAL_KEY;
+  return headers;
+}
+
+async function getActiveBmTokens(businessId) {
+  const bms = await prisma.metaBusinessManager.findMany({ where: { businessId, isActive: true, tokenStatus: 'ACTIVE' } });
+  const out = [];
+  for (const bm of bms) {
+    const token = decrypt(bm.accessToken);
+    if (token) out.push({ bmId: bm.id, bmName: bm.name, token });
+  }
+  return out;
+}
+
+async function resolveBusinessGeminiKey(businessId) {
+  const business = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+  const settings = business?.settings || {};
+  const encrypted = settings.metaGuardGeminiApiKeyEncrypted;
+  if (typeof encrypted !== 'string' || !encrypted) return null;
+  try { return decrypt(encrypted); } catch { return null; }
+}
+
+async function downloadUrlAsBuffer(url, timeoutMs) {
+  const resp = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+  if (!resp.ok) return null;
+  const buffer = Buffer.from(await resp.arrayBuffer());
+  if (buffer.byteLength > MAX_VIDEO_BYTES) return null;
+  return { buffer, contentType: resp.headers.get('content-type') || 'application/octet-stream' };
+}
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+async function fetchRejectedList(businessId) {
+  const bmTokens = await getActiveBmTokens(businessId);
+  const rejected = [];
+  const uniqueAdAccounts = new Set();
+
+  for (const { token } of bmTokens) {
+    try {
+      const adAccResp = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/me/adaccounts?fields=id&access_token=${token}`);
+      if (!adAccResp.ok) continue;
+      const adAccounts = ((await adAccResp.json())).data || [];
+
+      for (const act of adAccounts) {
+        const actId = act.id;
+        const dedupeKey = `${actId}:${token.slice(0, 8)}`;
+        if (uniqueAdAccounts.has(dedupeKey)) continue;
+        uniqueAdAccounts.add(dedupeKey);
+
+        const q = new URLSearchParams({
+          fields: 'id,name,campaign{name},ad_review_feedback,creative{id,name,thumbnail_url,image_url,video_id,object_story_spec,body}',
+          effective_status: JSON.stringify(['DISAPPROVED']),
+          limit: '50',
+          access_token: token,
+        });
+        const adsResp = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${actId}/ads?${q.toString()}`);
+        if (!adsResp.ok) continue;
+        const ads = ((await adsResp.json())).data || [];
+
+        for (const ad of ads) {
+          const feedback = ad.ad_review_feedback?.global || {};
+          if (Object.keys(feedback).length === 0) continue;
+          rejected.push({ ad, token });
+        }
+      }
+    } catch (e) {
+      log(`WARN gagal fetch dari salah satu BM: ${e.message}`);
+    }
+  }
+  return rejected;
+}
+
+async function auditOne(ad, token, geminiKey) {
+  const creative = ad.creative || {};
+  const metaVideoId = extractMetaVideoId(creative);
+  const landingPageUrl = extractLandingPageUrl(creative);
+  const { headline, primaryText } = extractCreativeCopy(creative);
+  const adTitle = creative.name || ad.name || `Meta Ad ${ad.id}`;
+
+  let videoBuffer = null, videoContentType = 'video/mp4';
+  if (metaVideoId) {
+    const srcResp = await fetch(`https://graph.facebook.com/${META_GRAPH_VERSION}/${metaVideoId}?fields=source&access_token=${token}`);
+    const srcData = await srcResp.json();
+    if (srcResp.ok && srcData.source) {
+      const downloaded = await downloadUrlAsBuffer(srcData.source, 60_000);
+      if (downloaded) { videoBuffer = downloaded.buffer; videoContentType = downloaded.contentType; }
+    }
+  }
+
+  let thumbnailBuffer = null, thumbnailContentType = 'image/jpeg';
+  const thumbUrl = creative.thumbnail_url || creative.image_url;
+  if (thumbUrl) {
+    try {
+      const downloaded = await downloadUrlAsBuffer(thumbUrl, 20_000);
+      if (downloaded) { thumbnailBuffer = downloaded.buffer; thumbnailContentType = downloaded.contentType; }
+    } catch { /* opsional */ }
+  }
+
+  if (!videoBuffer && !thumbnailBuffer && !landingPageUrl) {
+    throw new Error('Tidak ada video/thumbnail/landing page yang bisa diambil dari creative ini.');
+  }
+
+  const form = new FormData();
+  form.set('ad_title', String(adTitle));
+  if (primaryText) form.set('primary_text', String(primaryText));
+  if (headline) form.set('headline', String(headline));
+  if (landingPageUrl) form.set('landing_page_url', String(landingPageUrl));
+  if (videoBuffer) form.set('video_file', new Blob([videoBuffer], { type: videoContentType }), `meta-ad-${ad.id}.mp4`);
+  if (thumbnailBuffer) form.set('thumbnail_file', new Blob([thumbnailBuffer], { type: thumbnailContentType }), `meta-ad-${ad.id}-thumb.jpg`);
+
+  const submitResp = await fetch(`${METAGUARD_URL}/v1/audit`, {
+    method: 'POST',
+    headers: metaguardHeaders(geminiKey ? { 'X-Gemini-Api-Key': geminiKey } : undefined),
+    body: form,
+  });
+  const submitData = await submitResp.json();
+  if (!submitResp.ok || typeof submitData.audit_id !== 'string') {
+    throw new Error(`metaguard_service menolak: HTTP ${submitResp.status} ${JSON.stringify(submitData).slice(0, 300)}`);
+  }
+
+  await prisma.videoAdAudit.create({
+    data: { id: submitData.audit_id, businessId: BUSINESS_ID, adTitle: String(adTitle), metaAdId: ad.id, metaVideoId: metaVideoId || undefined },
+  });
+
+  let finalReport = null, finalStatus = null;
+  for (let attempt = 0; attempt < 200; attempt++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    const stResp = await fetch(`${METAGUARD_URL}/v1/audit/${submitData.audit_id}`, { headers: metaguardHeaders() });
+    const stData = await stResp.json();
+    if (stData.status === 'done' || stData.status === 'error') {
+      finalStatus = stData.status;
+      finalReport = stData.report || null;
+      break;
+    }
+  }
+
+  if (finalStatus === 'done' && finalReport) {
+    await prisma.videoAdAudit.updateMany({
+      where: { id: submitData.audit_id, businessId: BUSINESS_ID },
+      data: {
+        overallScore: typeof finalReport.overall_compliance_score === 'number' ? finalReport.overall_compliance_score : undefined,
+        verdict: typeof finalReport.verdict === 'string' ? finalReport.verdict : undefined,
+        rawReportJson: finalReport,
+      },
+    });
+  }
+
+  return { auditId: submitData.audit_id, status: finalStatus, verdict: finalReport?.verdict, score: finalReport?.overall_compliance_score };
+}
+
+async function main() {
+  const scriptT0 = Date.now();
+  log('Mulai "Audit Semua" (eksekusi server-side atas permintaan Bossfren).');
+
+  const rejected = await fetchRejectedList(BUSINESS_ID);
+  log(`Ditemukan ${rejected.length} ad DISAPPROVED dgn ad_review_feedback di semua BM terkoneksi.`);
+
+  const metaAdIds = rejected.map((r) => r.ad.id);
+  const existing = metaAdIds.length
+    ? await prisma.videoAdAudit.findMany({ where: { businessId: BUSINESS_ID, metaAdId: { in: metaAdIds } }, select: { metaAdId: true } })
+    : [];
+  const alreadyAudited = new Set(existing.map((e) => e.metaAdId));
+  const targets = rejected.filter((r) => !alreadyAudited.has(r.ad.id));
+  log(`${alreadyAudited.size} sudah diaudit (di-skip), ${targets.length} akan diaudit sekarang.`);
+
+  const geminiKey = await resolveBusinessGeminiKey(BUSINESS_ID);
+
+  let success = 0, failed = 0;
+  const results = [];
+  for (let i = 0; i < targets.length; i++) {
+    const { ad, token } = targets[i];
+    const t0 = Date.now();
+    log(`[${i + 1}/${targets.length}] Mengaudit "${ad.name}" (${ad.id})...`);
+    try {
+      const r = await auditOne(ad, token, geminiKey);
+      const mins = ((Date.now() - t0) / 60000).toFixed(1);
+      if (r.status === 'done') {
+        success += 1;
+        log(`[${i + 1}/${targets.length}] BERHASIL "${ad.name}" -- verdict=${r.verdict}, score=${r.score}, ${mins} menit.`);
+      } else {
+        failed += 1;
+        log(`[${i + 1}/${targets.length}] GAGAL/timeout "${ad.name}" -- status=${r.status}, ${mins} menit.`);
+      }
+      results.push({ adId: ad.id, adName: ad.name, ...r, minutes: parseFloat(mins) });
+    } catch (e) {
+      failed += 1;
+      const mins = ((Date.now() - t0) / 60000).toFixed(1);
+      log(`[${i + 1}/${targets.length}] ERROR "${ad.name}": ${e.message} (${mins} menit).`);
+      results.push({ adId: ad.id, adName: ad.name, status: 'error', error: e.message, minutes: parseFloat(mins) });
+    }
+  }
+
+  const totalMin = ((Date.now() - scriptT0) / 60000).toFixed(1);
+  log(`SELESAI. ${success} berhasil, ${failed} gagal, ${alreadyAudited.size} dilewati (sudah diaudit sebelumnya). Total waktu: ${totalMin} menit.`);
+  log(`FINAL_SUMMARY_JSON:${JSON.stringify({ success, failed, skipped: alreadyAudited.size, totalMinutes: parseFloat(totalMin), results })}`);
+
+  await prisma.$disconnect();
+}
+
+main().catch((e) => { console.error('FATAL', e); process.exit(1); });

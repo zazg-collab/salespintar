@@ -65,6 +65,11 @@ interface ModuleStatus {
   pendingApprovalCount: number;
   hasUrgent: boolean;
   lastRunAt: string | null;
+  // Fase 9: heartbeat real dari Bridge VPS45
+  cronStatus?: 'ok' | 'error' | 'late' | 'never' | 'unknown';
+  cronLastRun?: string | null;
+  cronLastRunRelative?: string;
+  cronFindings?: number;
 }
 
 interface ModuleDetailRule {
@@ -675,21 +680,35 @@ function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule, onTogg
                     </span>
                   </td>
 
-                  {/* Kolom Status dengan Toggle Interaktif */}
+                  {/* Kolom Status Operasional — heartbeat real + toggle */}
                   <td className="px-4 py-3.5 whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
-                    <div className="flex items-center gap-2">
-                      <button
-                        onClick={() => onToggleModule(m.moduleId, !isEnabled)}
-                        className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${isEnabled ? 'bg-emerald-600' : 'bg-gray-300'}`}
-                        role="switch"
-                        aria-checked={isEnabled}
-                        title={isEnabled ? 'Klik untuk nonaktifkan modul' : 'Klik untuk aktifkan modul'}
-                      >
-                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${isEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
-                      </button>
-                      <span className={`text-[11px] font-semibold ${isEnabled ? 'text-emerald-700' : 'text-gray-400'}`}>
-                        {isEnabled ? 'Aktif' : 'Off'}
-                      </span>
+                    <div className="flex flex-col gap-1.5">
+                      {/* Badge heartbeat real */}
+                      {!isEnabled ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-100 text-gray-400 text-[11px] font-semibold">
+                          ⚪ Nonaktif
+                        </span>
+                      ) : m.cronStatus === 'ok' ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-semibold">
+                          🟢 Normal
+                        </span>
+                      ) : m.cronStatus === 'error' ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-50 text-red-700 border border-red-200 text-[11px] font-semibold">
+                          🔴 Error
+                        </span>
+                      ) : m.cronStatus === 'late' ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-red-50 text-red-700 border border-red-200 text-[11px] font-semibold">
+                          🔴 Macet
+                        </span>
+                      ) : m.cronStatus === 'never' ? (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-gray-100 text-gray-500 text-[11px]">
+                          ⚪ Belum pernah
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-blue-50 text-blue-600 text-[11px]">
+                          🟡 Standby
+                        </span>
+                      )}
                     </div>
                   </td>
 
@@ -703,7 +722,7 @@ function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule, onTogg
                     )}
                   </td>
                   <td className="px-4 py-3.5 text-right text-gray-500 whitespace-nowrap">
-                    {m.lastRunAt ? formatWaktu(m.lastRunAt) : 'Belum pernah'}
+                    {m.cronLastRunRelative ?? (m.lastRunAt ? formatWaktu(m.lastRunAt) : 'Belum pernah')}
                   </td>
                   <td className="px-4 py-3.5 text-center" onClick={(e) => e.stopPropagation()}>
                     <button
@@ -845,6 +864,19 @@ export default function AiAdsCommandCenter() {
   const [configSaving, setConfigSaving] = useState(false);
   const [configDirty, setConfigDirty] = useState(false);
 
+  // State Global Config
+  const [globalConfig, setGlobalConfig] = useState({
+    targetRoas: 2.0,
+    targetCpa: 150000,
+    maxDailyBudgetCeiling: 500000,
+    leadActionType: 'lead',
+    revenueActionType: 'purchase'
+  });
+  const [globalConfigSaving, setGlobalConfigSaving] = useState(false);
+  const [globalConfigDirty, setGlobalConfigDirty] = useState(false);
+
+
+
   const QUEUE_LIMIT = 20;
 
   const showToast = useCallback((msg: string, ok: boolean) => {
@@ -856,6 +888,19 @@ export default function AiAdsCommandCenter() {
     try {
       setModulesLoading(true);
       const resp = await apiGet<{ ok: boolean; modules: ModuleStatus[] }>('/ai-ads/modules/status');
+
+      const gc = await apiGet<any>('/ai-ads/global-config').catch(() => null);
+      if (gc) {
+        setGlobalConfig({
+          targetRoas: gc.targetRoas ?? 2.0,
+          targetCpa: gc.targetCpa ?? 150000,
+          maxDailyBudgetCeiling: gc.maxDailyBudgetCeiling ?? 500000,
+          leadActionType: gc.leadActionType ?? 'lead',
+          revenueActionType: gc.revenueActionType ?? 'purchase'
+        });
+        setGlobalConfigDirty(false);
+      }
+
       setModules(resp.modules);
     } catch {
       showToast('Gagal memuat status modul.', false);
@@ -876,6 +921,32 @@ export default function AiAdsCommandCenter() {
       setScanningPrefix(null);
     }
   }, [showToast]);
+
+  // Radar BM Terpantau — state & fetch (Fase 9)
+  const [radarData, setRadarData] = useState<{
+    summary: { total_bm: number; total_active: number; total_standby: number; last_discovery: string | null };
+    bm_groups: Array<{ bm: { name: string; metaBusinessId?: string; picName?: string }; active: any[]; standby: any[] }>;
+  } | null>(null);
+  const [radarLoading, setRadarLoading] = useState(false);
+  const [radarSyncing, setRadarSyncing] = useState(false);
+
+  const muatRadar = useCallback(async () => {
+    try {
+      setRadarLoading(true);
+      const resp = await apiGet<any>('/ai-ads/radar-summary');
+      if (resp.ok) setRadarData(resp);
+    } catch { /* silent */ } finally { setRadarLoading(false); }
+  }, []);
+
+  const triggerDiscovery = useCallback(async () => {
+    setRadarSyncing(true);
+    try {
+      await apiPost('/ai-ads/trigger-discovery', {});
+      showToast('Discovery dimulai! Radar akan diperbarui dalam ~30 detik.', true);
+      setTimeout(() => muatRadar(), 8000);
+    } catch { showToast('Gagal memulai discovery.', false); }
+    finally { setRadarSyncing(false); }
+  }, [muatRadar, showToast]);
 
   const muatQueue = useCallback(async (page: number, routingType: string) => {
     try {
@@ -937,6 +1008,20 @@ export default function AiAdsCommandCenter() {
     }
   }, [showToast]);
 
+  
+  const simpanGlobalConfig = async () => {
+    setGlobalConfigSaving(true);
+    try {
+      await apiPut('/ai-ads/global-config', globalConfig);
+      setGlobalConfigDirty(false);
+      showToast('Konfigurasi global berhasil disimpan!', true);
+    } catch {
+      showToast('Gagal menyimpan konfigurasi global.', false);
+    } finally {
+      setGlobalConfigSaving(false);
+    }
+  };
+
   const simpanConfig = useCallback(async () => {
     if (!moduleConfig) return;
     setConfigSaving(true);
@@ -967,6 +1052,7 @@ export default function AiAdsCommandCenter() {
 
   useEffect(() => {
     muatModules();
+    muatRadar();
     muatConfig();
   }, [muatModules, muatConfig]);
 
@@ -1116,6 +1202,87 @@ export default function AiAdsCommandCenter() {
               )}
             </section>
 
+            {/* ── RADAR AKUN & BM TERPANTAU (Fase 9) ── */}
+            <section className="bg-white border border-blue-100 rounded-xl shadow-sm overflow-hidden">
+              <div className="px-5 py-3.5 bg-gradient-to-r from-blue-50 to-indigo-50 border-b border-blue-100 flex items-center justify-between flex-wrap gap-2">
+                <div>
+                  <h2 className="text-sm font-bold text-gray-800 flex items-center gap-2">
+                    🛡️ Radar Akun & BM Terpantau (Auto-Discovery)
+                  </h2>
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    Campaign aktif dipantau 24/7 · Refresh otomatis tiap hari 03:00 WIB
+                  </p>
+                </div>
+                <button
+                  onClick={triggerDiscovery}
+                  disabled={radarSyncing}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-white border border-blue-200 hover:border-blue-400 hover:bg-blue-50 text-blue-700 rounded-lg text-xs font-semibold transition-all shadow-sm disabled:opacity-50"
+                >
+                  {radarSyncing ? (
+                    <><Loader2 size={13} className="animate-spin" /> Sync berjalan...</>
+                  ) : (
+                    <><RefreshCw size={13} /> Sync & Refresh</>
+                  )}
+                </button>
+              </div>
+              {radarLoading ? (
+                <div className="flex items-center justify-center py-6 text-gray-400 text-xs">
+                  <Loader2 size={18} className="animate-spin mr-2" /> Memuat data radar...
+                </div>
+              ) : radarData ? (
+                <div className="p-4 space-y-3">
+                  {/* Summary metric row */}
+                  <div className="grid grid-cols-3 gap-3">
+                    <div className="bg-blue-50 rounded-lg p-3 text-center">
+                      <div className="text-xl font-bold text-blue-700">{radarData.summary.total_bm}</div>
+                      <div className="text-[11px] text-blue-500 mt-0.5">BM Terhubung</div>
+                    </div>
+                    <div className="bg-emerald-50 rounded-lg p-3 text-center">
+                      <div className="text-xl font-bold text-emerald-700">{radarData.summary.total_active}</div>
+                      <div className="text-[11px] text-emerald-500 mt-0.5">Campaign Aktif Dipantau</div>
+                    </div>
+                    <div className="bg-amber-50 rounded-lg p-3 text-center">
+                      <div className="text-xl font-bold text-amber-700">{radarData.summary.total_standby}</div>
+                      <div className="text-[11px] text-amber-500 mt-0.5">Standby (0 Spend)</div>
+                    </div>
+                  </div>
+                  {/* BM list */}
+                  {radarData.bm_groups.length === 0 ? (
+                    <div className="text-center text-xs text-gray-400 py-4">
+                      Belum ada BM terdaftar atau discovery belum pernah berjalan.
+                      <br/>Klik <strong>Sync & Refresh</strong> untuk mulai discovery pertama.
+                    </div>
+                  ) : (
+                    <div className="space-y-1.5">
+                      {radarData.bm_groups.map((grp, i) => (
+                        <div key={i} className="flex items-center justify-between px-3 py-2 bg-gray-50 rounded-lg border border-gray-100 text-xs">
+                          <div className="flex items-center gap-2">
+                            <span className="font-bold text-gray-800">{grp.bm?.name ?? 'BM Tidak Dikenal'}</span>
+                            {grp.bm?.picName && <span className="text-gray-400">· {grp.bm.picName}</span>}
+                          </div>
+                          <div className="flex items-center gap-2">
+                            <span className="px-2 py-0.5 bg-emerald-100 text-emerald-700 rounded-full font-semibold">{grp.active.length} aktif</span>
+                            {grp.standby.length > 0 && (
+                              <span className="px-2 py-0.5 bg-amber-100 text-amber-700 rounded-full">{grp.standby.length} standby</span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {radarData.summary.last_discovery && (
+                    <p className="text-[11px] text-gray-400 text-right">
+                      Discovery terakhir: {new Date(radarData.summary.last_discovery).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })} WIB
+                    </p>
+                  )}
+                </div>
+              ) : (
+                <div className="text-center text-xs text-gray-400 py-6">
+                  Klik <strong>Sync & Refresh</strong> untuk menjalankan discovery pertama.
+                </div>
+              )}
+            </section>
+
             {/* ── 2. KARTU STATUS MODUL (RINGKASAN SISTEM DENGAN POPUP) ── */}
             <section>
               {modulesLoading ? (
@@ -1178,7 +1345,50 @@ export default function AiAdsCommandCenter() {
         {/* TAB 2: PENGATURAN (Parameter Bagian 8 Blueprint - 7 Modul)    */}
         {/* ═══════════════════════════════════════════════════════════════ */}
         {activeTab === 'settings' && (
+
           <div className="space-y-6">
+            
+            {/* Global Config UI */}
+            <div className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm space-y-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-base font-bold text-gray-800">Konfigurasi Threshold Default Lintas BM</h2>
+                  <p className="text-xs text-gray-500 mt-0.5">Threshold pukul rata untuk semua campaign di semua akun (jika tidak ada override per-campaign).</p>
+                </div>
+                <button
+                  onClick={simpanGlobalConfig}
+                  disabled={!globalConfigDirty || globalConfigSaving}
+                  className="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold disabled:opacity-40 flex items-center gap-1.5"
+                >
+                  {globalConfigSaving ? <Loader2 size={12} className="animate-spin" /> : <CheckCircle2 size={12} />}
+                  Simpan Global
+                </button>
+              </div>
+              
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mt-4">
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Target ROAS</label>
+                  <input type="number" step="0.1" value={globalConfig.targetRoas} onChange={e => { setGlobalConfig({...globalConfig, targetRoas: parseFloat(e.target.value)}); setGlobalConfigDirty(true); }} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Target CPA (Rp)</label>
+                  <input type="number" value={globalConfig.targetCpa} onChange={e => { setGlobalConfig({...globalConfig, targetCpa: parseInt(e.target.value)}); setGlobalConfigDirty(true); }} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Max Daily Budget Ceiling (Rp)</label>
+                  <input type="number" value={globalConfig.maxDailyBudgetCeiling} onChange={e => { setGlobalConfig({...globalConfig, maxDailyBudgetCeiling: parseInt(e.target.value)}); setGlobalConfigDirty(true); }} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Event Lead API Meta</label>
+                  <input type="text" value={globalConfig.leadActionType} onChange={e => { setGlobalConfig({...globalConfig, leadActionType: e.target.value}); setGlobalConfigDirty(true); }} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                </div>
+                <div>
+                  <label className="block text-xs font-medium text-gray-700 mb-1">Event Purchase API Meta</label>
+                  <input type="text" value={globalConfig.revenueActionType} onChange={e => { setGlobalConfig({...globalConfig, revenueActionType: e.target.value}); setGlobalConfigDirty(true); }} className="w-full px-3 py-2 border border-gray-300 rounded-lg text-sm" />
+                </div>
+              </div>
+            </div>
+
             <div className="flex items-center justify-between">
               <div>
                 <h2 className="text-base font-bold text-gray-800">Parameter Modul Automasi (Bagian 8)</h2>

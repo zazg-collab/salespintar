@@ -1,0 +1,25 @@
+@@ -825,7 +825,7 @@
+         <div className="flex items-center justify-between mb-2">
+           <h1 className="text-xl font-bold text-gray-900 flex items-center gap-2">
+             <Users className="w-6 h-6 text-indigo-500" />
+-            Device & Sesi CS
++            Device & Sesi CS
+           </h1>
+           <button
+             onClick={fetchSessions}
+@@ -835,13 +835,13 @@
+           </button>
+         </div>
+         <p className="text-sm text-gray-500">
+-          Pantau percakapan CS secara transparan — pengetahuan diekstrak otomatis 24/7
++          Pantau status koneksi perangkat CS dan rekap aktivitas chat harian
+         </p>
+       </div>
+ 
+       {/* Stats row */}
+       {sessions.length > 0 && (
+-        <div className="grid grid-cols-2 lg:grid-cols-5 gap-3">
++        <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+           {[
+             { label: 'CS Terdaftar', value: sessions.length, icon: <Users className="w-4 h-4 text-blue-400" />, sub: null },
+             { label: 'Aktif Sekarang', value: connected, icon: <Wifi className="w-4 h-4 text-green-400" />, sub: null },

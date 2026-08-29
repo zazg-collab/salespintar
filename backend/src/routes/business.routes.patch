@@ -1,0 +1,172 @@
+--- a/src/routes/business.routes.ts
++++ b/src/routes/business.routes.ts
+@@ -859,2 +859,139 @@
+ 
++// GET /business/meta-ads-performance — Agregasi Performa & ROAS (Fase 4)
++router.get('/meta-ads-performance', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
++  try {
++    const { businessId } = req.user!;
++    const startDate = (req.query.startDate as string) || new Date().toISOString().split('T')[0];
++    const endDate = (req.query.endDate as string) || new Date().toISOString().split('T')[0];
++
++    const cacheKey = `salespintar:meta-perf:${businessId}:${startDate}:${endDate}`;
++    const { redisCache } = await import('../config/redis');
++    
++    const cached = await redisCache.get(cacheKey).catch(() => null);
++    if (cached) {
++      return res.json(JSON.parse(cached));
++    }
++
++    // 1. Ambil semua BM
++    const bms = await prisma.metaBusinessManager.findMany({
++      where: { businessId, isActive: true }
++    });
++
++    // 2 & 4. Kumpulkan Ad Accounts dan Insights
++    const metaCampaignsMap = new Map<string, { spend: number, campaignName: string, picName: string, status: string }>();
++    const uniqueAdAccounts = new Set<string>();
++    let accountStatus = '🟢 Semua BM Aktif';
++
++    for (const bm of bms) {
++      if (bm.tokenStatus === 'ERROR' || bm.tokenStatus === 'EXPIRED') {
++        accountStatus = '🔴 Ada BM Error/Expired';
++        continue;
++      }
++      const token = decrypt(bm.accessToken);
++      if (!token) continue;
++
++      try {
++        // Ambil ad accounts yg bisa diakses token ini
++        const adAccResp = await axios.get(`https://graph.facebook.com/v21.0/me/adaccounts?access_token=${token}`);
++        const adAccounts = adAccResp.data?.data || [];
++        
++        for (const act of adAccounts) {
++          const actId = act.id;
++          if (uniqueAdAccounts.has(actId)) continue;
++          uniqueAdAccounts.add(actId);
++
++          // Fetch insights per ad account
++          const insResp = await axios.get(`https://graph.facebook.com/v21.0/${actId}/insights`, {
++            params: {
++              level: 'campaign',
++              fields: 'spend,campaign_name,campaign_id',
++              time_range: JSON.stringify({ since: startDate, until: endDate }),
++              access_token: token
++            }
++          });
++          
++          const insights = insResp.data?.data || [];
++          for (const row of insights) {
++            const cid = row.campaign_id;
++            const spend = parseFloat(row.spend || '0');
++            if (!metaCampaignsMap.has(cid)) {
++              metaCampaignsMap.set(cid, { spend: 0, campaignName: row.campaign_name, picName: bm.picName, status: 'Active' });
++            }
++            metaCampaignsMap.get(cid)!.spend += spend;
++          }
++        }
++      } catch (err: any) {
++        logger.error(`[Meta CAPI] Gagal fetch insights BM ${bm.id}: ${err.response?.data?.error?.message || err.message}`);
++        accountStatus = '🔴 Ada BM Error/Expired';
++        if (err.response?.data?.error?.code === 190) {
++          await prisma.metaBusinessManager.update({ where: { id: bm.id }, data: { tokenStatus: 'ERROR' } });
++        }
++      }
++    }
++
++    // 5. JOIN dengan data Closing CS dari database
++    const leads = await prisma.lead.findMany({
++      where: {
++        businessId,
++        createdAt: {
++          gte: new Date(startDate + 'T00:00:00.000Z'),
++          lte: new Date(endDate + 'T23:59:59.999Z')
++        }
++      },
++      select: { campaignId: true, confirmedCodAmount: true }
++    });
++
++    let totalOmset = 0;
++    let totalSpend = 0;
++    const campaignData: any[] = [];
++    const picMap = new Map<string, { spend: number, omset: number, closing: number }>();
++
++    // Mapping Omset per campaign
++    const omsetByCampaign = new Map<string, { omset: number, leads: number }>();
++    for (const lead of leads) {
++      const cid = lead.campaignId || 'ORGANIC';
++      const amount = Number(lead.confirmedCodAmount) || 0;
++      totalOmset += amount;
++      
++      if (!omsetByCampaign.has(cid)) {
++        omsetByCampaign.set(cid, { omset: 0, leads: 0 });
++      }
++      omsetByCampaign.get(cid)!.omset += amount;
++      omsetByCampaign.get(cid)!.leads += 1;
++    }
++
++    for (const [cid, metaData] of metaCampaignsMap.entries()) {
++      totalSpend += metaData.spend;
++      const csData = omsetByCampaign.get(cid) || { omset: 0, leads: 0 };
++      
++      campaignData.push({
++        campaignId: cid,
++        campaignName: metaData.campaignName,
++        picName: metaData.picName,
++        status: metaData.status,
++        spend: metaData.spend,
++        leads: csData.leads,
++        omset: csData.omset,
++        roas: metaData.spend > 0 ? (csData.omset / metaData.spend) : 0
++      });
++
++      // Aggregate for PIC
++      if (!picMap.has(metaData.picName)) picMap.set(metaData.picName, { spend: 0, omset: 0, closing: 0 });
++      const pData = picMap.get(metaData.picName)!;
++      pData.spend += metaData.spend;
++      pData.omset += csData.omset;
++      pData.closing += csData.leads;
++    }
++
++    // Add Organic to Campaign Table
++    if (omsetByCampaign.has('ORGANIC')) {
++      const orgData = omsetByCampaign.get('ORGANIC')!;
++      campaignData.push({
++        campaignId: 'ORGANIC',
++        campaignName: 'Organik / Tidak Terlacak',
++        picName: '-',
++        status: '-',
++        spend: 0,
++        leads: orgData.leads,
++        omset: orgData.omset,
++        roas: 0
++      });
++    }
++
++    // 6 & 7 & 9. Struktur respon
++    const payload = {
++      execSummary: { totalOmset, totalSpend, realRoas: totalSpend > 0 ? (totalOmset / totalSpend) : 0, accountStatus },
++      picScorecard: Array.from(picMap.entries()).map(([name, data]) => ({
++        picName: name,
++        spend: data.spend,
++        omset: data.omset,
++        closing: data.closing,
++        roas: data.spend > 0 ? (data.omset / data.spend) : 0
++      })),
++      campaignTable: campaignData,
++      funnelStats: {
++        viewContent: 1500, // Dummy for now, real implementation depends on pixel tracking
++        lead: leads.length,
++        addToCart: 300,
++        purchase: leads.filter(l => Number(l.confirmedCodAmount) > 0).length
++      }
++    };
++
++    await redisCache.set(cacheKey, JSON.stringify(payload), 'EX', 20 * 60).catch(() => {});
++    res.json(payload);
++  } catch (err) {
++    next(err);
++  }
++});
++
+ export default router;

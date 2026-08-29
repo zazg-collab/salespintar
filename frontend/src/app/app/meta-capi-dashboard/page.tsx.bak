@@ -1,0 +1,1441 @@
+'use client';
+
+import { useState, useEffect, useCallback, useMemo } from 'react';
+import Link from 'next/link';
+import { getJakartaTodayStr, getJakartaOffsetStr, getJakartaFirstDayOfMonthStr } from '../../../lib/date';
+import { apiGet } from '../../../lib/api';
+import { useAuthStore } from '../../../stores/auth';
+import {
+  BarChart3,
+  Users,
+  MessageCircle,
+  ShoppingCart,
+  BadgeDollarSign,
+  TrendingUp,
+  RefreshCw,
+  Calendar,
+  AlertCircle,
+  Target,
+  Megaphone,
+  CheckCircle2,
+  ArrowRight,
+  ShieldCheck,
+  Layers,
+  Search,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  Filter,
+  X,
+  Building2,
+  CreditCard,
+} from 'lucide-react';
+
+interface CampaignPerformance {
+  campaignId: string;
+  campaignName: string;
+  accountName?: string;
+  accountId?: string;
+  picName: string;
+  status: string;
+  spend: number;
+  clicks: number;
+  ctr: number;
+  frequency: number;
+  impressions: number;
+  leads: number;
+  closing: number;
+  omset: number;
+  roas: number;
+}
+
+interface BestDayData {
+  days: any[];
+  bestDay: string | null;
+  lowDayName: string | null;
+  recommendation: string;
+}
+
+interface TopCreative {
+  adId: string;
+  adName: string;
+  campaignName: string;
+  spend: number;
+  ctr: number;
+  impressions: number;
+  qualityRanking: string;
+  engagementRanking: string;
+  conversionRanking: string;
+  thumbnailUrl: string | null;
+}
+
+interface MetaAdsPerformance {
+  execSummary: {
+    totalOmset: number;
+    totalSpend: number;
+    realRoas: number;
+    accountStatus: string;
+  };
+  picScorecard: {
+    picName: string;
+    spend: number;
+    omset: number;
+    closing: number;
+    roas: number;
+  }[];
+  campaignTable: CampaignPerformance[];
+  funnelStats: {
+    viewContent: number;
+    lead: number;
+    addToCart: number;
+    purchase: number;
+  };
+}
+
+export default function MetaCapiDashboardPage() {
+  const { business } = useAuthStore();
+  const [data, setData] = useState<MetaAdsPerformance | null>(null);
+  const [bestDayData, setBestDayData] = useState<BestDayData | null>(null);
+  const [topCreatives, setTopCreatives] = useState<TopCreative[]>([]);
+  const [creativesLimit, setCreativesLimit] = useState<number>(10);
+  const [insightAd, setInsightAd] = useState<TopCreative | null>(null);
+
+  const [loading, setLoading] = useState(true);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  
+  const [datePreset, setDatePreset] = useState<'today' | 'yesterday' | '7d' | '30d' | 'this_month' | 'custom'>('today');
+  const [customStart, setCustomStart] = useState(() => getJakartaOffsetStr(-6));
+  const [customEnd, setCustomEnd] = useState(() => getJakartaTodayStr());
+  const [selectedPic, setSelectedPic] = useState<string | null>(null);
+
+  // ── FILTER & SORT TABLE STATES ──
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedAccount, setSelectedAccount] = useState<string>('ALL');
+  const [sortField, setSortField] = useState<'omset' | 'spend' | 'closing' | 'roas' | 'campaignName' | 'accountName' | 'clicks' | 'ctr' | 'frequency'>('omset');
+  const [sortDirection, setSortDirection] = useState<'asc' | 'desc'>('desc');
+
+  const { startDate, endDate, dateRangeLabel } = useMemo(() => {
+    const todayStr = getJakartaTodayStr();
+    if (datePreset === 'today') return { startDate: todayStr, endDate: todayStr, dateRangeLabel: 'Hari Ini' };
+    if (datePreset === 'yesterday') {
+      const yesterdayStr = getJakartaOffsetStr(-1);
+      return { startDate: yesterdayStr, endDate: yesterdayStr, dateRangeLabel: 'Kemarin' };
+    }
+    if (datePreset === '7d') return { startDate: getJakartaOffsetStr(-6), endDate: todayStr, dateRangeLabel: '7 Hari Terakhir' };
+    if (datePreset === '30d') return { startDate: getJakartaOffsetStr(-29), endDate: todayStr, dateRangeLabel: '30 Hari Terakhir' };
+    if (datePreset === 'this_month') return { startDate: getJakartaFirstDayOfMonthStr(), endDate: todayStr, dateRangeLabel: 'Bulan Ini' };
+    return { startDate: customStart || todayStr, endDate: customEnd || todayStr, dateRangeLabel: `${customStart} s/d ${customEnd}` };
+  }, [datePreset, customStart, customEnd]);
+
+  const fetchData = useCallback(async () => {
+    setLoading(true);
+    setErrorMsg(null);
+    try {
+      const [res, bestDayRes, topRes] = await Promise.all([
+        apiGet<MetaAdsPerformance>(`/business/meta-ads-performance?startDate=${startDate}&endDate=${endDate}`),
+        apiGet<BestDayData>(`/business/meta-ads-best-day?startDate=${startDate}&endDate=${endDate}`).catch(() => null),
+        apiGet<{data: TopCreative[]}>(`/business/meta-top-creatives?startDate=${startDate}&endDate=${endDate}&limit=${creativesLimit}`).catch(() => null)
+      ]);
+      setData(res);
+      if (bestDayRes) setBestDayData(bestDayRes);
+      if (topRes) setTopCreatives(topRes.data);
+    } catch (err: any) {
+      console.error('Failed to fetch meta ads performance', err);
+      setErrorMsg(err?.message || 'Gagal memuat data performa Meta Ads.');
+    } finally {
+      setLoading(false);
+    }
+  }, [startDate, endDate, creativesLimit]);
+
+  useEffect(() => {
+    fetchData();
+  }, [fetchData]);
+
+  const formatCurrency = (val: number) => {
+    return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(val);
+  };
+
+  const handleSort = (field: 'omset' | 'spend' | 'closing' | 'roas' | 'campaignName' | 'accountName' | 'clicks' | 'ctr' | 'frequency') => {
+    if (sortField === field) {
+      setSortDirection(prev => (prev === 'asc' ? 'desc' : 'asc'));
+    } else {
+      setSortField(field);
+      setSortDirection('desc');
+    }
+  };
+
+  const availableAccounts = useMemo(() => {
+    if (!data?.campaignTable) return [];
+    const setAcc = new Set<string>();
+    data.campaignTable.forEach(c => {
+      if (c.accountName && c.accountName !== '-') setAcc.add(c.accountName);
+    });
+    return Array.from(setAcc);
+  }, [data]);
+
+  const filteredCampaigns = useMemo(() => {
+    if (!data?.campaignTable) return [];
+    
+    let result = data.campaignTable;
+
+    // Filter PIC
+    if (selectedPic) {
+      result = result.filter(c => c.picName === selectedPic);
+    }
+
+    // Filter Ad Account
+    if (selectedAccount !== 'ALL') {
+      result = result.filter(c => c.accountName === selectedAccount);
+    }
+
+    // Search Query (Campaign Name, Account Name, PIC, ID)
+    if (searchQuery.trim()) {
+      const q = searchQuery.toLowerCase().trim();
+      result = result.filter(c =>
+        (c.campaignName && c.campaignName.toLowerCase().includes(q)) ||
+        (c.accountName && c.accountName.toLowerCase().includes(q)) ||
+        (c.picName && c.picName.toLowerCase().includes(q)) ||
+        (c.campaignId && c.campaignId.toLowerCase().includes(q))
+      );
+    }
+
+    // Sort
+    return [...result].sort((a, b) => {
+      let valA: any = a[sortField];
+      let valB: any = b[sortField];
+
+      if (typeof valA === 'string') {
+        const comp = (valA || '').localeCompare(valB || '');
+        return sortDirection === 'asc' ? comp : -comp;
+      }
+
+      valA = Number(valA) || 0;
+      valB = Number(valB) || 0;
+      return sortDirection === 'asc' ? valA - valB : valB - valA;
+    });
+  }, [data, selectedPic, selectedAccount, searchQuery, sortField, sortDirection]);
+
+  const summaryCards = [
+    {
+      label: 'Total Omset CS',
+      value: formatCurrency(data?.execSummary.totalOmset || 0),
+      sub: 'Omset closing dari lead iklan',
+      icon: Target,
+      color: 'text-emerald-600',
+      bg: 'bg-emerald-50',
+      badge: 'Revenue',
+      highlight: (data?.execSummary.totalOmset || 0) > 0,
+    },
+    {
+      label: 'Total Spend Meta',
+      value: formatCurrency(data?.execSummary.totalSpend || 0),
+      sub: 'Biaya iklan Meta Ads terpakai',
+      icon: CreditCard,
+      color: 'text-rose-600',
+      bg: 'bg-rose-50',
+      badge: 'Ad Spend',
+      highlight: (data?.execSummary.totalSpend || 0) > 0,
+    },
+    {
+      label: 'Real ROAS Gabungan',
+      value: `${(data?.execSummary.realRoas || 0).toFixed(2)}x`,
+      sub: 'Total Omset ÷ Total Spend',
+      icon: TrendingUp,
+      color: 'text-indigo-600',
+      bg: 'bg-indigo-50',
+      badge: 'Efficiency',
+      highlight: (data?.execSummary.realRoas || 0) > 0,
+    },
+    {
+      label: 'Status Akun Meta',
+      value: data?.execSummary.accountStatus || 'Belum Ada BM',
+      sub: 'Koneksi Meta Business Manager',
+      icon: Megaphone,
+      color: 'text-blue-600',
+      bg: 'bg-blue-50',
+      badge: 'Account',
+      highlight: false,
+    },
+  ];
+
+  return (
+    <div className="space-y-4 pb-8 max-w-7xl mx-auto">
+      {/* ── HEADER UTAMA ── */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-gray-200 pb-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider bg-indigo-50 text-indigo-700 border border-indigo-100">
+              GROWTH & PAID TRAFFIC VIEW
+            </span>
+          </div>
+          <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2 mt-0.5">
+            <BarChart3 className="w-5 h-5 text-indigo-600" />
+            Dashboard Meta Ads
+          </h1>
+          <p className="text-xs text-gray-500">
+            Pantau performa kampanye, ROAS, funnel konversi CAPI, dan leaderboard PIC secara real-time.
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Link
+            href="/app/meta-capi"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition-colors shadow-xs"
+          >
+            <Megaphone className="w-3.5 h-3.5" />
+            Integrasi Meta CAPI
+          </Link>
+        </div>
+      </div>
+
+      {/* ── FILTER TANGGAL ── */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5 bg-white p-2.5 rounded-xl border border-gray-200 shadow-xs">
+        <div className="flex items-center gap-1.5 text-xs text-gray-600 font-semibold">
+          <Calendar className="w-3.5 h-3.5 text-gray-400" />
+          <span>Periode Analisis:</span>
+          <span className="text-gray-900 font-bold bg-gray-100 px-2 py-0.5 rounded text-xs">{dateRangeLabel}</span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1 bg-gray-100 p-1 rounded-lg">
+          {['today', 'yesterday', '7d', '30d', 'this_month', 'custom'].map((preset) => (
+            <button
+              key={preset}
+              onClick={() => setDatePreset(preset as any)}
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
+                datePreset === preset ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
+              }`}
+            >
+              {preset === 'today' ? 'Hari Ini' : preset === 'yesterday' ? 'Kemarin' : preset === '7d' ? '7 Hari' : preset === '30d' ? '30 Hari' : preset === 'this_month' ? 'Bulan Ini' : 'Custom'}
+            </button>
+          ))}
+          <button
+            onClick={fetchData}
+            disabled={loading}
+            className="p-1 ml-0.5 text-gray-500 hover:text-indigo-600 bg-white border border-gray-200 rounded-md hover:bg-indigo-50 transition-colors disabled:opacity-50"
+            title="Segarkan Data"
+          >
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+          </button>
+        </div>
+
+        {datePreset === 'custom' && (
+          <div className="flex items-center gap-1 bg-gray-50 border border-gray-200 px-2 py-1 rounded-lg">
+            <input
+              type="date"
+              value={customStart}
+              onChange={(e) => setCustomStart(e.target.value)}
+              className="px-1.5 py-0.5 text-xs bg-white border border-gray-200 rounded text-gray-700 focus:outline-none"
+            />
+            <span className="text-xs text-gray-400">-</span>
+            <input
+              type="date"
+              value={customEnd}
+              onChange={(e) => setCustomEnd(e.target.value)}
+              className="px-1.5 py-0.5 text-xs bg-white border border-gray-200 rounded text-gray-700 focus:outline-none"
+            />
+          </div>
+        )}
+      </div>
+
+      {errorMsg && (
+        <div className="p-3 bg-red-50 border border-red-200 rounded-xl text-xs text-red-700 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <span className="font-bold">⚠️ Error:</span>
+            <span>{errorMsg}</span>
+          </div>
+          <button
+            onClick={() => fetchData()}
+            className="px-2.5 py-1 bg-red-100 hover:bg-red-200 text-red-800 font-semibold rounded-md transition-colors"
+          >
+            Coba Lagi
+          </button>
+        </div>
+      )}
+
+      {/* ── 1. TOP SUMMARY SCORECARDS (4 KARTU EKSEKUTIF METRIK IKLAN) ── */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2.5">
+        {summaryCards.map((card) => (
+          <div
+            key={card.label}
+            className={`bg-white p-2.5 rounded-xl border transition-all hover:shadow-xs hover:border-indigo-200 group ${
+              card.highlight ? 'border-amber-300 ring-2 ring-amber-100' : 'border-gray-200'
+            }`}
+          >
+            <div className="flex items-center justify-between mb-1.5">
+              <div className={`w-6 h-6 ${card.bg} rounded-lg flex items-center justify-center`}>
+                <card.icon className={`w-3.5 h-3.5 ${card.color}`} />
+              </div>
+              <span className="text-[10px] font-semibold text-gray-400 uppercase tracking-wider">
+                {card.badge}
+              </span>
+            </div>
+            <p className="text-base md:text-lg font-bold text-gray-900 leading-tight">
+              {loading ? '...' : card.value}
+            </p>
+            <p className="text-[11px] font-semibold text-gray-700 mt-0.5 truncate">{card.label}</p>
+            <p className="text-[10px] text-gray-400 mt-0.5 truncate">{card.sub}</p>
+          </div>
+        ))}
+      </div>
+
+      {/* ── 2. FUNNEL EVENT CAPI (SERVER-SIDE TRACKING FLOW) ── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+        <div className="border-b border-gray-100 px-4 py-3 flex items-center justify-between bg-white">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600">
+              <TrendingUp className="w-3.5 h-3.5" />
+            </div>
+            <div>
+              <h2 className="text-xs font-bold text-gray-900">Funnel Event CAPI</h2>
+              <p className="text-[10px] text-gray-500">Pelacakan alur konversi server-side ke Meta Events Manager</p>
+            </div>
+          </div>
+          <span className="text-[10px] font-semibold bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded-full border border-indigo-100">
+            Server-Side Tracking
+          </span>
+        </div>
+
+        <div className="p-3 bg-gray-50/50">
+          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+            {/* Step 1: Pesan Masuk (ViewContent) */}
+            <div className="bg-white p-2.5 rounded-xl border border-gray-200 shadow-2xs relative">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="w-6 h-6 bg-blue-50 text-blue-600 rounded-lg flex items-center justify-center">
+                  <MessageCircle className="w-3.5 h-3.5" />
+                </div>
+                <span className="font-mono text-[10px] bg-blue-50 text-blue-700 px-1.5 py-0.5 rounded font-semibold border border-blue-100">
+                  ViewContent
+                </span>
+              </div>
+              <p className="text-base md:text-lg font-bold text-gray-900 leading-tight">
+                {loading ? '...' : data?.funnelStats?.viewContent || 0}
+              </p>
+              <p className="text-[11px] font-semibold text-gray-700 mt-0.5">Tahap 1: Pesan Masuk</p>
+              <p className="text-[10px] text-gray-400 mt-0.5">Chat pertama terkirim</p>
+            </div>
+
+            {/* Step 2: WARM (Lead) */}
+            <div className="bg-white p-2.5 rounded-xl border border-gray-200 shadow-2xs relative">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="w-6 h-6 bg-amber-50 text-amber-600 rounded-lg flex items-center justify-center">
+                  <Users className="w-3.5 h-3.5" />
+                </div>
+                <span className="font-mono text-[10px] bg-amber-50 text-amber-700 px-1.5 py-0.5 rounded font-semibold border border-amber-100">
+                  Lead
+                </span>
+              </div>
+              <p className="text-base md:text-lg font-bold text-gray-900 leading-tight">
+                {loading ? '...' : data?.funnelStats?.lead || 0}
+              </p>
+              <p className="text-[11px] font-semibold text-gray-700 mt-0.5">Tahap 2: WARM</p>
+              <p className="text-[10px] text-gray-400 mt-0.5">Pembeli membalas pesan CS</p>
+            </div>
+
+            {/* Step 3: HOT (AddToCart) */}
+            <div className="bg-white p-2.5 rounded-xl border border-gray-200 shadow-2xs relative">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="w-6 h-6 bg-purple-50 text-purple-600 rounded-lg flex items-center justify-center">
+                  <ShoppingCart className="w-3.5 h-3.5" />
+                </div>
+                <span className="font-mono text-[10px] bg-purple-50 text-purple-700 px-1.5 py-0.5 rounded font-semibold border border-purple-100">
+                  AddToCart
+                </span>
+              </div>
+              <p className="text-base md:text-lg font-bold text-gray-900 leading-tight">
+                {loading ? '...' : data?.funnelStats?.addToCart || 0}
+              </p>
+              <p className="text-[11px] font-semibold text-gray-700 mt-0.5">Tahap 3: HOT</p>
+              <p className="text-[10px] text-gray-400 mt-0.5">Masuk ke form order / mau bayar</p>
+            </div>
+
+            {/* Step 4: CLOSING (Purchase) */}
+            <div className="bg-white p-2.5 rounded-xl border border-emerald-300 ring-2 ring-emerald-100 shadow-2xs relative">
+              <div className="flex items-center justify-between mb-1.5">
+                <div className="w-6 h-6 bg-emerald-50 text-emerald-600 rounded-lg flex items-center justify-center">
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                </div>
+                <span className="font-mono text-[10px] bg-emerald-50 text-emerald-700 px-1.5 py-0.5 rounded font-semibold border border-emerald-200">
+                  Purchase
+                </span>
+              </div>
+              <p className="text-base md:text-lg font-bold text-emerald-700 leading-tight">
+                {loading ? '...' : data?.funnelStats?.purchase || 0}
+              </p>
+              <p className="text-[11px] font-semibold text-emerald-900 mt-0.5">Tahap 4: CLOSING</p>
+              <p className="text-[10px] text-emerald-600 mt-0.5">Deal / Transfer / COD disetujui</p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* ── 3. LEADERBOARD PIC MARKETING ── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+        <div className="border-b border-gray-100 px-4 py-3 flex items-center justify-between bg-white">
+          <div className="flex items-center gap-2">
+            <div className="w-6 h-6 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600">
+              <Users className="w-3.5 h-3.5" />
+            </div>
+            <div>
+              <h2 className="text-xs font-bold text-gray-900">Leaderboard PIC Marketing</h2>
+              <p className="text-[10px] text-gray-500">Evaluasi efisiensi budget & closing rate per pengiklan</p>
+            </div>
+          </div>
+        </div>
+
+        <div className="p-3 bg-gray-50/50">
+          {loading ? (
+            <div className="text-center py-6 text-gray-500 text-xs bg-white rounded-xl border border-dashed">
+              Memuat data leaderboard...
+            </div>
+          ) : !data?.picScorecard || data.picScorecard.length === 0 ? (
+            <div className="text-center py-6 text-gray-400 text-xs bg-white rounded-xl border border-dashed">
+              Belum ada data performa PIC pada periode ini.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2.5">
+              {data.picScorecard.map((pic, idx) => (
+                <div
+                  key={idx}
+                  onClick={() => setSelectedPic(selectedPic === pic.picName ? null : pic.picName)}
+                  className={`bg-white p-2.5 rounded-xl border transition-all cursor-pointer hover:shadow-xs hover:border-indigo-300 ${
+                    selectedPic === pic.picName ? 'border-indigo-500 ring-2 ring-indigo-100' : 'border-gray-200'
+                  }`}
+                >
+                  <div className="flex items-center justify-between mb-1.5">
+                    <div className="flex items-center gap-1.5">
+                      <div className="w-6 h-6 rounded-full bg-indigo-100 text-indigo-700 flex items-center justify-center text-[10px] font-bold">
+                        {pic.picName.charAt(0).toUpperCase()}
+                      </div>
+                      <h3 className="font-bold text-gray-900 text-xs truncate max-w-[110px]">{pic.picName}</h3>
+                    </div>
+                    <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border ${
+                      pic.roas >= 3.5 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                      pic.roas >= 2.5 ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                      'bg-rose-50 text-rose-700 border-rose-200'
+                    }`}>
+                      {pic.roas >= 3.5 ? '🚀 ' : pic.roas >= 2.5 ? '🟢 ' : '⚠️ '}
+                      {pic.roas.toFixed(2)}x
+                    </span>
+                  </div>
+
+                  <div className="space-y-0.5 text-[11px] pt-1 border-t border-gray-100">
+                    <div className="flex justify-between text-gray-500">
+                      <span>Spend:</span>
+                      <span className="font-semibold text-gray-700">{formatCurrency(pic.spend)}</span>
+                    </div>
+                    <div className="flex justify-between text-gray-500">
+                      <span>Omset:</span>
+                      <span className="font-semibold text-emerald-600">{formatCurrency(pic.omset)}</span>
+                    </div>
+                    <div className="flex justify-between text-gray-500">
+                      <span>Closing:</span>
+                      <span className="font-semibold text-indigo-600">{pic.closing} leads</span>
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ── 4. TABEL DRILL-DOWN CAMPAIGN (SEARCH, FILTER AKUN, & MULTI-SORT) ── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+        {/* Header & Controls */}
+        <div className="border-b border-gray-100 p-3 bg-white space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <div className="w-6 h-6 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600">
+                <Layers className="w-3.5 h-3.5" />
+              </div>
+              <div>
+                <h2 className="text-xs font-bold text-gray-900 flex items-center gap-2">
+                  Drill-down Campaign
+                  {selectedPic && (
+                    <span className="px-2 py-0.5 text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-md">
+                      PIC: {selectedPic}
+                    </span>
+                  )}
+                  {selectedAccount !== 'ALL' && (
+                    <span className="px-2 py-0.5 text-[10px] font-semibold bg-sky-50 text-sky-700 border border-sky-200 rounded-md">
+                      Akun: {selectedAccount}
+                    </span>
+                  )}
+                </h2>
+                <p className="text-[10px] text-gray-500">
+                  Menampilkan {filteredCampaigns.length} kampanye (klik header kolom untuk mengurutkan data)
+                </p>
+              </div>
+            </div>
+
+            {(selectedPic || selectedAccount !== 'ALL' || searchQuery) && (
+              <button
+                onClick={() => {
+                  setSelectedPic(null);
+                  setSelectedAccount('ALL');
+                  setSearchQuery('');
+                }}
+                className="inline-flex items-center gap-1 text-[11px] text-rose-600 hover:text-rose-700 font-semibold bg-rose-50 hover:bg-rose-100 px-2 py-1 rounded-md transition-colors w-fit"
+              >
+                <X className="w-3 h-3" />
+                Reset Semua Filter
+              </button>
+            )}
+          </div>
+
+          {/* Search Bar & Dropdown Filter */}
+          <div className="flex flex-col sm:flex-row items-center gap-2 pt-1">
+            {/* Search Input */}
+            <div className="relative flex-1 w-full">
+              <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Cari nama campaign, akun iklan, PIC, atau ID..."
+                className="w-full pl-8 pr-8 py-1.5 text-xs bg-gray-50/50 border border-gray-200 rounded-lg text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:bg-white transition-all"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* Filter Akun Iklan */}
+            <div className="flex items-center gap-1.5 w-full sm:w-auto">
+              <Filter className="w-3.5 h-3.5 text-gray-400 hidden sm:block" />
+              <select
+                value={selectedAccount}
+                onChange={(e) => setSelectedAccount(e.target.value)}
+                className="w-full sm:w-48 px-2.5 py-1.5 text-xs bg-gray-50/50 border border-gray-200 rounded-lg text-gray-700 font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:bg-white"
+              >
+                <option value="ALL">Semua Akun Iklan ({availableAccounts.length})</option>
+                {availableAccounts.map((acc) => (
+                  <option key={acc} value={acc}>
+                    {acc}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs text-gray-600">
+            <thead className="bg-gray-50/90 text-gray-700 text-[11px] uppercase font-bold border-b border-gray-200 select-none">
+              <tr>
+                {/* Campaign */}
+                <th
+                  onClick={() => handleSort('campaignName')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors sticky left-0 bg-gray-50/90 z-10 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.1)]"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Campaign</span>
+                    {sortField === 'campaignName' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Akun Iklan */}
+                <th
+                  onClick={() => handleSort('accountName')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Akun Iklan</span>
+                    {sortField === 'accountName' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* PIC */}
+                <th className="px-4 py-2.5 whitespace-nowrap">
+                  <span>PIC</span>
+                </th>
+
+                {/* Spend */}
+                <th
+                  onClick={() => handleSort('spend')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Spend</span>
+                    {sortField === 'spend' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Clicks */}
+                <th
+                  onClick={() => handleSort('clicks')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Clicks</span>
+                    {sortField === 'clicks' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* CTR */}
+                <th
+                  onClick={() => handleSort('ctr')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>CTR</span>
+                    {sortField === 'ctr' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Frequency */}
+                <th
+                  onClick={() => handleSort('frequency')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Freq</span>
+                    {sortField === 'frequency' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Omset CS */}
+                <th
+                  onClick={() => handleSort('omset')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Omset CS</span>
+                    {sortField === 'omset' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Closing */}
+                <th
+                  onClick={() => handleSort('closing')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Closing</span>
+                    {sortField === 'closing' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* ROAS */}
+                <th
+                  onClick={() => handleSort('roas')}
+                  className="px-4 py-2.5 text-right cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center justify-end gap-1">
+                    <span>ROAS</span>
+                    {sortField === 'roas' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {loading ? (
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400">Memuat data kampanye...</td></tr>
+              ) : filteredCampaigns.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-gray-400">
+                    {searchQuery || selectedAccount !== 'ALL' || selectedPic
+                      ? 'Tidak ada kampanye yang cocok dengan filter / pencarian.'
+                      : 'Tidak ada kampanye pada periode ini.'}
+                  </td>
+                </tr>
+              ) : (
+                filteredCampaigns.map((c, idx) => (
+                  <tr key={idx} className="hover:bg-indigo-50/30 transition-colors group">
+                    {/* Campaign Name & Status */}
+                    <td className="px-4 py-2.5 font-medium text-gray-900 sticky left-0 bg-white z-10 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)] group-hover:bg-indigo-50/30">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                          c.status === 'Active' ? 'bg-emerald-500' : 'bg-gray-400'
+                        }`} />
+                        <span className="font-semibold text-gray-900 group-hover:text-indigo-600 transition-colors">
+                          {c.campaignName}
+                        </span>
+                        {c.status && c.status !== '-' && (
+                          <span className={`text-[9px] px-1.5 py-0.2 rounded font-semibold ${
+                            c.status === 'Active'
+                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                              : 'bg-gray-100 text-gray-600 border border-gray-200'
+                          }`}>
+                            {c.status}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Akun Iklan */}
+                    <td className="px-4 py-2.5 text-gray-700">
+                      <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-gray-100 text-gray-800 border border-gray-200">
+                        <Building2 className="w-3 h-3 text-gray-500" />
+                        <span>{c.accountName || '-'}</span>
+                      </div>
+                    </td>
+
+                    {/* PIC */}
+                    <td className="px-4 py-2.5 text-gray-600">
+                      <span className="font-medium">{c.picName || '-'}</span>
+                    </td>
+
+                    {/* Spend */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700">
+                      {formatCurrency(c.spend)}
+                    </td>
+
+                    {/* Clicks */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700">
+                      {new Intl.NumberFormat('id-ID').format(c.clicks || 0)}
+                    </td>
+
+                    {/* CTR */}
+                    <td className="px-3 py-2.5">
+                      <span className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold border inline-block ${
+                        (c.ctr || 0) > 2.5 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                        (c.ctr || 0) > 1.5 ? 'bg-amber-50 text-amber-700 border-amber-200' :
+                        'bg-rose-50 text-rose-700 border-rose-200'
+                      }`}>
+                        {(c.ctr || 0).toFixed(2)}%
+                      </span>
+                    </td>
+
+                    {/* Frequency */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700">
+                      <div className="flex items-center gap-1">
+                        <span>{(c.frequency || 0).toFixed(2)}x</span>
+                        {(c.frequency || 0) > 2.5 && (
+                          <span title="Ad Fatigue Warning">
+                            <AlertCircle className="w-3 h-3 text-amber-500" />
+                          </span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Omset CS */}
+                    <td className="px-4 py-2.5 text-emerald-600 font-semibold">
+                      {formatCurrency(c.omset)}
+                    </td>
+
+                    {/* Closing */}
+                    <td className="px-4 py-2.5 font-medium">
+                      {c.closing} order
+                    </td>
+
+                    {/* ROAS */}
+                    <td className="px-4 py-2.5 text-right">
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border inline-block ${
+                        c.roas >= 3.5 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                        c.roas >= 2.5 ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                        'bg-rose-50 text-rose-700 border-rose-200'
+                      }`}>
+                        {c.roas >= 3.5 ? '🚀 ' : c.roas >= 2.5 ? '🟢 ' : '⚠️ '}
+                        {c.roas.toFixed(2)}x
+                      </span>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── BEST DAY TO RUN ADS WIDGET ── */}
+      {bestDayData && (
+        <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+          <div className="border-b border-gray-100 px-4 py-3 flex items-center justify-between bg-white">
+            <div className="flex items-center gap-2">
+              <div className="w-6 h-6 rounded-lg bg-amber-50 flex items-center justify-center text-amber-600">
+                <Calendar className="w-3.5 h-3.5" />
+              </div>
+              <div>
+                <h2 className="text-xs font-bold text-gray-900">Best Day to Run Ads</h2>
+                <p className="text-[10px] text-gray-500">Analisis performa harian berdasarkan ROAS dan Konversi CS</p>
+              </div>
+            </div>
+            {bestDayData.bestDay && (
+              <span className="text-[10px] font-semibold bg-amber-50 text-amber-700 px-2 py-0.5 rounded-full border border-amber-200 flex items-center gap-1">
+                ⭐ Peak Day: {bestDayData.bestDay}
+              </span>
+            )}
+          </div>
+          
+          <div className="p-4 bg-gray-50/50">
+            <div className="grid grid-cols-2 md:grid-cols-7 gap-2">
+              {['Minggu', 'Senin', 'Selasa', 'Rabu', 'Kamis', 'Jumat', 'Sabtu'].map((dayName, idx) => {
+                const dayData = bestDayData.days.find(d => d.dayOfWeek === idx);
+                const isBest = bestDayData.bestDay === dayName;
+                const isLow = bestDayData.lowDayName === dayName;
+                
+                return (
+                  <div key={dayName} className={`bg-white p-3 rounded-xl border ${isBest ? 'border-amber-400 ring-2 ring-amber-100 shadow-md relative' : isLow ? 'border-gray-200 opacity-60' : 'border-gray-200'}`}>
+                    {isBest && <div className="absolute -top-2 -right-2 bg-amber-400 text-white text-[9px] font-bold px-1.5 py-0.5 rounded shadow-sm">#1 JUARA</div>}
+                    <h3 className="font-bold text-gray-900 text-sm mb-2 text-center">{dayName}</h3>
+                    
+                    <div className="space-y-1.5 text-[10px]">
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-500">Spend</span>
+                        <span className="font-mono font-semibold text-gray-700">{dayData ? formatCurrency(dayData.spend) : '-'}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-500">Omset</span>
+                        <span className="font-mono font-semibold text-emerald-600">{dayData ? formatCurrency(dayData.omset) : '-'}</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-gray-500">ROAS</span>
+                        <span className={`font-mono font-bold ${(dayData?.roas || 0) > 2 ? 'text-indigo-600' : 'text-gray-600'}`}>
+                          {dayData && dayData.spend > 0 ? `${dayData.roas.toFixed(2)}x` : '-'}
+                        </span>
+                      </div>
+                    </div>
+                    
+                    {/* Score Bar */}
+                    <div className="mt-3 h-1.5 w-full bg-gray-100 rounded-full overflow-hidden">
+                      <div 
+                        className={`h-full ${isBest ? 'bg-amber-400' : 'bg-indigo-400'}`} 
+                        style={{ width: `${Math.min(100, (dayData?.score || 0) * 100)}%` }} 
+                      />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div className="mt-4 p-3 bg-indigo-50 border border-indigo-100 rounded-lg text-xs text-indigo-800 flex items-start gap-2">
+              <span className="text-lg">💡</span>
+              <p>{bestDayData.recommendation}</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── TOP CREATIVES WIDGET ── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+          <div className="border-b border-gray-100 px-4 py-3 flex items-center justify-between bg-white">
+            <div className="flex items-center gap-2">
+              <div className="w-6 h-6 rounded-lg bg-emerald-50 flex items-center justify-center text-emerald-600">
+                <ArrowUp className="w-3.5 h-3.5" />
+              </div>
+              <div>
+                <h2 className="text-xs font-bold text-gray-900">Top Creatives by CTR</h2>
+                <p className="text-[10px] text-gray-500">Materi iklan dengan click-through-rate tertinggi</p>
+              </div>
+            </div>
+            <select
+              value={creativesLimit}
+              onChange={(e) => setCreativesLimit(Number(e.target.value))}
+              className="px-2 py-1 text-[11px] bg-gray-50 border border-gray-200 rounded-md text-gray-700"
+            >
+              <option value={5}>Top 5</option>
+              <option value={10}>Top 10</option>
+              <option value={20}>Top 20</option>
+            </select>
+          </div>
+          
+          <div className="p-4 bg-gray-50/50">
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-5 gap-3">
+              {topCreatives.map((ad, idx) => (
+                <div key={ad.adId} className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-xs hover:shadow-md transition-all flex flex-col group relative">
+                  <div className="absolute top-2 left-2 bg-black/60 text-white text-[10px] font-bold px-1.5 py-0.5 rounded backdrop-blur-sm z-10">
+                    #{idx + 1}
+                  </div>
+                  
+                  {/* Thumbnail Container */}
+                  <div className="w-full h-32 bg-gray-100 relative flex items-center justify-center overflow-hidden border-b border-gray-100">
+                    {ad.thumbnailUrl ? (
+                      <img src={ad.thumbnailUrl} alt={ad.adName} className="object-cover w-full h-full group-hover:scale-105 transition-transform duration-300" />
+                    ) : (
+                      <span className="text-[10px] text-gray-400">No Image</span>
+                    )}
+                  </div>
+                  
+                  <div className="p-2.5 flex flex-col flex-grow">
+                    <h3 className="font-bold text-gray-900 text-xs truncate" title={ad.adName}>{ad.adName}</h3>
+                    <p className="text-[9px] text-gray-500 truncate mb-2" title={ad.campaignName}>{ad.campaignName}</p>
+                    
+                    <div className="flex justify-between items-center mb-1">
+                      <span className="text-[10px] text-gray-500">CTR</span>
+                      <span className="font-mono text-xs font-bold text-emerald-600">{ad.ctr.toFixed(2)}%</span>
+                    </div>
+                    
+                    <div className="flex justify-between items-center mb-3">
+                      <span className="text-[10px] text-gray-500">Spend</span>
+                      <span className="font-mono text-[10px] font-semibold text-gray-700">{formatCurrency(ad.spend)}</span>
+                    </div>
+                    
+                    <div className="mt-auto">
+                      {ad.qualityRanking === 'DATA_INSUFFICIENT' ? (
+                        <div className="text-[9px] font-medium text-gray-500 bg-gray-100 px-1.5 py-1 rounded text-center truncate">
+                          ⚪ Belum cukup tayangan
+                        </div>
+                      ) : (
+                        <div className={`text-[9px] font-bold px-1.5 py-1 rounded text-center truncate ${
+                          ad.qualityRanking.includes('BELOW') ? 'bg-rose-50 text-rose-700 border border-rose-200' :
+                          ad.qualityRanking.includes('ABOVE') ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' :
+                          'bg-blue-50 text-blue-700 border border-blue-200'
+                        }`}>
+                          {ad.qualityRanking.replace(/_/g, ' ')}
+                        </div>
+                      )}
+                    </div>
+                    
+                    <button 
+                      onClick={() => setInsightAd(ad)}
+                      className="mt-2 w-full py-1.5 text-[10px] font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 rounded-lg transition-colors border border-indigo-100"
+                    >
+                      💡 Insight
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+            {topCreatives.length === 0 && !loading && (
+              <div className="text-center py-8 text-gray-400 text-xs border-t border-dashed rounded-b-xl">
+                Belum ada data creative dengan tayangan memadai (min. 100 imp).
+              </div>
+            )}
+          </div>
+        </div>
+
+      {/* ── 4. TABEL DRILL-DOWN CAMPAIGN (SEARCH, FILTER AKUN, & MULTI-SORT) ── */}
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+        {/* Header & Controls */}
+        <div className="border-b border-gray-100 p-3 bg-white space-y-3">
+          <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <div className="w-6 h-6 rounded-lg bg-indigo-50 flex items-center justify-center text-indigo-600">
+                <Layers className="w-3.5 h-3.5" />
+              </div>
+              <div>
+                <h2 className="text-xs font-bold text-gray-900 flex items-center gap-2">
+                  Drill-down Campaign
+                  {selectedPic && (
+                    <span className="px-2 py-0.5 text-[10px] font-semibold bg-indigo-50 text-indigo-700 border border-indigo-200 rounded-md">
+                      PIC: {selectedPic}
+                    </span>
+                  )}
+                  {selectedAccount !== 'ALL' && (
+                    <span className="px-2 py-0.5 text-[10px] font-semibold bg-sky-50 text-sky-700 border border-sky-200 rounded-md">
+                      Akun: {selectedAccount}
+                    </span>
+                  )}
+                </h2>
+                <p className="text-[10px] text-gray-500">
+                  Menampilkan {filteredCampaigns.length} kampanye (klik header kolom untuk mengurutkan data)
+                </p>
+              </div>
+            </div>
+
+            {(selectedPic || selectedAccount !== 'ALL' || searchQuery) && (
+              <button
+                onClick={() => {
+                  setSelectedPic(null);
+                  setSelectedAccount('ALL');
+                  setSearchQuery('');
+                }}
+                className="inline-flex items-center gap-1 text-[11px] text-rose-600 hover:text-rose-700 font-semibold bg-rose-50 hover:bg-rose-100 px-2 py-1 rounded-md transition-colors w-fit"
+              >
+                <X className="w-3 h-3" />
+                Reset Semua Filter
+              </button>
+            )}
+          </div>
+
+          {/* Search Bar & Dropdown Filter */}
+          <div className="flex flex-col sm:flex-row items-center gap-2 pt-1">
+            {/* Search Input */}
+            <div className="relative flex-1 w-full">
+              <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Cari nama campaign, akun iklan, PIC, atau ID..."
+                className="w-full pl-8 pr-8 py-1.5 text-xs bg-gray-50/50 border border-gray-200 rounded-lg text-gray-900 placeholder:text-gray-400 focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:bg-white transition-all"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-2.5 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            {/* Filter Akun Iklan */}
+            <div className="flex items-center gap-1.5 w-full sm:w-auto">
+              <Filter className="w-3.5 h-3.5 text-gray-400 hidden sm:block" />
+              <select
+                value={selectedAccount}
+                onChange={(e) => setSelectedAccount(e.target.value)}
+                className="w-full sm:w-48 px-2.5 py-1.5 text-xs bg-gray-50/50 border border-gray-200 rounded-lg text-gray-700 font-medium focus:outline-none focus:ring-2 focus:ring-indigo-500/20 focus:border-indigo-500 focus:bg-white"
+              >
+                <option value="ALL">Semua Akun Iklan ({availableAccounts.length})</option>
+                {availableAccounts.map((acc) => (
+                  <option key={acc} value={acc}>
+                    {acc}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs text-gray-600">
+            <thead className="bg-gray-50/90 text-gray-700 text-[11px] uppercase font-bold border-b border-gray-200 select-none">
+              <tr>
+                {/* Campaign */}
+                <th
+                  onClick={() => handleSort('campaignName')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors sticky left-0 bg-gray-50/90 z-10 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.1)]"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Campaign</span>
+                    {sortField === 'campaignName' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Akun Iklan */}
+                <th
+                  onClick={() => handleSort('accountName')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Akun Iklan</span>
+                    {sortField === 'accountName' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* PIC */}
+                <th className="px-4 py-2.5 whitespace-nowrap">
+                  <span>PIC</span>
+                </th>
+
+                {/* Spend */}
+                <th
+                  onClick={() => handleSort('spend')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Spend</span>
+                    {sortField === 'spend' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Clicks */}
+                <th
+                  onClick={() => handleSort('clicks')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Clicks</span>
+                    {sortField === 'clicks' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* CTR */}
+                <th
+                  onClick={() => handleSort('ctr')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>CTR</span>
+                    {sortField === 'ctr' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Frequency */}
+                <th
+                  onClick={() => handleSort('frequency')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Freq</span>
+                    {sortField === 'frequency' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Omset CS */}
+                <th
+                  onClick={() => handleSort('omset')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Omset CS</span>
+                    {sortField === 'omset' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* Closing */}
+                <th
+                  onClick={() => handleSort('closing')}
+                  className="px-4 py-2.5 whitespace-nowrap cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center gap-1">
+                    <span>Closing</span>
+                    {sortField === 'closing' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+
+                {/* ROAS */}
+                <th
+                  onClick={() => handleSort('roas')}
+                  className="px-4 py-2.5 text-right cursor-pointer hover:bg-gray-100/80 transition-colors"
+                >
+                  <div className="flex items-center justify-end gap-1">
+                    <span>ROAS</span>
+                    {sortField === 'roas' ? (
+                      sortDirection === 'asc' ? <ArrowUp className="w-3 h-3 text-indigo-600" /> : <ArrowDown className="w-3 h-3 text-indigo-600" />
+                    ) : (
+                      <ArrowUpDown className="w-3 h-3 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {loading ? (
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-gray-400">Memuat data kampanye...</td></tr>
+              ) : filteredCampaigns.length === 0 ? (
+                <tr>
+                  <td colSpan={7} className="px-4 py-8 text-center text-gray-400">
+                    {searchQuery || selectedAccount !== 'ALL' || selectedPic
+                      ? 'Tidak ada kampanye yang cocok dengan filter / pencarian.'
+                      : 'Tidak ada kampanye pada periode ini.'}
+                  </td>
+                </tr>
+              ) : (
+                filteredCampaigns.map((c, idx) => (
+                  <tr key={idx} className="hover:bg-indigo-50/30 transition-colors group">
+                    {/* Campaign Name & Status */}
+                    <td className="px-4 py-2.5 font-medium text-gray-900 sticky left-0 bg-white z-10 shadow-[2px_0_5px_-2px_rgba(0,0,0,0.05)] group-hover:bg-indigo-50/30">
+                      <div className="flex items-center gap-1.5">
+                        <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${
+                          c.status === 'Active' ? 'bg-emerald-500' : 'bg-gray-400'
+                        }`} />
+                        <span className="font-semibold text-gray-900 group-hover:text-indigo-600 transition-colors">
+                          {c.campaignName}
+                        </span>
+                        {c.status && c.status !== '-' && (
+                          <span className={`text-[9px] px-1.5 py-0.2 rounded font-semibold ${
+                            c.status === 'Active'
+                              ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                              : 'bg-gray-100 text-gray-600 border border-gray-200'
+                          }`}>
+                            {c.status}
+                          </span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Akun Iklan */}
+                    <td className="px-4 py-2.5 text-gray-700">
+                      <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded text-[11px] font-medium bg-gray-100 text-gray-800 border border-gray-200">
+                        <Building2 className="w-3 h-3 text-gray-500" />
+                        <span>{c.accountName || '-'}</span>
+                      </div>
+                    </td>
+
+                    {/* PIC */}
+                    <td className="px-4 py-2.5 text-gray-600">
+                      <span className="font-medium">{c.picName || '-'}</span>
+                    </td>
+
+                    {/* Spend */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700">
+                      {formatCurrency(c.spend)}
+                    </td>
+
+                    {/* Clicks */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700">
+                      {new Intl.NumberFormat('id-ID').format(c.clicks || 0)}
+                    </td>
+
+                    {/* CTR */}
+                    <td className="px-3 py-2.5">
+                      <span className={`px-2 py-0.5 rounded font-mono text-[10px] font-bold border inline-block ${
+                        (c.ctr || 0) > 2.5 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                        (c.ctr || 0) > 1.5 ? 'bg-amber-50 text-amber-700 border-amber-200' :
+                        'bg-rose-50 text-rose-700 border-rose-200'
+                      }`}>
+                        {(c.ctr || 0).toFixed(2)}%
+                      </span>
+                    </td>
+
+                    {/* Frequency */}
+                    <td className="px-3 py-2.5 font-mono text-xs tabular-nums text-gray-700">
+                      <div className="flex items-center gap-1">
+                        <span>{(c.frequency || 0).toFixed(2)}x</span>
+                        {(c.frequency || 0) > 2.5 && (
+                          <span title="Ad Fatigue Warning">
+                            <AlertCircle className="w-3 h-3 text-amber-500" />
+                          </span>
+                        )}
+                      </div>
+                    </td>
+
+                    {/* Omset CS */}
+                    <td className="px-4 py-2.5 text-emerald-600 font-semibold">
+                      {formatCurrency(c.omset)}
+                    </td>
+
+                    {/* Closing */}
+                    <td className="px-4 py-2.5 font-medium">
+                      {c.closing} order
+                    </td>
+
+                    {/* ROAS */}
+                    <td className="px-4 py-2.5 text-right">
+                      <span className={`px-2 py-0.5 rounded-full text-[10px] font-bold border inline-block ${
+                        c.roas >= 3.5 ? 'bg-emerald-50 text-emerald-700 border-emerald-200' :
+                        c.roas >= 2.5 ? 'bg-blue-50 text-blue-700 border-blue-200' :
+                        'bg-rose-50 text-rose-700 border-rose-200'
+                      }`}>
+                        {c.roas >= 3.5 ? '🚀 ' : c.roas >= 2.5 ? '🟢 ' : '⚠️ '}
+                        {c.roas.toFixed(2)}x
+                      </span>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* Insight Modal */}
+      {insightAd && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/40 backdrop-blur-sm">
+          <div className="bg-white rounded-2xl shadow-xl max-w-md w-full overflow-hidden border border-gray-200">
+            <div className="p-4 border-b border-gray-100 flex justify-between items-center">
+              <h3 className="font-bold text-gray-900 text-sm flex items-center gap-2">
+                <span className="text-xl">💡</span> Ad Insight
+              </h3>
+              <button onClick={() => setInsightAd(null)} className="text-gray-400 hover:text-gray-600">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+            <div className="p-5 space-y-4">
+              <div>
+                <p className="text-[10px] text-gray-500 uppercase font-bold tracking-wider mb-1">Creative</p>
+                <p className="text-sm font-semibold text-gray-900">{insightAd.adName}</p>
+              </div>
+              
+              <div className="bg-gray-50 p-3 rounded-xl border border-gray-200 space-y-3">
+                <div>
+                  <div className="flex justify-between mb-1 text-xs">
+                    <span className="text-gray-600">Quality Ranking</span>
+                    <span className="font-bold text-gray-900">{insightAd.qualityRanking.replace(/_/g, ' ')}</span>
+                  </div>
+                  <div className="flex justify-between mb-1 text-xs">
+                    <span className="text-gray-600">Engagement Ranking</span>
+                    <span className="font-bold text-gray-900">{insightAd.engagementRanking.replace(/_/g, ' ')}</span>
+                  </div>
+                  <div className="flex justify-between mb-1 text-xs">
+                    <span className="text-gray-600">Conversion Ranking</span>
+                    <span className="font-bold text-gray-900">{insightAd.conversionRanking.replace(/_/g, ' ')}</span>
+                  </div>
+                </div>
+              </div>
+              
+              <div className="bg-indigo-50 p-3 rounded-xl border border-indigo-100">
+                <h4 className="text-xs font-bold text-indigo-900 mb-1">Rekomendasi Tindakan:</h4>
+                <p className="text-[11px] text-indigo-700 leading-relaxed">
+                  {insightAd.qualityRanking === 'DATA_INSUFFICIENT' ? 
+                    'Iklan ini belum memiliki cukup data (diperlukan minimal 500 tayangan) untuk dinilai oleh Meta. Biarkan berjalan untuk mengumpulkan data lebih banyak.' :
+                    insightAd.qualityRanking.includes('BELOW') ? 
+                    'Kualitas materi iklan ini berada di bawah rata-rata dibandingkan iklan sejenis. Pertimbangkan untuk mengganti visual atau headline agar lebih relevan dengan audiens target.' :
+                    insightAd.ctr > 2 ? 
+                    'Creative ini memiliki CTR yang sangat baik. Pertimbangkan untuk melakukan scale up budget pada campaign ini dan jadikan materi iklan ini sebagai winning template untuk materi selanjutnya.' :
+                    'Performa cukup stabil. Terus pantau Frequency agar audiens tidak jenuh (Ad Fatigue).'
+                  }
+                </p>
+              </div>
+              
+              <button 
+                onClick={() => setInsightAd(null)}
+                className="w-full py-2 bg-indigo-600 text-white text-xs font-bold rounded-xl hover:bg-indigo-700 transition-colors"
+              >
+                Tutup
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
+

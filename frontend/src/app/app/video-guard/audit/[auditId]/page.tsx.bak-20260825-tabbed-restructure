@@ -1,0 +1,354 @@
+'use client';
+
+import React, { useEffect, useRef, useState } from 'react';
+import { useParams } from 'next/navigation';
+import Link from 'next/link';
+import { ArrowLeft, Loader2, CheckCircle2, XCircle, AlertTriangle, ListChecks, X, Info } from 'lucide-react';
+import { apiGet } from '../../../../../lib/api';
+
+interface ChannelScores {
+  visual_motion_score?: number | null;
+  audio_speech_score?: number | null;
+  text_copy_score?: number | null;
+  thumbnail_image_score?: number | null;
+  landing_page_score?: number | null;
+}
+
+interface ViolationDetail {
+  id: string;
+  channel: string;
+  risk_level: 'LOW' | 'MEDIUM' | 'HIGH';
+  detected_element: string;
+  remediation: string;
+  policy_reference: string;
+  timestamp_start?: string | null;
+  timestamp_end?: string | null;
+}
+
+interface RawAssessment {
+  ad_title: string;
+  channel_scores: ChannelScores;
+  violations: ViolationDetail[];
+  clarification_questions: unknown[];
+  remediation_assets: {
+    safe_captions: string[];
+    safe_voiceover_script?: string | null;
+    visual_cut_instructions: string[];
+    landing_page_fixes: string[];
+  };
+  executive_summary: string;
+}
+
+interface ComplianceAuditReport {
+  audit_id: string;
+  raw_assessment: RawAssessment;
+  overall_compliance_score: number;
+  verdict: 'APPROVED' | 'NEEDS_MINOR_TWEAK' | 'HIGH_RISK_REJECT' | 'MANUAL_REVIEW';
+  critical_penalty_applied: number;
+  channels_used: string[];
+  presentation_layers_applied: string[];
+  // Ditempel Node (attachAdContext, backend/src/routes/video-guard.routes.ts) dari _ad_context
+  // yang tersimpan di DB -- TIDAK datang dari metaguard_service. Bisa null utk audit lama sebelum
+  // fitur ini ada, atau utk audit manual (bukan dari "Ads Creative") yang memang tidak punya ad Meta.
+  ad_name?: string | null;
+  original_headline?: string | null;
+  original_primary_text?: string | null;
+}
+
+type AuditStatusResponse =
+  | { status: 'queued' | 'processing' }
+  | { status: 'done'; report: ComplianceAuditReport }
+  | { status: 'error'; error: string };
+
+const VERDICT_META: Record<string, { label: string; className: string; icon: React.ElementType }> = {
+  APPROVED: { label: 'Disetujui — Aman Tayang', className: 'bg-emerald-100 text-emerald-700 border-emerald-200', icon: CheckCircle2 },
+  NEEDS_MINOR_TWEAK: { label: 'Perlu Klarifikasi / Revisi Kecil', className: 'bg-amber-100 text-amber-700 border-amber-200', icon: AlertTriangle },
+  HIGH_RISK_REJECT: { label: 'Ditolak — Risiko Tinggi', className: 'bg-rose-100 text-rose-700 border-rose-200', icon: XCircle },
+  MANUAL_REVIEW: { label: 'Perlu Review Manual', className: 'bg-gray-200 text-gray-700 border-gray-300', icon: AlertTriangle },
+};
+
+const CHANNEL_LABELS: Record<keyof ChannelScores, string> = {
+  visual_motion_score: 'Visual / Gerakan',
+  audio_speech_score: 'Audio / Ucapan',
+  text_copy_score: 'Teks / Copy',
+  thumbnail_image_score: 'Thumbnail',
+  landing_page_score: 'Landing Page',
+};
+
+// Penjelasan metodologi statis per channel (feedback Bossfren 2026-08-25: "biar orang gak skeptis
+// AI ngasal") -- ditulis manual, BUKAN dari output AI, supaya konsisten tampil walau untuk audit
+// yang tidak ada pelanggaran sama sekali pada channel tsb.
+const CHANNEL_METHODOLOGY: Record<keyof ChannelScores, string> = {
+  visual_motion_score:
+    'AI menonton video-nya langsung, adegan per adegan (lengkap dengan timestamp kemunculan). Yang dinilai: gerakan & aksi di video, konteks lokasi pengambilan gambar, dan kesesuaiannya dengan kebijakan Meta soal senjata/alat tajam (Section 4.12 & 4.13) serta konten sensasional/mengejutkan.',
+  audio_speech_score:
+    'AI mentranskrip dan mendengarkan audio/voice-over video secara langsung. Yang dinilai: klaim berlebihan, kata-kata ancaman/kekerasan, dan kesesuaian narasi dengan kebijakan iklan Meta.',
+  text_copy_score:
+    'AI membaca headline & primary text (isi caption) yang dikirim bersama iklan. Yang dinilai: apakah framing produk (mis. alat pertanian vs senjata) jelas, dan apakah ada klaim yang berisiko bikin Meta menolak iklannya.',
+  thumbnail_image_score:
+    'AI melihat gambar thumbnail/cover sebagai gambar diam (tanpa konteks video maupun teks) — mensimulasikan cara sistem review otomatis Meta menilai gambar itu sendirian, sebelum video-nya diputar.',
+  landing_page_score:
+    'AI membaca halaman tujuan (landing page) yang ditautkan di iklan. Yang dinilai: apakah headline & klaim di sana konsisten dengan video/teks iklan dan tidak melanggar kebijakan, karena Meta ikut memeriksa halaman tujuan saat me-review iklan.',
+};
+
+/** Cocokkan field `channel` bebas-teks dari violations (mis. "Video_Visual", "Landing_Page") ke
+ *  key channel_scores yang baku -- pencarian substring case-insensitive, bukan exact match, krn
+ *  metaguard_service tidak selalu konsisten menuliskan nama channel-nya. */
+function matchesChannel(violationChannel: string, key: keyof ChannelScores): boolean {
+  const vc = violationChannel.toLowerCase();
+  switch (key) {
+    case 'visual_motion_score': return vc.includes('visual') || vc.includes('motion') || vc.includes('video');
+    case 'audio_speech_score': return vc.includes('audio') || vc.includes('speech') || vc.includes('suara') || vc.includes('ucapan');
+    case 'text_copy_score': return vc.includes('text') || vc.includes('copy') || vc.includes('caption');
+    case 'thumbnail_image_score': return vc.includes('thumbnail') || vc.includes('image') || vc.includes('gambar');
+    case 'landing_page_score': return vc.includes('landing') || vc.includes('page');
+    default: return false;
+  }
+}
+
+const RISK_STYLE: Record<string, string> = {
+  HIGH: 'bg-rose-100 text-rose-700 border-rose-200',
+  MEDIUM: 'bg-amber-100 text-amber-700 border-amber-200',
+  LOW: 'bg-gray-100 text-gray-600 border-gray-200',
+};
+
+function ScoreBar({ label, value, onClick }: { label: string; value: number; onClick: () => void }) {
+  const color = value >= 80 ? 'bg-emerald-500' : value >= 60 ? 'bg-amber-500' : 'bg-rose-500';
+  return (
+    <button type="button" onClick={onClick} className="w-full text-left group">
+      <div className="flex items-center justify-between text-xs text-gray-600 mb-1">
+        <span className="group-hover:text-indigo-600 transition-colors flex items-center gap-1">
+          {label}
+          <Info className="w-3 h-3 text-gray-300 group-hover:text-indigo-400" />
+        </span>
+        <span className="font-semibold">{value}/100</span>
+      </div>
+      <div className="w-full h-2 bg-gray-100 rounded-full overflow-hidden group-hover:ring-2 group-hover:ring-indigo-200 transition-all">
+        <div className={`h-full ${color}`} style={{ width: `${value}%` }} />
+      </div>
+    </button>
+  );
+}
+
+function ChannelDetailModal({
+  channelKey,
+  score,
+  violations,
+  onClose,
+}: {
+  channelKey: keyof ChannelScores;
+  score: number;
+  violations: ViolationDetail[];
+  onClose: () => void;
+}) {
+  const related = violations.filter((v) => matchesChannel(v.channel, channelKey));
+  return (
+    <div className="fixed inset-0 bg-black/40 flex items-center justify-center z-50 p-4" onClick={onClose}>
+      <div
+        className="bg-white rounded-2xl border border-gray-200 max-w-lg w-full max-h-[85vh] overflow-y-auto p-6 space-y-4"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h3 className="font-bold text-gray-900">{CHANNEL_LABELS[channelKey]}</h3>
+            <p className="text-sm text-gray-500 mt-0.5">Skor: <span className="font-semibold">{score}/100</span></p>
+          </div>
+          <button onClick={onClose} className="text-gray-400 hover:text-gray-600 flex-shrink-0">
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        <div className="bg-indigo-50 border border-indigo-100 rounded-xl p-4">
+          <p className="text-xs font-semibold text-indigo-700 mb-1">Cara AI menilai channel ini</p>
+          <p className="text-sm text-indigo-900 leading-relaxed">{CHANNEL_METHODOLOGY[channelKey]}</p>
+        </div>
+
+        {related.length > 0 ? (
+          <div className="space-y-3">
+            <p className="text-xs font-semibold text-gray-500 uppercase">
+              {related.length} temuan pada channel ini — kenapa skornya segini
+            </p>
+            {related.map((v) => (
+              <div key={v.id} className="border border-gray-200 rounded-xl p-4 space-y-2">
+                <div className="flex items-start justify-between gap-2">
+                  <p className="text-sm font-medium text-gray-800">{v.detected_element}</p>
+                  <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full border flex-shrink-0 ${RISK_STYLE[v.risk_level]}`}>
+                    {v.risk_level}
+                  </span>
+                </div>
+                {v.timestamp_start && (
+                  <p className="text-xs text-gray-400">Waktu di video: {v.timestamp_start}{v.timestamp_end ? ` – ${v.timestamp_end}` : ''}</p>
+                )}
+                <p className="text-xs text-gray-500"><span className="font-medium text-gray-600">Kebijakan Meta:</span> {v.policy_reference}</p>
+                <p className="text-sm text-emerald-700 bg-emerald-50 rounded-lg px-3 py-2"><span className="font-medium">Saran perbaikan:</span> {v.remediation}</p>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <p className="text-sm text-gray-500 bg-gray-50 rounded-xl px-4 py-3">
+            Tidak ada pelanggaran spesifik yang tercatat pada channel ini — skor murni dari penilaian kualitas/kesesuaian AI, bukan karena ada yang dilanggar.
+          </p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+export default function ComplianceReportPage() {
+  const params = useParams<{ auditId: string }>();
+  const auditId = params.auditId;
+  const [state, setState] = useState<AuditStatusResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [activeChannel, setActiveChannel] = useState<keyof ChannelScores | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function poll() {
+      try {
+        const res = await apiGet<AuditStatusResponse>(`/video-guard/audit/${auditId}`);
+        if (cancelled) return;
+        setState(res);
+        if (res.status === 'done' || res.status === 'error') {
+          if (pollRef.current) clearInterval(pollRef.current);
+        }
+      } catch (e) {
+        if (!cancelled) setError((e as Error).message || 'Gagal memuat status audit.');
+      }
+    }
+
+    void poll();
+    pollRef.current = setInterval(poll, 4000);
+    return () => {
+      cancelled = true;
+      if (pollRef.current) clearInterval(pollRef.current);
+    };
+  }, [auditId]);
+
+  return (
+    <div className="max-w-3xl mx-auto space-y-6">
+      <Link href="/app/video-guard/riwayat" className="inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700">
+        <ArrowLeft className="w-4 h-4" /> Kembali ke Riwayat
+      </Link>
+
+      {error && <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>}
+
+      {!state && !error && (
+        <div className="flex items-center gap-2 text-gray-500 text-sm py-12 justify-center">
+          <Loader2 className="w-4 h-4 animate-spin" /> Memuat status audit…
+        </div>
+      )}
+
+      {state && (state.status === 'queued' || state.status === 'processing') && (
+        <div className="bg-white rounded-2xl border border-gray-200 p-10 flex flex-col items-center gap-3 text-center">
+          <Loader2 className="w-8 h-8 text-emerald-500 animate-spin" />
+          <p className="font-medium text-gray-800">Audit sedang diproses AI…</p>
+          <p className="text-sm text-gray-500">Bisa memakan waktu puluhan detik sampai beberapa menit tergantung ukuran video. Halaman ini akan memperbarui diri otomatis.</p>
+        </div>
+      )}
+
+      {state && state.status === 'error' && (
+        <div className="bg-rose-50 border border-rose-200 rounded-2xl p-6 text-rose-700">
+          <p className="font-semibold">Audit gagal diproses</p>
+          <p className="text-sm mt-1">{state.error}</p>
+        </div>
+      )}
+
+      {state && state.status === 'done' && (() => {
+        const report = state.report;
+        const meta = VERDICT_META[report.verdict] ?? VERDICT_META.MANUAL_REVIEW;
+        const Icon = meta.icon;
+        const scores = report.raw_assessment.channel_scores;
+        const displayTitle = report.ad_name || report.raw_assessment.ad_title;
+        const showSubtitle = report.ad_name && report.ad_name !== report.raw_assessment.ad_title;
+        const hasOriginalCopy = Boolean(report.original_headline || report.original_primary_text);
+        const captions = report.raw_assessment.remediation_assets.safe_captions;
+
+        return (
+          <div className="space-y-6">
+            <div className={`rounded-2xl border p-6 ${meta.className}`}>
+              <div className="flex items-center gap-3">
+                <Icon className="w-8 h-8" />
+                <div>
+                  <p className="font-bold text-lg">{meta.label}</p>
+                  <p className="text-sm opacity-80">Skor Kepatuhan Keseluruhan: {report.overall_compliance_score}/100</p>
+                </div>
+              </div>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-gray-200 p-6">
+              <h2 className="font-semibold text-gray-900">{displayTitle}</h2>
+              {showSubtitle && <p className="text-xs text-gray-400 mb-4 mt-0.5">{report.raw_assessment.ad_title}</p>}
+              <div className={`space-y-3 ${showSubtitle ? '' : 'mt-4'}`}>
+                {(Object.keys(CHANNEL_LABELS) as (keyof ChannelScores)[])
+                  .filter((k) => typeof scores[k] === 'number')
+                  .map((k) => (
+                    <ScoreBar key={k} label={CHANNEL_LABELS[k]} value={scores[k] as number} onClick={() => setActiveChannel(k)} />
+                  ))}
+              </div>
+              <p className="text-[11px] text-gray-400 mt-3">Klik salah satu channel untuk lihat alasan skor, temuan, dan cara AI menilainya.</p>
+            </div>
+
+            <div className="bg-white rounded-2xl border border-gray-200 p-6">
+              <h2 className="font-semibold text-gray-900 mb-2">Ringkasan Eksekutif</h2>
+              <p className="text-sm text-gray-600 leading-relaxed whitespace-pre-line">{report.raw_assessment.executive_summary}</p>
+            </div>
+
+            {report.raw_assessment.violations.length > 0 && (
+              <Link
+                href={`/app/video-guard/audit/${auditId}/analysis`}
+                className="flex items-center justify-between bg-white rounded-2xl border border-gray-200 p-6 hover:border-emerald-300 hover:shadow-md transition-all"
+              >
+                <div className="flex items-center gap-3">
+                  <ListChecks className="w-6 h-6 text-emerald-600" />
+                  <div>
+                    <p className="font-semibold text-gray-900">
+                      {report.raw_assessment.violations.length} Pelanggaran Terdeteksi
+                    </p>
+                    <p className="text-xs text-gray-500">Lihat analisis rinci per pelanggaran & panel klarifikasi →</p>
+                  </div>
+                </div>
+              </Link>
+            )}
+
+            {captions.length > 0 && (
+              <div className="bg-white rounded-2xl border border-gray-200 p-6">
+                <h2 className="font-semibold text-gray-900 mb-1">Saran Caption Aman</h2>
+                <p className="text-xs text-gray-400 mb-4">
+                  {hasOriginalCopy ? 'Perbandingan teks iklan asli (kiri) dengan saran versi aman AI (kanan).' : 'Teks asli iklan ini tidak tersimpan — berikut saran caption amannya.'}
+                </p>
+                <div className="space-y-3">
+                  {captions.map((c, i) => (
+                    <div key={i} className={`grid gap-3 ${hasOriginalCopy ? 'sm:grid-cols-2' : ''}`}>
+                      {hasOriginalCopy && (
+                        <div className="bg-gray-50 border border-gray-200 rounded-xl p-4">
+                          <p className="text-[10px] font-semibold text-gray-400 uppercase mb-1">Teks Asli</p>
+                          {report.original_headline && <p className="text-sm font-medium text-gray-700">{report.original_headline}</p>}
+                          {report.original_primary_text && <p className="text-sm text-gray-600 mt-1">{report.original_primary_text}</p>}
+                        </div>
+                      )}
+                      <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-4">
+                        <p className="text-[10px] font-semibold text-emerald-600 uppercase mb-1">Saran Caption {captions.length > 1 ? `#${i + 1}` : ''}</p>
+                        <p className="text-sm text-emerald-900">{c}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
+      {state && state.status === 'done' && activeChannel && (
+        <ChannelDetailModal
+          channelKey={activeChannel}
+          score={(state.report.raw_assessment.channel_scores[activeChannel] as number) ?? 0}
+          violations={state.report.raw_assessment.violations}
+          onClose={() => setActiveChannel(null)}
+        />
+      )}
+    </div>
+  );
+}

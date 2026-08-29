@@ -1,0 +1,366 @@
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import Link from 'next/link';
+import { ArrowLeft, SlidersHorizontal, Loader2, Save, CheckCircle2, KeyRound, Info, Sparkles, RefreshCw } from 'lucide-react';
+import { apiGet, apiPut, apiPost } from '../../../../../lib/api';
+
+/**
+ * [2026-08-27, fix v1.8.0 -- "check & generate ads ada opsi layanan dan model sendiri"] Sebelumnya
+ * halaman ini SATU config dipakai bersama Check Ads & Generate Ads. Sekarang dipecah jadi 2 section
+ * independen (masing2 provider/API key/model sendiri) -- backend sudah lebih dulu dipecah
+ * (`copywriting.routes.ts`, field `checkAdsLlm*`/`generateAdsLlm*`, GET balikin `{checkAds,
+ * generateAds}`, PUT wajib sebut `feature: 'check'|'generate'`).
+ *
+ * Provider Groq ditambahkan. Kolom model manual (ketik sendiri) diganti dropdown yang OTOMATIS
+ * dimuat dari `POST /llm-models/list` begitu provider dipilih -- tidak perlu hafal nama model
+ * persis. Endpoint itu publik utk OpenRouter (tanpa key), sementara Google/OpenAI/Groq butuh API
+ * key (baru diketik ATAU yang sudah tersimpan di server lewat parameter `slot`).
+ */
+
+type Provider = 'agy' | 'google' | 'openai' | 'openrouter' | 'groq';
+type Slot = 'checkAds' | 'generateAds';
+
+interface FeatureConfig {
+  provider: Provider;
+  model: string | null;
+  usingLegacyGeminiKeyFallback: boolean;
+  usingLegacySharedFallback: boolean;
+  apiKeyConfigured: boolean;
+  apiKeyPreview: string | null;
+}
+
+interface SettingsResponse {
+  checkAds: FeatureConfig;
+  generateAds: FeatureConfig;
+}
+
+interface ModelEntry {
+  id: string;
+  label?: string;
+  supportsVideo?: boolean;
+}
+
+const PROVIDERS: { key: Provider; label: string; defaultModel: string; keyHint: string; noApiKey?: boolean }[] = [
+  {
+    key: 'agy',
+    label: 'Agy (default, tanpa API key)',
+    defaultModel: 'Otomatis — ditentukan agy/Antigravity CLI sendiri',
+    keyHint: 'Tidak butuh API key sama sekali. Pakai mekanisme yang sama dengan audit video Video Guard (sesi Google AI Pro via agy), lewat antrean/pool sendiri ("copywriting-ads") supaya tidak berebut dengan audit video atau fitur lain.',
+    noApiKey: true,
+  },
+  {
+    key: 'google',
+    label: 'Google AI Studio (Gemini)',
+    defaultModel: 'gemini-2.5-flash',
+    keyHint: 'Kosongkan untuk pakai key Video Guard yang sudah diisi (kalau ada) — satu key Gemini bisa dipakai bersama. Perhatian: key Gemini API gratis dibatasi 20 request/hari, gunakan hanya kalau paham risikonya.',
+  },
+  {
+    key: 'openai',
+    label: 'OpenAI',
+    defaultModel: 'gpt-4o-mini',
+    keyHint: 'Wajib diisi sendiri — tidak ada key bersama/fallback untuk provider ini.',
+  },
+  {
+    key: 'openrouter',
+    label: 'OpenRouter',
+    defaultModel: 'openai/gpt-4o-mini',
+    keyHint: 'Wajib diisi sendiri. Daftar model dimuat otomatis dari OpenRouter — tinggal pilih dari dropdown.',
+  },
+  {
+    key: 'groq',
+    label: 'Groq',
+    defaultModel: 'llama-3.3-70b-versatile',
+    keyHint: 'Wajib diisi sendiri — dapatkan API key gratis di console.groq.com. Groq terkenal sangat cepat (chip LPU), cocok untuk Check Ads yang butuh respons instan.',
+  },
+];
+
+function providerMetaOf(p: Provider) {
+  return PROVIDERS.find((x) => x.key === p) ?? PROVIDERS[0];
+}
+
+function ProviderConfigSection({
+  title,
+  description,
+  slot,
+  feature,
+  config,
+  onSaved,
+}: {
+  title: string;
+  description: string;
+  slot: Slot;
+  feature: 'check' | 'generate';
+  config: FeatureConfig;
+  onSaved: (fresh: FeatureConfig) => void;
+}) {
+  const [provider, setProvider] = useState<Provider>(config.provider);
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [modelInput, setModelInput] = useState(config.model ?? '');
+  const [modelOptions, setModelOptions] = useState<ModelEntry[]>([]);
+  const [modelsLoading, setModelsLoading] = useState(false);
+  const [modelsError, setModelsError] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const isAgy = provider === 'agy';
+  const meta = providerMetaOf(provider);
+
+  async function loadModels(prov: Provider, keyOverride?: string) {
+    if (prov === 'agy') {
+      setModelOptions([]);
+      setModelsError(null);
+      return;
+    }
+    setModelsLoading(true);
+    setModelsError(null);
+    try {
+      const body: Record<string, unknown> = { provider: prov, slot };
+      const key = (keyOverride ?? apiKeyInput).trim();
+      if (key) body.apiKey = key;
+      const res = await apiPost<{ models: ModelEntry[] }>('/llm-models/list', body);
+      setModelOptions(res.models ?? []);
+    } catch (e) {
+      setModelOptions([]);
+      setModelsError((e as Error).message || 'Gagal memuat daftar model.');
+    } finally {
+      setModelsLoading(false);
+    }
+  }
+
+  // Muat daftar model begitu section ini pertama kali render (pakai key yang sudah tersimpan di
+  // server kalau ada, lewat `slot` -- tidak perlu user ketik ulang key tiap buka halaman).
+  useEffect(() => {
+    if (config.provider !== 'agy') {
+      loadModels(config.provider);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function handleProviderClick(p: Provider) {
+    setProvider(p);
+    setError(null);
+    if (p !== 'agy') loadModels(p);
+  }
+
+  async function handleSave(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSaved(false);
+    setSaving(true);
+    try {
+      const body: { feature: 'check' | 'generate'; provider: Provider; apiKey?: string; model?: string } = {
+        feature,
+        provider,
+      };
+      if (!isAgy && apiKeyInput.trim()) body.apiKey = apiKeyInput.trim();
+      body.model = isAgy ? '' : modelInput.trim(); // "" = hapus/pakai default provider
+      await apiPut('/copywriting-ads/settings', body);
+      const fresh = await apiGet<SettingsResponse>('/copywriting-ads/settings');
+      const freshConfig = fresh[slot];
+      onSaved(freshConfig);
+      setProvider(freshConfig.provider);
+      setModelInput(freshConfig.model ?? '');
+      setApiKeyInput('');
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
+    } catch (e) {
+      setError((e as Error).message || 'Gagal menyimpan pengaturan.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  // Kalau model yang sedang tersimpan/dipilih tidak ada di daftar hasil fetch (mis. key baru
+  // diganti, atau model lama sudah discontinued provider-nya), tetap tampilkan sebagai opsi
+  // supaya tidak diam-diam ke-reset pas render dropdown.
+  const modelSelectOptions =
+    modelInput && !modelOptions.some((m) => m.id === modelInput)
+      ? [{ id: modelInput, label: `${modelInput} (tersimpan)` }, ...modelOptions]
+      : modelOptions;
+
+  return (
+    <form onSubmit={handleSave} className="bg-white rounded-2xl border border-gray-200 p-6 space-y-6">
+      <div>
+        <h2 className="text-sm font-bold text-gray-900">{title}</h2>
+        <p className="text-xs text-gray-500 mt-0.5">{description}</p>
+      </div>
+
+      {error && <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>}
+
+      <div>
+        <label className="block text-sm font-medium text-gray-700 mb-2">Provider LLM</label>
+        <div className="flex flex-wrap gap-2">
+          {PROVIDERS.map((p) => (
+            <button
+              type="button"
+              key={p.key}
+              onClick={() => handleProviderClick(p.key)}
+              className={`px-3 py-1.5 rounded-full text-xs font-semibold border transition-colors ${
+                provider === p.key ? 'bg-fuchsia-600 border-fuchsia-600 text-white' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+              }`}
+            >
+              {p.label}
+            </button>
+          ))}
+        </div>
+        {provider === 'google' && config.usingLegacyGeminiKeyFallback && (
+          <p className="text-xs text-indigo-600 mt-2 flex items-center gap-1">
+            <Info className="w-3.5 h-3.5" /> Saat ini memakai key Gemini dari pengaturan Video Guard.
+          </p>
+        )}
+        {config.usingLegacySharedFallback && (
+          <p className="text-xs text-amber-600 mt-2 flex items-center gap-1">
+            <Info className="w-3.5 h-3.5" /> Masih pakai setting lama yang dulu dipakai bersama Check &amp; Generate Ads.
+            Simpan di sini untuk memisahkannya khusus {title}.
+          </p>
+        )}
+      </div>
+
+      {isAgy ? (
+        <div className="bg-fuchsia-50 border border-fuchsia-200 rounded-xl px-4 py-3 flex items-start gap-2.5">
+          <Sparkles className="w-4 h-4 text-fuchsia-600 shrink-0 mt-0.5" />
+          <p className="text-xs text-fuchsia-800">{meta.keyHint}</p>
+        </div>
+      ) : (
+        <>
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1 flex items-center gap-1.5">
+              <KeyRound className="w-4 h-4 text-fuchsia-600" /> API Key ({meta.label})
+            </label>
+            <p className="text-xs text-gray-500 mb-2">
+              {config.apiKeyConfigured
+                ? `Sudah diisi (${config.apiKeyPreview}). Isi kolom di bawah untuk mengganti, kosongkan untuk menghapus.`
+                : meta.keyHint}
+            </p>
+            <div className="flex gap-2">
+              <input
+                type="password"
+                value={apiKeyInput}
+                onChange={(e) => setApiKeyInput(e.target.value)}
+                placeholder={config.apiKeyConfigured ? 'Ganti key (opsional)…' : `Masukkan ${meta.label} API Key…`}
+                className="flex-1 border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-fuchsia-500 focus:border-fuchsia-500"
+              />
+              <button
+                type="button"
+                onClick={() => loadModels(provider)}
+                disabled={modelsLoading}
+                title="Muat ulang daftar model dengan key di atas"
+                className="shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-lg border border-gray-300 text-xs font-semibold text-gray-600 hover:bg-gray-50 disabled:opacity-60"
+              >
+                {modelsLoading ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                Muat model
+              </button>
+            </div>
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Model</label>
+            {modelsLoading ? (
+              <div className="flex items-center gap-2 text-xs text-gray-500 py-2">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-fuchsia-600" /> Memuat daftar model dari {meta.label}…
+              </div>
+            ) : modelsError ? (
+              <div className="text-xs text-rose-600 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
+                {modelsError}
+              </div>
+            ) : (
+              // fix [2026-08-27, keluhan Bossfren -- "openrouter modelnya bnyk bgt, pusing nyari
+              // dropdown"]: dropdown <select> diganti input teks + <datalist> (autocomplete bawaan
+              // browser) -- ketik utk filter dari daftar yang sudah dimuat, TETAP bisa ketik model id
+              // manual yang tidak ada di daftar (mis. model baru yang belum ke-refresh). Kosongkan
+              // field = pakai default provider (sama seperti opsi "Otomatis" di <select> versi lama).
+              <>
+                <input
+                  type="text"
+                  list={`model-options-${slot}`}
+                  value={modelInput}
+                  onChange={(e) => setModelInput(e.target.value)}
+                  placeholder={`Ketik utk cari model (opsional) — kosongkan utk default: ${meta.defaultModel}`}
+                  className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-fuchsia-500 focus:border-fuchsia-500 bg-white"
+                />
+                <datalist id={`model-options-${slot}`}>
+                  {modelSelectOptions.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label || m.id}
+                    </option>
+                  ))}
+                </datalist>
+              </>
+            )}
+          </div>
+        </>
+      )}
+
+      <button
+        type="submit"
+        disabled={saving}
+        className="w-full flex items-center justify-center gap-2 bg-fuchsia-600 hover:bg-fuchsia-700 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-colors shadow-sm"
+      >
+        {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : saved ? <CheckCircle2 className="w-4 h-4" /> : <Save className="w-4 h-4" />}
+        {saving ? 'Menyimpan…' : saved ? 'Tersimpan' : `Simpan ${title}`}
+      </button>
+    </form>
+  );
+}
+
+export default function CopywritingAdsSettingsPage() {
+  const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    apiGet<SettingsResponse>('/copywriting-ads/settings')
+      .then((res) => setSettings(res))
+      .catch((e) => setError(e.message || 'Gagal memuat pengaturan.'));
+  }, []);
+
+  return (
+    <div className="max-w-2xl mx-auto space-y-6">
+      <Link href="/app/video-guard/copywriting-ads" className="inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700">
+        <ArrowLeft className="w-4 h-4" /> Kembali ke Copywriting Ads
+      </Link>
+
+      <div>
+        <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2">
+          <SlidersHorizontal className="w-6 h-6 text-fuchsia-600" /> Pengaturan Copywriting Ads
+        </h1>
+        <p className="text-xs text-gray-500 mt-1">
+          Check Ads &amp; Generate Ads sekarang punya provider &amp; model LLM masing-masing sendiri. Defaultnya
+          adalah <strong>Agy</strong> — tidak butuh API key dan tidak memakai kuota Gemini API yang sama dengan
+          audit video. Provider lain (Google AI Studio, OpenAI, OpenRouter, Groq) tersedia sebagai pilihan manual
+          kalau kamu ingin pakai key sendiri — daftar model akan otomatis dimuat begitu provider dipilih.
+        </p>
+      </div>
+
+      {error && <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>}
+
+      {!settings && !error && (
+        <div className="flex items-center gap-2 text-gray-500 text-sm py-12 justify-center">
+          <Loader2 className="w-4 h-4 animate-spin text-fuchsia-600" /> Memuat…
+        </div>
+      )}
+
+      {settings && (
+        <>
+          <ProviderConfigSection
+            title="Check Ads"
+            description="Provider/model LLM untuk cek kepatuhan copy iklan yang sudah ada (headline & primary text)."
+            slot="checkAds"
+            feature="check"
+            config={settings.checkAds}
+            onSaved={(fresh) => setSettings((s) => (s ? { ...s, checkAds: fresh } : s))}
+          />
+          <ProviderConfigSection
+            title="Generate Ads"
+            description="Provider/model LLM untuk membuat copy iklan baru dari keyword/produk."
+            slot="generateAds"
+            feature="generate"
+            config={settings.generateAds}
+            onSaved={(fresh) => setSettings((s) => (s ? { ...s, generateAds: fresh } : s))}
+          />
+        </>
+      )}
+    </div>
+  );
+}

@@ -3,6 +3,15 @@ import type { NextConfig } from 'next';
 const nextConfig: NextConfig = {
   output: process.env.BUILD_STATIC === 'true' ? 'export' : undefined,
   images: { unoptimized: true },
+  async redirects() {
+    return [
+      {
+        source: '/',
+        destination: '/login',
+        permanent: false,
+      },
+    ];
+  },
   async rewrites() {
     if (process.env.BUILD_STATIC === 'true') return [];
     return [

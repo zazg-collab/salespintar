@@ -1,0 +1,306 @@
+'use client';
+
+/**
+ * /app/ai-ads/chat — "Agent Workspace" (Global Agent Workspace), Tahap 2 + Langkah A redesign.
+ *
+ * Bagian dari blueprint "Ekstensi Fase 3: Global Agent Workspace & Multi-BM Token Vault" v1.3.
+ * Halaman ini murni jalur Node.js/UI — chat ke POST /ai-ads/global-chat, yang di backend mematok
+ * businessId dari sesi login (bukan dari body) dan meneruskannya ke bridge VPS 45 (/v1/global-run).
+ * Agent SUDAH aktif sungguhan sejak Tahap 3 v1 (bukan placeholder lagi).
+ *
+ * [2026-08-25] Langkah A -- ditemukan agent SEBELUMNYA amnesia total tiap pesan: conversationId
+ * yang dikirim cuma label buatan sendiri, TIDAK PERNAH diteruskan ke `agy` (tidak ada
+ * `--conversation`), dan responsnya ditunggu utuh baru ditampilkan (kerasa "muter2 doang").
+ * Sekarang diperbaiki dua-duanya: (1) conversation_id ASLI dari `agy` dipakai lewat
+ * `--conversation` di server.js VPS 45 -- agent beneran inget percakapan sebelumnya dalam satu
+ * sesi halaman ini; (2) respons di-stream progresif (SSE: event conversation_id/delta/done/error)
+ * lewat apiPostStream(), bukan nunggu utuh baru render.
+ *
+ * CATATAN: refresh halaman ini MASIH mereset percakapan ke awal (conversationId cuma di React
+ * state, belum disimpan permanen) -- penyimpanan histori per-PIC yang tahan refresh menyusul di
+ * redesign widget floating (Langkah B), belum bagian dari perbaikan ini.
+ *
+ * Markdown-lite renderer ditulis ulang di sini (bukan reuse komponen lama) karena komponen
+ * "MarkdownLite" yang disebut di catatan sesi sebelumnya tidak ditemukan lagi di source tree saat
+ * ini -- kemungkinan sudah berubah nama/lokasi. Duplikasi kecil ini dianggap risiko rendah.
+ */
+
+import { useState, useRef, useEffect } from 'react';
+import Link from 'next/link';
+import { apiPostStream } from '../../../../lib/api';
+import { Bot, Send, Loader2, ArrowLeft, User, AlertCircle } from 'lucide-react';
+
+interface ChatMessage {
+  id: string;
+  role: 'user' | 'assistant' | 'system';
+  text: string;
+}
+
+// ── Markdown-lite: heading ###, **bold**, list -/1., pemisah --- ──────────
+
+function renderInlineMarkdown(text: string) {
+  const parts = text.split(/(\*\*[^*]+\*\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+      return <strong key={i}>{part.slice(2, -2)}</strong>;
+    }
+    return <span key={i}>{part}</span>;
+  });
+}
+
+function MarkdownLite({ text }: { text: string }) {
+  const lines = text.split('\n');
+  const elements: React.ReactNode[] = [];
+  let listBuffer: string[] = [];
+  let listKey = 0;
+
+  const flushList = () => {
+    if (listBuffer.length === 0) return;
+    elements.push(
+      <ul key={`list-${listKey++}`} className="list-disc list-inside space-y-0.5 my-1">
+        {listBuffer.map((item, i) => (
+          <li key={i}>{renderInlineMarkdown(item)}</li>
+        ))}
+      </ul>
+    );
+    listBuffer = [];
+  };
+
+  lines.forEach((line, idx) => {
+    const trimmed = line.trim();
+    if (trimmed === '---') {
+      flushList();
+      elements.push(<hr key={`hr-${idx}`} className="my-2 border-gray-200" />);
+      return;
+    }
+    const headingMatch = trimmed.match(/^(#{1,6})\s+(.*)$/);
+    if (headingMatch) {
+      flushList();
+      const level = headingMatch[1].length;
+      const sizeClass = level <= 2 ? 'text-base font-bold' : 'text-sm font-semibold';
+      elements.push(
+        <div key={`h-${idx}`} className={`${sizeClass} mt-2 mb-1`}>
+          {renderInlineMarkdown(headingMatch[2])}
+        </div>
+      );
+      return;
+    }
+    const listMatch = trimmed.match(/^(?:-|\d+\.)\s+(.*)$/);
+    if (listMatch) {
+      listBuffer.push(listMatch[1]);
+      return;
+    }
+    flushList();
+    if (trimmed.length === 0) {
+      elements.push(<div key={`sp-${idx}`} className="h-2" />);
+    } else {
+      elements.push(
+        <p key={`p-${idx}`} className="leading-relaxed">
+          {renderInlineMarkdown(line)}
+        </p>
+      );
+    }
+  });
+  flushList();
+
+  return <div className="text-sm text-gray-800 space-y-0.5">{elements}</div>;
+}
+
+// ── Parsing SSE (event conversation_id/delta/done/error) ──────────────────
+
+interface SSEHandlers {
+  onConversationId: (id: string) => void;
+  onDelta: (text: string) => void;
+  onDone: (reply: string, active: boolean, conversationId?: string) => void;
+  onError: (message: string) => void;
+}
+
+async function consumeGlobalChatStream(res: Response, handlers: SSEHandlers) {
+  if (!res.body) {
+    handlers.onError('Respons server tidak mendukung streaming di browser ini.');
+    return;
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buf = '';
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx: number;
+    while ((idx = buf.indexOf('\n\n')) !== -1) {
+      const rawEvent = buf.slice(0, idx);
+      buf = buf.slice(idx + 2);
+      const dataLine = rawEvent.split('\n').find((l) => l.startsWith('data: '));
+      if (!dataLine) continue;
+      let evt: any;
+      try {
+        evt = JSON.parse(dataLine.slice(6));
+      } catch {
+        continue;
+      }
+      if (evt.type === 'conversation_id' && typeof evt.conversationId === 'string') {
+        handlers.onConversationId(evt.conversationId);
+      } else if (evt.type === 'delta' && typeof evt.text === 'string') {
+        handlers.onDelta(evt.text);
+      } else if (evt.type === 'done') {
+        handlers.onDone(typeof evt.reply === 'string' ? evt.reply : '', !!evt.active, evt.conversationId);
+      } else if (evt.type === 'error') {
+        handlers.onError(typeof evt.message === 'string' ? evt.message : 'Terjadi kesalahan.');
+      }
+    }
+  }
+}
+
+// ── Halaman utama ───────────────────────────────────────────────────────
+
+export default function AgentWorkspaceChatPage() {
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [input, setInput] = useState('');
+  const [sending, setSending] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [conversationId, setConversationId] = useState<string | undefined>(undefined);
+  const bottomRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, sending]);
+
+  async function handleSend() {
+    const trimmed = input.trim();
+    if (!trimmed || sending) return;
+    setError(null);
+    const userMsg: ChatMessage = { id: `u-${Date.now()}`, role: 'user', text: trimmed };
+    const assistantId = `a-${Date.now()}`;
+    setMessages((prev) => [...prev, userMsg, { id: assistantId, role: 'assistant', text: '' }]);
+    setInput('');
+    setSending(true);
+
+    let hadError = false;
+    try {
+      const res = await apiPostStream('/ai-ads/global-chat', { message: trimmed, conversationId });
+      await consumeGlobalChatStream(res, {
+        onConversationId: (id) => setConversationId(id),
+        onDelta: (text) => {
+          setMessages((prev) =>
+            prev.map((m) => (m.id === assistantId ? { ...m, text: m.text + text } : m))
+          );
+        },
+        onDone: (reply, active, convId) => {
+          if (convId) setConversationId(convId);
+          setMessages((prev) =>
+            prev.map((m) =>
+              m.id === assistantId ? { ...m, text: reply, role: active ? 'assistant' : 'system' } : m
+            )
+          );
+        },
+        onError: (message) => {
+          hadError = true;
+          setError(message);
+          setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+        },
+      });
+    } catch (err: any) {
+      hadError = true;
+      setError(err?.message || 'Gagal menghubungi Agent Workspace.');
+      setMessages((prev) => prev.filter((m) => m.id !== assistantId));
+    } finally {
+      setSending(false);
+      if (hadError) {
+        // pesan asisten kosong sudah dibuang di handler error masing2 di atas
+      }
+    }
+  }
+
+  function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  }
+
+  const lastMessage = messages[messages.length - 1];
+  const showThinkingIndicator = sending && (!lastMessage || lastMessage.role !== 'user') && lastMessage?.text === '';
+
+  return (
+    <div className="max-w-3xl mx-auto p-6 flex flex-col h-[calc(100vh-2rem)]">
+      <div className="flex items-center gap-2 mb-1">
+        <Link href="/app/ai-ads" className="text-gray-400 hover:text-gray-600">
+          <ArrowLeft className="w-5 h-5" />
+        </Link>
+        <Bot className="w-6 h-6 text-indigo-600" />
+        <h1 className="text-xl font-bold">Agent Workspace</h1>
+      </div>
+      <p className="text-sm text-gray-500 mb-4">
+        Chat lintas-BM dengan AI Media Buyer — Global Agent Workspace. Jawaban muncul bertahap dan
+        agent mengingat percakapan sebelumnya selama halaman ini belum di-refresh.
+      </p>
+
+      <div className="flex-1 overflow-y-auto bg-white rounded-lg shadow border border-gray-100 p-4 space-y-4">
+        {messages.length === 0 && (
+          <div className="text-sm text-gray-400 text-center py-8">
+            Mulai percakapan dengan mengetik pesan di bawah.
+          </div>
+        )}
+        {messages.map((m) => (
+          <div key={m.id} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+            <div
+              className={`max-w-[85%] rounded-lg px-3 py-2 ${
+                m.role === 'user'
+                  ? 'bg-indigo-600 text-white'
+                  : m.role === 'system'
+                    ? 'bg-amber-50 border border-amber-200'
+                    : 'bg-gray-100'
+              }`}
+            >
+              {m.role === 'user' ? (
+                <div className="flex items-start gap-2">
+                  <User className="w-4 h-4 mt-0.5 shrink-0" />
+                  <span className="text-sm">{m.text}</span>
+                </div>
+              ) : m.text ? (
+                <MarkdownLite text={m.text} />
+              ) : (
+                <span className="text-sm text-gray-400">&nbsp;</span>
+              )}
+            </div>
+          </div>
+        ))}
+        {showThinkingIndicator && (
+          <div className="flex items-center gap-2 text-sm text-gray-500">
+            <Loader2 className="w-4 h-4 animate-spin" />
+            Agent sedang mikir...
+          </div>
+        )}
+        <div ref={bottomRef} />
+      </div>
+
+      {error && (
+        <div className="mt-2 flex items-center gap-2 text-sm text-red-600">
+          <AlertCircle className="w-4 h-4" />
+          {error}
+        </div>
+      )}
+
+      <div className="mt-3 flex items-end gap-2">
+        <textarea
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Tulis pesan ke Agent Workspace..."
+          rows={2}
+          className="flex-1 resize-none rounded-lg border border-gray-200 px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-indigo-500"
+          disabled={sending}
+        />
+        <button
+          onClick={handleSend}
+          disabled={sending || !input.trim()}
+          className="inline-flex items-center gap-1.5 rounded-lg bg-indigo-600 text-white px-4 py-2 text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed hover:bg-indigo-700"
+        >
+          {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
+          Kirim
+        </button>
+      </div>
+    </div>
+  );
+}

@@ -1,0 +1,181 @@
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import Link from 'next/link';
+import { ShieldCheck, UploadCloud, Wand2, History, CheckCircle2, XCircle, Clock, AlertTriangle, Loader2 } from 'lucide-react';
+import { apiGet } from '../../../lib/api';
+
+interface AuditRow {
+  id: string;
+  adTitle: string;
+  overallScore: number | null;
+  verdict: string | null;
+  layersApplied: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
+const VERDICT_STYLE: Record<string, { label: string; className: string; icon: React.ElementType }> = {
+  APPROVED: { label: 'Disetujui', className: 'bg-emerald-100 text-emerald-700', icon: CheckCircle2 },
+  NEEDS_MINOR_TWEAK: { label: 'Perlu Klarifikasi', className: 'bg-amber-100 text-amber-700', icon: AlertTriangle },
+  HIGH_RISK_REJECT: { label: 'Ditolak', className: 'bg-rose-100 text-rose-700', icon: XCircle },
+  MANUAL_REVIEW: { label: 'Perlu Review Manual', className: 'bg-gray-200 text-gray-700', icon: AlertTriangle },
+};
+
+function VerdictBadge({ verdict }: { verdict: string | null }) {
+  if (!verdict) {
+    return (
+      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold bg-indigo-100 text-indigo-700">
+        <Clock className="w-3.5 h-3.5" /> Diproses
+      </span>
+    );
+  }
+  const style = VERDICT_STYLE[verdict] ?? VERDICT_STYLE.MANUAL_REVIEW;
+  const Icon = style.icon;
+  return (
+    <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-xs font-semibold ${style.className}`}>
+      <Icon className="w-3.5 h-3.5" /> {style.label}
+    </span>
+  );
+}
+
+export default function VideoGuardDashboardPage() {
+  const [audits, setAudits] = useState<AuditRow[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    apiGet<{ audits: AuditRow[] }>('/video-guard/history?take=100')
+      .then((res) => setAudits(res.audits))
+      .catch((e) => setError(e.message || 'Gagal memuat riwayat audit'));
+  }, []);
+
+  const total = audits?.length ?? 0;
+  const approved = audits?.filter((a) => a.verdict === 'APPROVED').length ?? 0;
+  const rejected = audits?.filter((a) => a.verdict === 'HIGH_RISK_REJECT').length ?? 0;
+  const pending = audits?.filter((a) => !a.verdict || a.verdict === 'NEEDS_MINOR_TWEAK').length ?? 0;
+  const successRate = total > 0 ? Math.round((approved / total) * 100) : null;
+
+  // [2026-08-25] Round D poin 5 (referensi AdGuardAI): dulu cuma nampilin 1 audit terakhir + 1 audit
+  // nunggu klarifikasi (kalau ada) di 2 kartu terpisah. Sekarang satu list "Aktivitas Terbaru" gaya
+  // bersih (ikon+judul+waktu+status), beberapa item sekaligus -- lebih kelihatan aktivitasnya drpd
+  // cuma 1 snapshot. Tidak ada field "user" di skema VideoAdAudit (audit terikat ke business, bukan
+  // user individual) jadi kolom itu sengaja tidak ada di sini.
+  const recentAudits = (audits ?? []).slice(0, 8);
+
+  return (
+    <div className="max-w-6xl mx-auto space-y-6">
+      <div className="flex items-center justify-between">
+        <div>
+          <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2">
+            <ShieldCheck className="w-6 h-6 text-indigo-600" /> Meta Video AI Guards
+          </h1>
+          <p className="text-xs text-gray-500 mt-1">Audit kepatuhan iklan video Meta Ads sebelum tayang.</p>
+        </div>
+        <Link
+          href="/app/video-guard/audit-baru"
+          className="flex items-center gap-2 bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2.5 rounded-xl font-semibold shadow-sm transition-colors"
+        >
+          <UploadCloud className="w-4 h-4" /> Audit Baru
+        </Link>
+      </div>
+
+      {error && (
+        <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>
+      )}
+
+      {audits === null && !error && (
+        <div className="flex items-center gap-2 text-gray-500 text-sm py-8 justify-center">
+          <Loader2 className="w-4 h-4 animate-spin text-indigo-600" /> Memuat ringkasan…
+        </div>
+      )}
+
+      {audits !== null && (
+        <>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+            <div className="bg-white rounded-2xl border border-gray-200 p-5">
+              <p className="text-xs text-gray-500 font-medium">Total Audit</p>
+              <p className="text-2xl font-bold text-gray-900 mt-1">{total}</p>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-200 p-5">
+              <p className="text-xs text-gray-500 font-medium">Success Rate</p>
+              <p className="text-2xl font-bold text-emerald-600 mt-1">{successRate !== null ? `${successRate}%` : '—'}</p>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-200 p-5">
+              <p className="text-xs text-gray-500 font-medium">Ditolak</p>
+              <p className="text-2xl font-bold text-rose-600 mt-1">{rejected}</p>
+            </div>
+            <div className="bg-white rounded-2xl border border-gray-200 p-5">
+              <p className="text-xs text-gray-500 font-medium">Diproses / Perlu Klarifikasi</p>
+              <p className="text-2xl font-bold text-amber-600 mt-1">{pending}</p>
+            </div>
+          </div>
+
+          <div className="bg-white rounded-2xl border border-gray-200 p-6">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="font-semibold text-gray-900">Aktivitas Terbaru</h2>
+              {total > 8 && (
+                <Link href="/app/video-guard/riwayat" className="text-xs font-semibold text-indigo-600 hover:text-indigo-700">
+                  Lihat semua →
+                </Link>
+              )}
+            </div>
+            {recentAudits.length > 0 ? (
+              <div className="divide-y divide-gray-100">
+                {recentAudits.map((a) => {
+                  const style = a.verdict ? (VERDICT_STYLE[a.verdict] ?? VERDICT_STYLE.MANUAL_REVIEW) : null;
+                  const RowIcon = style?.icon ?? Clock;
+                  const iconClass = style?.className ?? 'bg-indigo-100 text-indigo-700';
+                  return (
+                    <Link
+                      key={a.id}
+                      href={`/app/video-guard/audit/${a.id}`}
+                      className="flex items-center gap-3 py-3 -mx-2 px-2 rounded-lg hover:bg-gray-50 transition-colors"
+                    >
+                      <div className={`w-9 h-9 rounded-full flex items-center justify-center flex-shrink-0 ${iconClass}`}>
+                        <RowIcon className="w-4 h-4" />
+                      </div>
+                      <div className="min-w-0 flex-1">
+                        <p className="font-medium text-gray-800 truncate">{a.adTitle}</p>
+                        <p className="text-xs text-gray-400 mt-0.5">{new Date(a.createdAt).toLocaleString('id-ID')}</p>
+                      </div>
+                      <VerdictBadge verdict={a.verdict} />
+                    </Link>
+                  );
+                })}
+              </div>
+            ) : (
+              <p className="text-sm text-gray-400">Belum ada audit. Mulai dari tombol &quot;Audit Baru&quot; di atas.</p>
+            )}
+          </div>
+
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <Link
+              href="/app/video-guard/reinforcement"
+              className="flex items-center gap-3 bg-white rounded-2xl border border-gray-200 p-5 hover:border-indigo-300 hover:shadow-md transition-all"
+            >
+              <div className="w-11 h-11 bg-indigo-100 text-indigo-600 rounded-xl flex items-center justify-center flex-shrink-0">
+                <Wand2 className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="font-semibold text-gray-900">Video Cloaking</p>
+                <p className="text-xs text-gray-500">Perkuat presentasi visual video sebelum audit</p>
+              </div>
+            </Link>
+            <Link
+              href="/app/video-guard/riwayat"
+              className="flex items-center gap-3 bg-white rounded-2xl border border-gray-200 p-5 hover:border-indigo-300 hover:shadow-md transition-all"
+            >
+              <div className="w-11 h-11 bg-indigo-100 text-indigo-600 rounded-xl flex items-center justify-center flex-shrink-0">
+                <History className="w-5 h-5" />
+              </div>
+              <div>
+                <p className="font-semibold text-gray-900">Riwayat Audit</p>
+                <p className="text-xs text-gray-500">Lihat semua audit yang pernah dijalankan</p>
+              </div>
+            </Link>
+          </div>
+        </>
+      )}
+    </div>
+  );
+}

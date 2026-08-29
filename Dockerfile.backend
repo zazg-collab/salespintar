@@ -1,7 +1,55 @@
-FROM node:20-alpine AS builder
+# ─────────────────────────────────────────────────────────────────────────────
+# BASIS DEBIAN, BUKAN ALPINE — Fase 77
+#
+# Dulu `node:20-alpine`. Alpine memakai **musl**, dan `onnxruntime-node` — yang
+# dipakai `@huggingface/transformers` untuk model embedding — hanya menyediakan
+# biner prebuilt untuk **glibc**. Hasilnya di server:
+#
+#   Failed to initialize embedding model
+#   Error loading shared library ld-linux-x86-64.so.2: No such file or directory
+#     (needed by .../onnxruntime-node/bin/napi-v6/linux/x64/libonnxruntime.so.1)
+#
+# `ld-linux-x86-64.so.2` itu pemuat pustaka glibc; di Alpine memang tidak ada,
+# dan tidak akan pernah ada.
+#
+# Akibatnya BUKAN sekadar sinkronisasi vault yang gagal. `searchRelevantKnowledge()`
+# menangkap galatnya lalu mengembalikan `[]`, jadi sejak cutover 31 Juli bot
+# menjawab pelanggan **tanpa satu potong pengetahuan pun** — tanpa satu tanda pun
+# di layar. Kosong karena tidak ada yang cocok, dan kosong karena modelnya mati,
+# terlihat sama persis. Bentuk kegagalan yang sama untuk kesekian kalinya.
+#
+# Ini kebalikan cermin dari Fase 73: di sana **glibc CentOS 7 terlalu tua** untuk
+# Node 20, dan container yang menyelamatkan. Di sini **musl-nya container**
+# terlalu asing untuk onnxruntime, dan basis Debian yang menyelamatkan.
+#
+# JANGAN kembalikan ke Alpine demi ukuran image. Selisihnya ~150 MB; harganya
+# seluruh pencarian pengetahuan.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM node:20-slim AS builder
 
 WORKDIR /app
-COPY backend/package.json backend/tsconfig.json ./
+
+# openssl WAJIB ada DI TAHAP BUILDER, bukan cuma di runner.
+# `prisma generate` memilih mesin kueri berdasarkan versi OpenSSL yang ia DETEKSI
+# saat digenerate. Tanpa openssl terpasang, ia menebak `debian-openssl-1.1.x`,
+# sementara runner (bookworm, openssl 3.x) menuntut `debian-openssl-3.0.x` —
+# dan container mati berulang saat start:
+#
+#   PrismaClientInitializationError: could not locate the Query Engine for
+#   runtime "debian-openssl-3.0.x" … generated for "debian-openssl-1.1.x"
+#
+# Kejadian 31 Juli 2026, ~90 detik layanan mati. Pelajarannya bukan "pasang
+# openssl", tapi: **image baru harus DIJALANKAN dulu sebelum menggantikan yang
+# sedang melayani.** Saya sempat menguji model embedding-nya di container
+# terpisah dan lupa menguji bahwa aplikasinya sendiri mau menyala.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends openssl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# package-lock.json WAJIB ikut: `npm ci` menolak jalan tanpa lockfile.
+# Baris ini dulu cuma menyalin package.json, jadi build Docker TIDAK PERNAH
+# berhasil — ketahuan 31 Juli 2026 saat penerapan pertama ke server.
+COPY backend/package.json backend/package-lock.json backend/tsconfig.json ./
 RUN npm ci
 
 COPY backend/prisma ./prisma
@@ -10,11 +58,16 @@ RUN npx prisma generate
 COPY backend/src ./src
 RUN npm run build
 
-FROM node:20-alpine AS runner
+FROM node:20-slim AS runner
 
 WORKDIR /app
 
-RUN apk add --no-cache tini
+# tini: penuai proses zombie. Di Debian letaknya /usr/bin/tini (di Alpine dulu
+# /sbin/tini) — ENTRYPOINT di bawah menyesuaikan.
+# openssl & ca-certificates: dibutuhkan Prisma dan unduhan model dari HuggingFace.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends tini openssl ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/node_modules ./node_modules
 COPY --from=builder /app/dist ./dist
@@ -28,5 +81,5 @@ EXPOSE 3000
 ENV NODE_ENV=production
 ENV NODE_OPTIONS="--max-old-space-size=768"
 
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["node", "dist/server.js"]

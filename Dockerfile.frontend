@@ -1,19 +1,48 @@
+# Next.js dijalankan sebagai SERVER, bukan diekspor statis.
+#
+# ⚠️ Versi sebelumnya memakai `BUILD_STATIC=true` (output: 'export') lalu
+#    menyajikan hasilnya dengan nginx. Itu peninggalan aplikasi Vite SEBELUM
+#    migrasi ke Next.js App Router (25 Juli 2026), dan sejak migrasi itu
+#    **tidak mungkin lagi berhasil**:
+#
+#      Error: Page "/app/chat/[id]" is missing "generateStaticParams()"
+#             so it cannot be used with "output: export" config.
+#
+#    `/app/chat/[id]` itu rute dinamis — id percakapan datang dari database dan
+#    tidak bisa diketahui saat build. Tidak ada cara menambal ini; ekspor statis
+#    memang bukan bentuk yang cocok untuk aplikasi ini.
+#
+# Untungnya mode server justru lebih sederhana: `rewrites()` di next.config.ts
+# ikut hidup lagi (Next mematikannya saat output: 'export'), jadi /api dan
+# /socket.io diteruskan sendiri oleh Next ke backend — TIDAK perlu container
+# nginx terpisah sama sekali.
+
 FROM node:20-alpine AS builder
 
 WORKDIR /app
-COPY frontend/package.json frontend/tsconfig.json frontend/next.config.ts frontend/postcss.config.js frontend/tailwind.config.js ./
+# package-lock.json WAJIB ikut — `npm ci` menolak jalan tanpa lockfile.
+# Nama berkas mengikuti struktur sesudah migrasi ke Next.js 15:
+# postcss.config.mjs & tailwind.config.ts (bukan .js), dan tidak ada folder public/.
+COPY frontend/package.json frontend/package-lock.json frontend/tsconfig.json frontend/next.config.ts frontend/postcss.config.mjs frontend/tailwind.config.ts ./
 RUN npm ci
 
-COPY frontend/public ./public
 COPY frontend/src ./src
-ENV BUILD_STATIC=true
 RUN npm run build
 
-FROM nginx:alpine AS runner
+FROM node:20-alpine AS runner
 
-COPY --from=builder /app/out /usr/share/nginx/html
-COPY nginx/default.conf /etc/nginx/conf.d/default.conf
+WORKDIR /app
+ENV NODE_ENV=production
+RUN apk add --no-cache tini
 
-EXPOSE 80
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/package.json ./
+COPY --from=builder /app/next.config.ts ./
 
-CMD ["nginx", "-g", "daemon off;"]
+EXPOSE 3001
+
+# -H 127.0.0.1: di jaringan host, mengikat 0.0.0.0 berarti terbuka ke internet.
+# Yang menghadap publik cuma nginx HOST di :443 yang mem-proxy ke sini.
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["npx", "next", "start", "-H", "127.0.0.1", "-p", "3001"]

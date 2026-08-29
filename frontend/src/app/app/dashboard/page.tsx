@@ -1,161 +1,802 @@
 'use client';
 
+import { useState, useMemo } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import Link from 'next/link';
 import { apiGet } from '../../../lib/api';
+import { getJakartaTodayStr, getJakartaOffsetStr, getJakartaFirstDayOfMonthStr } from '../../../lib/date';
 import {
-  BarChart3,
-  MessageSquare,
-  Users,
-  Zap,
-  TrendingUp,
+  Users2,
+  Brain,
   Clock,
-  Activity,
-  Bot,
+  CheckCircle2,
+  AlertCircle,
+  ArrowRight,
+  Sparkles,
+  Smartphone,
+  MessageSquareText,
+  Target,
+  Calendar,
+  ShieldCheck,
+  Truck,
+  TrendingUp,
+  UserCheck,
+  XCircle,
+  Trophy,
+  AlertTriangle,
+  Lightbulb,
+  ChevronRight,
+  ChevronDown,
+  ChevronUp,
+  Users,
 } from 'lucide-react';
 import {
-  LineChart,
-  Line,
   BarChart,
   Bar,
   XAxis,
   YAxis,
   CartesianGrid,
   Tooltip,
+  Legend,
   ResponsiveContainer,
 } from 'recharts';
 
-export default function Dashboard() {
-  const { data: stats, isLoading: statsLoading } = useQuery({
-    queryKey: ['dashboard', 'stats'],
+const compactTooltipStyle = {
+  backgroundColor: '#ffffff',
+  borderColor: '#e5e7eb',
+  borderRadius: '0.5rem',
+  fontSize: '11px',
+  padding: '4px 8px',
+  boxShadow: '0 4px 6px -1px rgb(0 0 0 / 0.1), 0 2px 4px -2px rgb(0 0 0 / 0.1)',
+};
+
+const compactItemStyle = {
+  paddingTop: '1px',
+  paddingBottom: '1px',
+  fontSize: '11px',
+};
+
+const compactLabelStyle = {
+  fontWeight: 600,
+  color: '#374151',
+  marginBottom: '2px',
+  fontSize: '11px',
+};
+
+export default function DashboardSalesPage() {
+  const [datePreset, setDatePreset] = useState<'today' | 'yesterday' | '7d' | '30d' | 'this_month' | 'custom'>('today');
+  const [customStart, setCustomStart] = useState(() => getJakartaOffsetStr(-6));
+  const [customEnd, setCustomEnd] = useState(() => getJakartaTodayStr());
+  const [showGuide, setShowGuide] = useState(false);
+
+  const { startDate, endDate, dateRangeLabel } = useMemo(() => {
+    const todayStr = getJakartaTodayStr();
+
+    if (datePreset === 'today') {
+      return { startDate: todayStr, endDate: todayStr, dateRangeLabel: 'Hari Ini' };
+    }
+    if (datePreset === 'yesterday') {
+      const yesterdayStr = getJakartaOffsetStr(-1);
+      return { startDate: yesterdayStr, endDate: yesterdayStr, dateRangeLabel: 'Kemarin' };
+    }
+    if (datePreset === '7d') {
+      return { startDate: getJakartaOffsetStr(-6), endDate: todayStr, dateRangeLabel: '7 Hari Terakhir' };
+    }
+    if (datePreset === '30d') {
+      return { startDate: getJakartaOffsetStr(-29), endDate: todayStr, dateRangeLabel: '30 Hari Terakhir' };
+    }
+    if (datePreset === 'this_month') {
+      return { startDate: getJakartaFirstDayOfMonthStr(), endDate: todayStr, dateRangeLabel: 'Bulan Ini' };
+    }
+    return {
+      startDate: customStart || todayStr,
+      endDate: customEnd || todayStr,
+      dateRangeLabel: `${customStart} s/d ${customEnd}`,
+    };
+  }, [datePreset, customStart, customEnd]);
+
+  const { data: stats } = useQuery({
+    queryKey: ['dashboard', 'v2', 'stats'],
     queryFn: () => apiGet<any>('/dashboard/stats'),
-    refetchInterval: 30000,
-  });
-
-  const { data: trends } = useQuery({
-    queryKey: ['dashboard', 'trends', '7d'],
-    queryFn: () => apiGet<any>('/dashboard/trends?period=7d'),
-    refetchInterval: 60000,
-  });
-
-  const { data: recent } = useQuery({
-    queryKey: ['dashboard', 'recent'],
-    queryFn: () => apiGet<any>('/dashboard/recent?limit=5'),
     refetchInterval: 15000,
   });
 
-  const { data: performance } = useQuery({
-    queryKey: ['dashboard', 'performance'],
-    queryFn: () => apiGet<any>('/dashboard/performance'),
-    refetchInterval: 60000,
+  const { data: hlData, isError: hlIsError, refetch: refetchHlData } = useQuery({
+    queryKey: ['dashboard', 'v2', 'human-learning', startDate, endDate],
+    queryFn: () => apiGet<any>(`/dashboard/human-learning?startDate=${startDate}&endDate=${endDate}`),
+    refetchInterval: 20000,
   });
 
-  const cards = [
-    { label: 'Chat Hari Ini', value: stats?.totalChatsToday ?? 0, icon: MessageSquare, color: 'text-blue-600', bg: 'bg-blue-50' },
-    { label: 'Aktif', value: stats?.activeConversations ?? 0, icon: Activity, color: 'text-green-600', bg: 'bg-green-50' },
-    { label: 'Total Leads', value: stats?.totalLeads ?? 0, icon: Users, color: 'text-purple-600', bg: 'bg-purple-50' },
-    { label: 'Leads Baru', value: stats?.newLeadsToday ?? 0, icon: TrendingUp, color: 'text-indigo-600', bg: 'bg-indigo-50' },
-    { label: 'AI Replies', value: stats?.aiReplies ?? 0, icon: Bot, color: 'text-cyan-600', bg: 'bg-cyan-50' },
-    { label: 'Konversi', value: `${stats?.conversionRate ?? 0}%`, icon: Zap, color: 'text-orange-600', bg: 'bg-orange-50' },
+  // Agregasi sinkron 100% dengan data tabel CS
+  const sessions = hlData?.sessions || [];
+  const totalUniqueBuyers = sessions.reduce((acc: number, s: any) => acc + (s.uniqueBuyers || 0), 0);
+  const totalAdLeads = sessions.reduce((acc: number, s: any) => acc + (s.adLeadsCreated || 0), 0);
+  const totalCohortClosing = sessions.reduce((acc: number, s: any) => acc + (s.cohortClosing || 0), 0);
+  const totalGrossClosing = sessions.reduce((acc: number, s: any) => acc + (s.totalClosingDetected || 0), 0);
+  const totalSolidClosing = sessions.reduce((acc: number, s: any) => acc + (s.solidClosing || 0), 0);
+  const totalAtRiskClosing = sessions.reduce((acc: number, s: any) => acc + (s.atRiskClosing || 0), 0);
+  const totalChatMasuk = sessions.reduce((acc: number, s: any) => acc + (s.totalBuyerMessages || 0), 0);
+  const totalSameDayClosing = sessions.reduce((acc: number, s: any) => acc + (s.sameDayClosing || 0), 0);
+  const totalFollowUpClosing = sessions.reduce((acc: number, s: any) => acc + (s.followUpClosing || 0), 0);
+
+  // 1. Rasio Closing Harian (Cashflow Yield): Mengukur apakah total closing hari ini menutup lead iklan baru hari ini
+  const adBasis = totalAdLeads > 0 ? totalAdLeads : totalUniqueBuyers;
+  const teamDailyYieldRate = adBasis > 0 ? Math.round((totalGrossClosing / adBasis) * 1000) / 10 : 0;
+
+  // 2. Konversi Kohort Iklan (Murni Kualitas Iklan): Dari lead iklan yang masuk hari ini, berapa % yang deal closing
+  const teamCohortRate = totalAdLeads > 0 ? Math.round((totalCohortClosing / totalAdLeads) * 1000) / 10 : 0;
+
+  const sessionsWithResp = sessions.filter((s: any) => typeof s.responseScore === 'number');
+  const avgTeamScore = sessionsWithResp.length > 0 
+    ? Math.round(sessionsWithResp.reduce((acc: number, s: any) => acc + s.responseScore, 0) / sessionsWithResp.length) 
+    : null;
+  const avgTeamMinutes = sessionsWithResp.length > 0
+    ? Math.round((sessionsWithResp.reduce((acc: number, s: any) => acc + s.avgRespMinutes, 0) / sessionsWithResp.length) * 10) / 10
+    : 0;
+
+  let teamAvgRespFormatted = '-';
+  if (avgTeamMinutes > 0) {
+    if (avgTeamMinutes < 1) teamAvgRespFormatted = '< 1 mnt';
+    else if (avgTeamMinutes < 60) teamAvgRespFormatted = `${avgTeamMinutes} mnt`;
+    else teamAvgRespFormatted = `${Math.round((avgTeamMinutes / 60) * 10) / 10} jam`;
+  }
+
+  const summaryCards = [
+    {
+      label: 'Lead Iklan Baru (Inbound)',
+      // [2026-08-27] Sebelumnya fallback diam-diam ke totalUniqueBuyers pas totalAdLeads
+      // masih 0 (lead blm sempat diklasifikasi PROSPEK_IKLAN / blm ke-assign ke sesi CS) --
+      // bikin card ini nyampur 2 metrik beda tanpa tanda apapun (root cause gap yang
+      // dilaporkan Bossfren: Riwayat Pelanggan vs Dashboard CS beda jauh). Sekarang
+      // tampilkan totalAdLeads apa adanya -- kalau 0, ya 0. Selisihnya (kontak chat yang
+      // belum/tidak keklasifikasi sbg lead ads) dikasih tau lewat `badge` kecil, BUKAN
+      // card terpisah (revisi dari draft awal atas permintaan Bossfren -- kebanyakan card).
+      value: `${totalAdLeads} Lead`,
+      sub: `${totalChatMasuk} balon chat masuk`,
+      badge: totalUniqueBuyers > totalAdLeads
+        ? `+${totalUniqueBuyers - totalAdLeads} kontak blm diklasifikasi`
+        : null,
+      icon: Users,
+      color: 'text-blue-600',
+      bg: 'bg-blue-50',
+      link: '/app/leads',
+    },
+    {
+      label: 'Total Transaksi Closing',
+      value: `${totalGrossClosing} Order`,
+      sub: `${totalSameDayClosing} lead baru • ${totalFollowUpClosing} follow-up`,
+      icon: Target,
+      color: 'text-indigo-600',
+      bg: 'bg-indigo-50',
+      link: '/app/leads?conversion=CLOSING',
+      highlight: totalGrossClosing > 0,
+    },
+    {
+      label: 'Rasio Closing Harian',
+      value: `${teamDailyYieldRate}%`,
+      sub: 'Total Closing ÷ Lead Iklan Masuk',
+      icon: TrendingUp,
+      color: 'text-emerald-600',
+      bg: 'bg-emerald-50',
+      link: '/app/leads?conversion=CLOSING',
+      highlight: teamDailyYieldRate > 0,
+    },
+    {
+      label: 'Konversi Ads (Murni Iklan)',
+      value: `${teamCohortRate}%`,
+      sub: `${totalCohortClosing} closing dari ${totalAdLeads} lead ads`,
+      icon: Sparkles,
+      color: 'text-purple-600',
+      bg: 'bg-purple-50',
+      link: '/app/leads?conversion=CLOSING',
+      highlight: teamCohortRate > 0,
+    },
+    {
+      label: 'Solid Closing (Aman Kirim)',
+      value: `${totalSolidClosing} Order`,
+      sub: 'Alamat & uang COD tervalidasi',
+      icon: ShieldCheck,
+      color: 'text-teal-600',
+      bg: 'bg-teal-50',
+      link: '/app/leads?conversion=CLOSING&rtsLevel=LOW',
+    },
+    {
+      label: 'Waspada Retur / RTS',
+      value: `${totalAtRiskClosing} Order`,
+      sub: totalAtRiskClosing > 0 ? 'Wajib verifikasi ulang CS' : '0% risiko retur COD',
+      icon: AlertTriangle,
+      color: totalAtRiskClosing > 0 ? 'text-rose-600' : 'text-emerald-600',
+      bg: totalAtRiskClosing > 0 ? 'bg-rose-50' : 'bg-emerald-50',
+      link: '/app/leads?rtsLevel=HIGH',
+      highlight: totalAtRiskClosing > 0,
+    },
   ];
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold text-gray-900">Dashboard</h1>
-
-      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-4">
-        {cards.map((card) => (
-          <div key={card.label} className="bg-white p-4 rounded-xl border border-gray-200">
-            <div className={`w-10 h-10 ${card.bg} rounded-lg flex items-center justify-center mb-3`}>
-              <card.icon className={`w-5 h-5 ${card.color}`} />
-            </div>
-            <p className="text-2xl font-bold">{card.value}</p>
-            <p className="text-xs text-gray-500 mt-1">{card.label}</p>
+    <div className="space-y-4 pb-8 max-w-7xl mx-auto">
+      {/* ── HEADER UTAMA ── */}
+      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 border-b border-gray-200 pb-3">
+        <div>
+          <div className="flex items-center gap-2">
+            <span className="px-2 py-0.5 rounded text-[10px] font-bold tracking-wider bg-indigo-50 text-indigo-700 border border-indigo-100">
+              CEO & SALES MANAGEMENT VIEW
+            </span>
           </div>
+          <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2 mt-0.5">
+            <Target className="w-5 h-5 text-emerald-600" />
+            Dashboard Performa & Sales CS
+          </h1>
+          <p className="text-xs text-gray-500">
+            Monitoring produktivitas CS, respon time, Gross vs Solid Closing, serta deteksi dini Toxic Closing (Anti-RTS Firewall).
+          </p>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <Link
+            href="/app/leads"
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition-colors shadow-xs"
+          >
+            <Users className="w-3.5 h-3.5" />
+            Riwayat Pelanggan
+          </Link>
+        </div>
+      </div>
+
+      {/* ── ERROR STATE (Langkah E Fase 27): bedakan fetch gagal vs data memang kosong.
+           Sebelumnya hlData/stats tidak pernah dicek isError, jadi kegagalan API terlihat
+           identik dengan "belum ada CS terhubung" di semua tabel/kartu di bawah. ── */}
+      {hlIsError && (
+        <div className="flex items-center justify-between gap-2 p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800">
+          <div className="flex items-center gap-2">
+            <AlertCircle className="w-4 h-4 text-rose-600 flex-shrink-0" />
+            <span>Gagal memuat data performa CS dari server. Angka di bawah mungkin belum sinkron / kosong palsu, bukan berarti belum ada aktivitas.</span>
+          </div>
+          <button
+            onClick={() => refetchHlData()}
+            className="text-xs font-semibold text-rose-700 hover:text-rose-900 underline whitespace-nowrap"
+          >
+            Coba lagi
+          </button>
+        </div>
+      )}
+
+      {/* ── FILTER TANGGAL ── */}
+      <div className="flex flex-wrap items-center justify-between gap-2.5 bg-white p-2.5 rounded-xl border border-gray-200 shadow-xs">
+        <div className="flex items-center gap-1.5 text-xs text-gray-600 font-semibold">
+          <Calendar className="w-3.5 h-3.5 text-gray-400" />
+          <span>Periode Analisis:</span>
+          <span className="text-gray-900 font-bold bg-gray-100 px-2 py-0.5 rounded text-xs">{dateRangeLabel}</span>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-1 bg-gray-100 p-1 rounded-lg">
+          <button
+            onClick={() => setDatePreset('today')}
+            className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
+              datePreset === 'today' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
+            }`}
+          >
+            Hari Ini
+          </button>
+          <button
+            onClick={() => setDatePreset('yesterday')}
+            className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
+              datePreset === 'yesterday' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
+            }`}
+          >
+            Kemarin
+          </button>
+          <button
+            onClick={() => setDatePreset('7d')}
+            className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
+              datePreset === '7d' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
+            }`}
+          >
+            7 Hari
+          </button>
+          <button
+            onClick={() => setDatePreset('30d')}
+            className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
+              datePreset === '30d' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
+            }`}
+          >
+            30 Hari
+          </button>
+          <button
+            onClick={() => setDatePreset('this_month')}
+            className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
+              datePreset === 'this_month' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
+            }`}
+          >
+            Bulan Ini
+          </button>
+          <button
+            onClick={() => setDatePreset('custom')}
+            className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
+              datePreset === 'custom' ? 'bg-indigo-600 text-white shadow-sm' : 'text-gray-600 hover:text-gray-900'
+            }`}
+          >
+            Custom
+          </button>
+        </div>
+
+        {datePreset === 'custom' && (
+          <div className="flex items-center gap-1 bg-gray-50 border border-gray-200 px-2 py-1 rounded-lg">
+            <input
+              type="date"
+              value={customStart}
+              onChange={(e) => setCustomStart(e.target.value)}
+              className="px-1.5 py-0.5 text-xs bg-white border border-gray-200 rounded text-gray-700 focus:outline-none"
+            />
+            <span className="text-xs text-gray-400">-</span>
+            <input
+              type="date"
+              value={customEnd}
+              onChange={(e) => setCustomEnd(e.target.value)}
+              className="px-1.5 py-0.5 text-xs bg-white border border-gray-200 rounded text-gray-700 focus:outline-none"
+            />
+          </div>
+        )}
+      </div>
+
+      {/* ── 1. TOP SUMMARY SCORECARDS (6 KARTU INFORMATIF & SINKRON) ── */}
+      <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-2.5">
+        {summaryCards.map((card) => (
+          <Link
+            key={card.label}
+            href={card.link}
+            className={`bg-white p-2.5 rounded-xl border transition-all hover:shadow-xs hover:border-indigo-200 group ${
+              card.highlight ? 'border-amber-300 ring-2 ring-amber-100' : 'border-gray-200'
+            }`}
+          >
+            <div className="flex items-center justify-between mb-1.5">
+              <div className={`w-6 h-6 ${card.bg} rounded-lg flex items-center justify-center`}>
+                <card.icon className={`w-3.5 h-3.5 ${card.color}`} />
+              </div>
+              <ArrowRight className="w-3 h-3 text-gray-300 group-hover:text-indigo-600 transition-colors" />
+            </div>
+            <p className="text-base md:text-lg font-bold text-gray-900 leading-tight">{card.value}</p>
+            <p className="text-[11px] font-semibold text-gray-700 mt-0.5 truncate">{card.label}</p>
+            <p className="text-[10px] text-gray-400 mt-0.5 truncate">{card.sub}</p>
+            {'badge' in card && card.badge && (
+              <span className="inline-block mt-1 px-1.5 py-0.5 rounded-full text-[9px] font-semibold bg-slate-100 text-slate-600 truncate max-w-full">
+                {card.badge}
+              </span>
+            )}
+          </Link>
         ))}
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="bg-white p-6 rounded-xl border border-gray-200">
-          <h3 className="font-semibold mb-4">Tren Chat (7 Hari)</h3>
-          <ResponsiveContainer width="100%" height={250}>
-            <LineChart data={trends?.daily ?? []}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-              <XAxis dataKey="date" tick={{ fontSize: 11 }} tickFormatter={(v) => v.slice(5)} />
-              <YAxis tick={{ fontSize: 11 }} />
-              <Tooltip />
-              <Line type="monotone" dataKey="chats" stroke="#6366f1" strokeWidth={2} name="Chat" />
-              <Line type="monotone" dataKey="ai" stroke="#06b6d4" strokeWidth={2} name="AI" />
-              <Line type="monotone" dataKey="human" stroke="#f59e0b" strokeWidth={2} name="Human" />
-            </LineChart>
-          </ResponsiveContainer>
+      {/* ── PANDUAN METRIK KONVERSI (CEO GUIDE - COLLAPSIBLE) ── */}
+      <div className="bg-slate-50 border border-slate-200/80 rounded-xl overflow-hidden text-xs text-slate-700 transition-all shadow-xs">
+        <button
+          onClick={() => setShowGuide((prev) => !prev)}
+          className="w-full flex items-center justify-between p-3 hover:bg-slate-100/80 transition-colors text-left"
+        >
+          <div className="flex items-center gap-2.5">
+            <div className="p-1.5 bg-indigo-100 text-indigo-700 rounded-lg flex-shrink-0">
+              <Sparkles className="w-4 h-4" />
+            </div>
+            <div>
+              <h4 className="font-bold text-gray-900 text-xs flex items-center gap-1.5">
+                💡 Panduan 2 Sudut Pandang Metrik Konversi SalesPintar
+              </h4>
+              <p className="text-[11px] text-gray-500 mt-0.5">
+                Klik untuk {showGuide ? 'menyembunyikan' : 'melihat penjelasan perbedaan'} Rasio Closing Harian vs Konversi Ads
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-1 text-[11px] font-semibold text-indigo-600 bg-indigo-50 px-2.5 py-1 rounded-lg border border-indigo-100 hover:bg-indigo-100 transition-colors">
+            <span>{showGuide ? 'Tutup Panduan' : 'Buka Panduan'}</span>
+            {showGuide ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+          </div>
+        </button>
+
+        {showGuide && (
+          <div className="p-4 pt-1 border-t border-slate-200/60 bg-white/50">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-3 pt-2 text-[11px]">
+              <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1 shadow-xs">
+                <span className="font-bold text-emerald-700 flex items-center gap-1">
+                  📈 1. Rasio Closing Harian (Daily Yield)
+                </span>
+                <p className="text-gray-600 leading-relaxed">
+                  <strong>Rumus:</strong> Total Closing Hari Ini ÷ Lead Iklan Masuk Hari Ini.<br/>
+                  <strong>Fungsi:</strong> Mengukur apakah total closingan hari ini (termasuk follow-up & repeat order) sanggup menutup biaya iklan yang dibakar hari ini.
+                </p>
+              </div>
+              <div className="p-3 bg-white rounded-lg border border-slate-200 space-y-1 shadow-xs">
+                <span className="font-bold text-purple-700 flex items-center gap-1">
+                  🧪 2. Konversi Ads (Murni Kualitas Iklan)
+                </span>
+                <p className="text-gray-600 leading-relaxed">
+                  <strong>Rumus:</strong> Lead Iklan Hari Ini yang Deal Closing ÷ Lead Iklan Hari Ini.<br/>
+                  <strong>Fungsi:</strong> Mengukur efektivitas materi iklan & landing page (dari 100 orang yang klik iklan hari ini, berapa yang akhirnya beli).
+                </p>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* ── 2. AI EXECUTIVE BRIEFING & TOXIC CLOSING INSIGHT ── */}
+      <div className="bg-gradient-to-r from-indigo-900 via-slate-900 to-indigo-950 text-white rounded-xl p-5 shadow-sm space-y-3">
+        <div className="flex items-center justify-between border-b border-indigo-800/60 pb-2.5">
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 rounded-lg bg-indigo-500/30 flex items-center justify-center text-indigo-300">
+              <Lightbulb className="w-4 h-4 text-amber-400" />
+            </div>
+            <div>
+              <h3 className="text-sm font-bold text-white flex items-center gap-2">
+                AI Executive Briefing & Evaluasi Kualitas Closing
+              </h3>
+              <p className="text-[11px] text-indigo-200">
+                Temuan cerdas AI Supervisor mengenai perilaku CS, validasi alamat pembeli, dan prediksi risiko retur COD.
+              </p>
+            </div>
+          </div>
+          <Link
+            href="/app/leads?rtsLevel=HIGH"
+            className="hidden sm:inline-flex items-center gap-1 text-xs font-semibold text-amber-300 hover:text-amber-200 transition"
+          >
+            Audit Prospek Berisiko <ChevronRight className="w-3.5 h-3.5" />
+          </Link>
         </div>
 
-        <div className="bg-white p-6 rounded-xl border border-gray-200">
-          <h3 className="font-semibold mb-4">Jam Sibuk</h3>
-          <ResponsiveContainer width="100%" height={250}>
-            <BarChart data={trends?.peakHours ?? []}>
-              <CartesianGrid strokeDasharray="3 3" stroke="#f0f0f0" />
-              <XAxis dataKey="hour" tick={{ fontSize: 11 }} tickFormatter={(v) => `${v}:00`} />
-              <YAxis tick={{ fontSize: 11 }} />
-              <Tooltip />
-              <Bar dataKey="count" fill="#6366f1" radius={[4, 4, 0, 0]} name="Pesan" />
-            </BarChart>
-          </ResponsiveContainer>
+        <div className="space-y-2 text-xs text-indigo-100">
+          {(!hlData?.executiveInsights || hlData.executiveInsights.length === 0) ? (
+            <div className="p-3 bg-white/5 rounded-lg border border-white/10 flex items-center gap-2">
+              <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0" />
+              <span>
+                Semua interaksi CS terpantau sehat. Belum ada anomali closing yang dipaksakan atau potensi retur tinggi.
+              </span>
+            </div>
+          ) : (
+            hlData.executiveInsights.map((insight: string, idx: number) => {
+              const isWarning = insight.includes('Rawan Retur') || insight.includes('Toxic');
+              return (
+                <div
+                  key={idx}
+                  className={`p-3 rounded-lg border flex items-start gap-2.5 ${
+                    isWarning
+                      ? 'bg-amber-500/10 border-amber-400/30 text-amber-100'
+                      : 'bg-white/5 border-white/10 text-indigo-100'
+                  }`}
+                >
+                  {isWarning ? (
+                    <AlertTriangle className="w-4 h-4 text-amber-400 flex-shrink-0 mt-0.5" />
+                  ) : (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400 flex-shrink-0 mt-0.5" />
+                  )}
+                  <span className="leading-relaxed">{insight}</span>
+                </div>
+              );
+            })
+          )}
         </div>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
-        <div className="bg-white p-6 rounded-xl border border-gray-200">
-          <h3 className="font-semibold mb-4">Percakapan Terbaru</h3>
-          {(!recent || recent.length === 0) && (
-            <p className="text-sm text-gray-400">Belum ada percakapan</p>
-          )}
-          <div className="space-y-3">
-            {recent?.map((c: any) => (
-              <div key={c.id} className="flex items-center gap-3 p-3 rounded-lg hover:bg-gray-50">
-                <div className="w-10 h-10 rounded-full bg-indigo-100 flex items-center justify-center text-sm font-medium text-indigo-600">
-                  {(c.lead?.name || '?')[0]}
-                </div>
-                <div className="flex-1 min-w-0">
-                  <p className="text-sm font-medium truncate">{c.lead?.name || c.lead?.waNumber}</p>
-                  <p className="text-xs text-gray-400 truncate">
-                    {c.messages?.[0]?.message || 'Belum ada pesan'}
-                  </p>
-                </div>
-                <span className={`text-xs px-2 py-1 rounded-full ${
-                  c.status === 'AI' ? 'bg-cyan-50 text-cyan-600' :
-                  c.status === 'HUMAN' ? 'bg-amber-50 text-amber-600' :
-                  'bg-gray-100 text-gray-500'
-                }`}>
-                  {c.status}
-                </span>
-              </div>
-            ))}
+      {/* ── 3. TABEL 1: PRODUKTIVITAS & KECEPATAN LAYANAN CS ── */}
+      <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-gray-100 pb-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <Users2 className="w-4 h-4 text-blue-600" />
+              <h2 className="text-sm font-bold text-gray-900">1. Produktivitas & Kecepatan Layanan CS</h2>
+            </div>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Evaluasi volume interaksi chat, pembeli unik, response time, dan skor respon ala marketplace.
+            </p>
+          </div>
+          <span className="text-[11px] text-gray-400">Total {hlData?.sessions?.length ?? 0} CS Terhubung</span>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs md:text-sm">
+            <thead className="bg-gray-50 text-gray-600 text-[11px] uppercase font-semibold">
+              <tr className="whitespace-nowrap">
+                <th className="px-3.5 py-2.5 rounded-l-lg whitespace-nowrap">CS / Perangkat</th>
+                <th className="px-3 py-2.5 whitespace-nowrap">Status</th>
+                <th className="px-3 py-2.5 whitespace-nowrap">Chat Masuk</th>
+                <th className="px-3 py-2.5 whitespace-nowrap">📥 Lead Ads</th>
+                <th className="px-3 py-2.5 whitespace-nowrap">🎯 Total Closing</th>
+                <th className="px-3 py-2.5 whitespace-nowrap">📈 Rasio Harian</th>
+                <th className="px-3 py-2.5 whitespace-nowrap">🧪 Konversi Ads</th>
+                <th className="px-3 py-2.5 whitespace-nowrap">Kecepatan Balas</th>
+                <th className="px-3.5 py-2.5 rounded-r-lg whitespace-nowrap">Skor Respon CS</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {(!hlData?.sessions || hlData.sessions.length === 0) && (
+                <tr>
+                  <td colSpan={9} className="px-3.5 py-6 text-center text-gray-400 text-xs">
+                    Belum ada HP CS yang tersambung. Hubungkan di menu{' '}
+                    <Link href="/app/human-learning" className="text-indigo-600 underline font-semibold">
+                      Device & Sesi CS
+                    </Link>
+                    .
+                  </td>
+                </tr>
+              )}
+              {hlData?.sessions?.map((s: any) => {
+                const hasScore = typeof s.responseScore === 'number';
+                const isFast = hasScore && s.responseScore >= 90;
+                const isModerate = hasScore && s.responseScore >= 60 && s.responseScore < 90;
+                const leadCount = typeof s.adLeadsCreated === 'number' ? s.adLeadsCreated : 0;
+
+                return (
+                  <tr key={s.id} className="hover:bg-gray-50/80 transition-colors whitespace-nowrap">
+                    <td className="px-3.5 py-3">
+                      <div className="font-semibold text-gray-900">{s.csName}</div>
+                      <div className="text-[11px] text-gray-400 font-mono">{s.csPhone}</div>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span
+                        className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${
+                          s.status === 'CONNECTED'
+                            ? 'bg-emerald-50 text-emerald-700 border border-emerald-200'
+                            : 'bg-gray-100 text-gray-600 border border-gray-200'
+                        }`}
+                      >
+                        <span
+                          className={`w-1.5 h-1.5 rounded-full ${
+                            s.status === 'CONNECTED' ? 'bg-emerald-500 animate-pulse' : 'bg-gray-400'
+                          }`}
+                        />
+                        {s.status === 'CONNECTED' ? 'Online' : 'Offline'}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3 text-gray-700">
+                      <span className="font-semibold text-gray-900">{s.totalBuyerMessages || 0}</span>
+                      <span className="text-[10px] text-gray-400 block">pesan</span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className="inline-flex items-center gap-1 text-indigo-700 bg-indigo-50 px-2 py-0.5 rounded font-bold text-xs">
+                        📥 {leadCount} baru
+                      </span>
+                      <span className="text-[10px] text-gray-400 block mt-0.5">
+                        ({s.uniqueBuyers || 0} aktif)
+                      </span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className="font-bold text-gray-900">{s.totalClosingDetected || 0} deal</span>
+                      <span className="text-[10px] text-gray-400 block mt-0.5">
+                        {s.sameDayClosing || 0} baru • {s.followUpClosing || 0} f-up
+                      </span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className="inline-flex items-center gap-1 font-bold text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded text-xs border border-emerald-200">
+                        {s.closingRate || 0}%
+                      </span>
+                      <span className="text-[10px] text-gray-400 block mt-0.5">
+                        Yield Harian
+                      </span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <span className="inline-flex items-center gap-1 font-bold text-purple-700 bg-purple-50 px-2 py-0.5 rounded text-xs border border-purple-200">
+                        {s.cohortClosingRate || 0}%
+                      </span>
+                      <span className="text-[10px] text-gray-400 block mt-0.5">
+                        {s.cohortClosing || 0} dari {leadCount}
+                      </span>
+                    </td>
+                    <td className="px-3 py-3">
+                      <div className="flex items-center gap-1 font-medium text-gray-800 text-xs">
+                        <Clock className="w-3.5 h-3.5 text-gray-400" />
+                        <span>{s.avgRespFormatted || '-'}</span>
+                      </div>
+                    </td>
+                    <td className="px-3.5 py-3">
+                      {hasScore ? (
+                        <div className="inline-flex items-center gap-1.5">
+                          <span
+                            className={`px-2 py-0.5 rounded font-bold text-xs ${
+                              isFast
+                                ? 'bg-emerald-100 text-emerald-800'
+                                : isModerate
+                                ? 'bg-amber-100 text-amber-800'
+                                : 'bg-rose-100 text-rose-800'
+                            }`}
+                          >
+                            {s.responseScore}%
+                          </span>
+                          <span className="text-[11px] text-gray-500">
+                            {s.responseRating || '-'}
+                          </span>
+                        </div>
+                      ) : (
+                        <span className="text-xs text-gray-400 font-normal">
+                          Belum Ada Data
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── 4. TABEL 2: AUDIT INTEGRITAS CLOSING & RADAR ANTI-RTS PER CS ── */}
+      <div className="bg-white p-5 rounded-xl border border-gray-200 shadow-sm space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-2 border-b border-gray-100 pb-3">
+          <div>
+            <div className="flex items-center gap-2">
+              <ShieldCheck className="w-4 h-4 text-emerald-600" />
+              <h2 className="text-sm font-bold text-gray-900">2. Audit Integritas Closing & Radar Anti-RTS per CS</h2>
+            </div>
+            <p className="text-xs text-gray-500 mt-0.5">
+              Membedah kualitas closing CS: Berapa yang benar-benar Solid (aman kirim COD) vs Toxic Closing (rawan retur).
+            </p>
+          </div>
+          <Link
+            href="/app/leads"
+            className="text-xs font-semibold text-indigo-600 hover:text-indigo-700 inline-flex items-center gap-1"
+          >
+            Buka Riwayat Pelanggan <ArrowRight className="w-3.5 h-3.5" />
+          </Link>
+        </div>
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left text-xs md:text-sm">
+            <thead className="bg-gray-50 text-gray-600 text-xs uppercase font-semibold">
+              <tr>
+                <th className="px-3.5 py-2.5 rounded-l-lg">CS Pemegang</th>
+                <th className="px-3.5 py-2.5">Total Closing (Gross)</th>
+                <th className="px-3.5 py-2.5">Skor Integritas CS</th>
+                <th className="px-3.5 py-2.5">🛡️ Solid Closing (Aman)</th>
+                <th className="px-3.5 py-2.5">⚠️ Potensi RTS (Rawan)</th>
+                <th className="px-3.5 py-2.5 rounded-r-lg">Rekomendasi Supervisor</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-gray-100">
+              {(!hlData?.sessions || hlData.sessions.length === 0) && (
+                <tr>
+                  <td colSpan={6} className="px-3.5 py-6 text-center text-gray-400 text-xs">
+                    Belum ada data closing untuk dianalisis.
+                  </td>
+                </tr>
+              )}
+              {hlData?.sessions?.map((s: any) => {
+                const gross = s.totalClosingDetected || 0;
+                const solid = s.solidClosing || 0;
+                const atRisk = s.atRiskClosing || 0;
+                const integrityPct = gross > 0 ? Math.round((solid / gross) * 100) : 100;
+                const isToxic = atRisk > 0 && integrityPct < 75;
+
+                return (
+                  <tr key={s.id} className="hover:bg-gray-50/80 transition-colors">
+                    <td className="px-3.5 py-3 font-semibold text-gray-900">
+                      <div>{s.csName}</div>
+                      <div className="text-[11px] text-gray-400 font-mono font-normal">{s.csPhone}</div>
+                    </td>
+
+                    <td className="px-3.5 py-3 font-bold text-gray-900">
+                      {gross} transaksi
+                    </td>
+
+                    <td className="px-3.5 py-3">
+                      {gross === 0 ? (
+                        <div>
+                          <span className="font-bold text-xs text-gray-400">-</span>
+                          <span className="text-[10px] text-gray-400 block mt-0.5">Belum Ada Closing</span>
+                        </div>
+                      ) : (
+                        <div>
+                          <div className="flex items-center gap-2">
+                            <div className="w-16 h-2 bg-gray-100 rounded-full overflow-hidden">
+                              <div
+                                className={`h-full rounded-full ${
+                                  integrityPct >= 80 ? 'bg-emerald-500' : integrityPct >= 60 ? 'bg-amber-500' : 'bg-rose-500'
+                                }`}
+                                style={{ width: `${integrityPct}%` }}
+                              />
+                            </div>
+                            <span className="font-bold text-xs text-gray-800">{integrityPct}%</span>
+                          </div>
+                          <span className="text-[10px] text-gray-400 block mt-0.5">
+                            {integrityPct >= 80 ? 'Kualitas Tinggi' : 'Banyak Komplain/Ragu'}
+                          </span>
+                        </div>
+                      )}
+                    </td>
+
+                    <td className="px-3.5 py-3">
+                      <span className="inline-flex items-center gap-1 text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded font-bold text-xs">
+                        🛡️ {solid} deal
+                      </span>
+                      <span className="text-[10px] text-emerald-600 block mt-0.5">Alamat & uang siap</span>
+                    </td>
+
+                    <td className="px-3.5 py-3">
+                      <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded font-bold text-xs ${
+                        atRisk > 0 ? 'text-rose-700 bg-rose-50 border border-rose-200' : 'text-gray-400 bg-gray-50'
+                      }`}>
+                        ⚠️ {atRisk} deal
+                      </span>
+                      <span className="text-[10px] text-rose-600 block mt-0.5">
+                        {atRisk > 0 ? 'Wajib Validasi Ulang' : 'Tidak Ada'}
+                      </span>
+                    </td>
+
+                    <td className="px-3.5 py-3">
+                      {gross === 0 ? (
+                        <span className="inline-flex items-center gap-1 text-[11px] text-gray-500 bg-gray-50 px-2 py-1 rounded border border-gray-200">
+                          Belum Ada Transaksi
+                        </span>
+                      ) : isToxic ? (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-bold text-rose-800 bg-rose-50 px-2 py-1 rounded border border-rose-200">
+                          <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />
+                          Briefing CS (Verifikasi COD)
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-semibold text-emerald-800 bg-emerald-50 px-2 py-1 rounded border border-emerald-200">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                          Closing Aman & Berkualitas
+                        </span>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* ── 5. GRAFIK TREN PENJUALAN & CS CHAT ── */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 pt-2">
+        <div className="lg:col-span-6 bg-white p-5 rounded-xl border border-gray-200 shadow-sm space-y-3">
+          <h3 className="text-xs font-bold text-gray-700 uppercase tracking-wider flex items-center gap-1.5">
+            <TrendingUp className="w-3.5 h-3.5 text-indigo-600" />
+            Tren Konversi Penjualan Harian ({dateRangeLabel})
+          </h3>
+          <div className="bg-gray-50/70 p-3 rounded-lg border border-gray-100">
+            <ResponsiveContainer width="100%" height={210}>
+              <BarChart data={hlData?.trends ?? []}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
+                <XAxis dataKey="date" tick={{ fontSize: 10 }} tickFormatter={(v) => v.slice(5)} />
+                <YAxis tick={{ fontSize: 10 }} width={24} />
+                <Tooltip
+                  contentStyle={compactTooltipStyle}
+                  itemStyle={compactItemStyle}
+                  labelStyle={compactLabelStyle}
+                />
+                <Legend
+                  wrapperStyle={{ fontSize: '11px', paddingTop: '6px' }}
+                  iconSize={8}
+                />
+                <Bar dataKey="closing" fill="#10b981" radius={[3, 3, 0, 0]} name="🎯 Closing (Deal)" />
+                <Bar dataKey="pending" fill="#3b82f6" radius={[3, 3, 0, 0]} name="⏳ Follow Up" />
+                <Bar dataKey="lost" fill="#f43f5e" radius={[3, 3, 0, 0]} name="❌ Lost (Batal)" />
+              </BarChart>
+            </ResponsiveContainer>
           </div>
         </div>
 
-        <div className="bg-white p-6 rounded-xl border border-gray-200">
-          <h3 className="font-semibold mb-4">Performa AI</h3>
-          <div className="space-y-4">
-            <div className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-              <span className="text-sm text-gray-600">Total AI Replies</span>
-              <span className="font-semibold">{performance?.totalAiReplies ?? 0}</span>
-            </div>
-            <div className="flex items-center justify-between p-3 bg-gray-50 rounded-lg">
-              <span className="text-sm text-gray-600">Human Takeover Rate</span>
-              <span className="font-semibold">{performance?.humanTakeoverRate ?? 0}%</span>
-            </div>
-            <div>
-              <h4 className="text-sm font-medium text-gray-700 mb-2">Top Intent</h4>
-              <div className="space-y-2">
-                {performance?.topIntents?.map((i: any) => (
-                  <div key={i.intent} className="flex items-center justify-between text-sm">
-                    <span className="text-gray-600 capitalize">{i.intent}</span>
-                    <span className="font-medium">{i.count}</span>
-                  </div>
-                ))}
-              </div>
-            </div>
+        <div className="lg:col-span-6 bg-white p-5 rounded-xl border border-gray-200 shadow-sm space-y-3">
+          <h3 className="text-xs font-bold text-gray-700 uppercase tracking-wider flex items-center gap-1.5">
+            <MessageSquareText className="w-3.5 h-3.5 text-blue-600" />
+            Volume Chat CS & Interaksi Pembeli ({dateRangeLabel})
+          </h3>
+          <div className="bg-gray-50/70 p-3 rounded-lg border border-gray-100">
+            <ResponsiveContainer width="100%" height={210}>
+              <BarChart data={hlData?.trends ?? []}>
+                <CartesianGrid strokeDasharray="3 3" stroke="#e5e7eb" vertical={false} />
+                <XAxis dataKey="date" tick={{ fontSize: 10 }} tickFormatter={(v) => v.slice(5)} />
+                <YAxis tick={{ fontSize: 10 }} width={24} />
+                <Tooltip
+                  contentStyle={compactTooltipStyle}
+                  itemStyle={compactItemStyle}
+                  labelStyle={compactLabelStyle}
+                />
+                <Legend
+                  wrapperStyle={{ fontSize: '11px', paddingTop: '6px' }}
+                  iconSize={8}
+                />
+                <Bar dataKey="extractions" fill="#6366f1" radius={[3, 3, 0, 0]} name="Pesan Diserap" />
+                <Bar dataKey="minings" fill="#06b6d4" radius={[3, 3, 0, 0]} name="Aktivitas Chat" />
+              </BarChart>
+            </ResponsiveContainer>
           </div>
         </div>
       </div>

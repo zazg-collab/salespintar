@@ -1,0 +1,468 @@
+generator client {
+  provider = "prisma-client-js"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Business {
+  id        String   @id @default(uuid()) @db.Uuid
+  name      String   @db.VarChar(200)
+  slug      String   @unique @db.VarChar(100)
+  isActive  Boolean  @default(true) @map("is_active")
+  aiConfig  Json     @default("{}") @map("ai_config")
+  settings  Json     @default("{}")
+  // Fix C9: mode Shadow Mining ("auto" | "draft") persisten per business.
+  // null = belum pernah diatur → pakai default dari env SHADOW_MINING_MODE.
+  shadowMiningMode String? @map("shadow_mining_mode") @db.VarChar(10)
+  // Rem untuk penambangan otomatis saat percakapan ditandai Selesai. Sebelumnya
+  // auto-trigger menyala permanen tanpa cara mematikannya — tiap percakapan
+  // selesai langsung memakan token Groq. Default true = perilaku lama.
+  shadowMiningAutoTrigger Boolean @default(true) @map("shadow_mining_auto_trigger")
+  createdAt DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  users         User[]
+  waCredentials WaCredential[]
+  leads         Lead[]
+  conversations Conversation[]
+  messages      Message[]
+  broadcasts    Broadcast[]
+  broadcastLogs BroadcastLog[]
+  sessions      Session[]
+  knowledge     Knowledge[]
+  miningSessions MiningSession[]
+  minedQuestions MinedQuestion[]
+  csHumanLearningSessions CsHumanLearningSession[]
+
+  @@map("businesses")
+}
+
+model User {
+  id          String    @id @default(uuid()) @db.Uuid
+  businessId  String    @map("business_id") @db.Uuid
+  name        String    @db.VarChar(100)
+  email       String    @unique @db.VarChar(255)
+  password    String    @db.VarChar(255)
+  role        String    @default("ADMIN") @db.VarChar(20)
+  isActive    Boolean   @default(true) @map("is_active")
+  lastLoginAt DateTime? @map("last_login_at") @db.Timestamptz()
+  inviteToken String?   @map("invite_token") @db.VarChar(255)
+  createdAt   DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt   DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  business       Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  conversations  Conversation[]  @relation("HumanTakeover")
+  broadcasts     Broadcast[]
+  sessions       Session[]
+  messages       Message[]       @relation("HumanMessage")
+
+  @@index([businessId])
+  @@index([email])
+  @@map("users")
+}
+
+model WaCredential {
+  id              String    @id @default(uuid()) @db.Uuid
+  businessId      String    @map("business_id") @db.Uuid
+  waNumber        String    @map("wa_number") @db.VarChar(15)
+  waId            String?   @map("wa_id") @db.VarChar(100)
+  sessionData     Json?     @map("session_data")
+  status          String    @default("DISCONNECTED") @db.VarChar(20)
+  qrCode          String?   @map("qr_code")
+  qrExpiresAt     DateTime? @map("qr_expires_at") @db.Timestamptz()
+  lastConnectedAt DateTime? @map("last_connected_at") @db.Timestamptz()
+  createdAt       DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt       DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, waNumber])
+  @@index([businessId])
+  @@map("wa_credentials")
+}
+
+model Lead {
+  id             String    @id @default(uuid()) @db.Uuid
+  businessId     String    @map("business_id") @db.Uuid
+  name           String?   @db.VarChar(500)
+  waNumber       String    @map("wa_number") @db.VarChar(20)
+  waId           String?   @map("wa_id") @db.VarChar(200)
+  avatarUrl      String?   @map("avatar_url")
+  segment        String?   @db.VarChar(50)
+  labels         String[]  @default([])
+  score          Int       @default(0)
+  status         String    @default("ACTIVE") @db.VarChar(20)
+  intent         String?   @db.VarChar(50)
+  lastMessageAt  DateTime? @map("last_message_at") @db.Timestamptz()
+  dailyAiCount   Int       @default(0) @map("daily_ai_count")
+  /** Tanggal (jam Indonesia) milik `dailyAiCount`. Kalau bukan hari ini,
+   *  hitungannya dianggap nol — inilah "reset harian" yang dulu tidak pernah
+   *  terjadi karena tidak ada cron yang menjalankannya. */
+  dailyCountDate DateTime? @map("daily_count_date") @db.Date
+  totalMessages  Int       @default(0) @map("total_messages")
+  createdAt      DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt      DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  business      Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  conversations Conversation[]
+  broadcastLogs BroadcastLog[]
+  messages      Message[]
+
+  @@unique([businessId, waNumber])
+  @@index([businessId])
+  @@index([businessId, status])
+  @@index([businessId, segment])
+  @@index([businessId, lastMessageAt])
+  @@map("leads")
+}
+
+model Conversation {
+  id         String    @id @default(uuid()) @db.Uuid
+  businessId String    @map("business_id") @db.Uuid
+  leadId     String    @map("lead_id") @db.Uuid
+  status     String    @default("AI") @db.VarChar(10)
+  humanId    String?   @map("human_id") @db.Uuid
+  startedAt  DateTime  @default(now()) @map("started_at") @db.Timestamptz()
+  endedAt    DateTime? @map("ended_at") @db.Timestamptz()
+  // Fix B4: penanda idempotency shadow mining. Diisi hanya kalau mining
+  // benar-benar menghasilkan dokumen; job berikutnya untuk conversation yang
+  // sudah punya nilai ini akan di-skip.
+  minedAt    DateTime? @map("mined_at") @db.Timestamptz()
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  business Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  lead     Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  human    User?     @relation("HumanTakeover", fields: [humanId], references: [id])
+  messages Message[]
+
+  @@index([businessId])
+  @@index([businessId, leadId])
+  @@index([businessId, status])
+  @@index([businessId, leadId, status]) // Fix C4: optimize findFirst({businessId, leadId, status: {in:[...]}})
+  @@index([businessId, minedAt])        // Fix B4: cari conversation yang belum di-mine
+  @@map("conversations")
+}
+
+model Message {
+  id             String   @id @default(uuid()) @db.Uuid
+  businessId     String   @map("business_id") @db.Uuid
+  conversationId String   @map("conversation_id") @db.Uuid
+  // Fix C5: denormalisasi dari Conversation. Query konteks AI mengambil 20 pesan
+  // terakhir milik SATU lead lintas percakapan — sebelumnya harus JOIN ke
+  // conversations. Nullable supaya baris lama tetap valid; baris baru selalu diisi.
+  leadId         String?  @map("lead_id") @db.Uuid
+  message        String
+  messageType    String   @default("text") @map("message_type") @db.VarChar(20)
+  mediaUrl       String?  @map("media_url")
+  fromRole       String   @map("from_role") @db.VarChar(10)
+  humanId        String?  @map("human_id") @db.Uuid
+  aiModel        String?  @map("ai_model") @db.VarChar(50)
+  metadata       Json?    @default("{}")
+  createdAt      DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  business     Business     @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  conversation Conversation @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  lead         Lead?        @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  human        User?        @relation("HumanMessage", fields: [humanId], references: [id])
+
+  @@index([businessId])
+  @@index([businessId, conversationId, createdAt(sort: Desc)])
+  @@index([businessId, createdAt])
+  @@index([businessId, leadId, createdAt(sort: Desc)]) // Fix C5: konteks AI per lead tanpa JOIN
+  @@map("messages")
+}
+
+model Broadcast {
+  id            String   @id @default(uuid()) @db.Uuid
+  businessId    String   @map("business_id") @db.Uuid
+  title         String   @db.VarChar(200)
+  message       String
+  templateVars  String[] @default([]) @map("template_vars")
+  filter        Json?
+  scheduleType  String   @default("once") @map("schedule_type") @db.VarChar(20)
+  scheduleAt    DateTime @map("schedule_at") @db.Timestamptz()
+  status        String   @default("PENDING") @db.VarChar(20)
+  totalTarget   Int      @default(0) @map("total_target")
+  totalSent     Int      @default(0) @map("total_sent")
+  totalDelivered Int     @default(0) @map("total_delivered")
+  totalRead     Int      @default(0) @map("total_read")
+  totalFailed   Int      @default(0) @map("total_failed")
+  createdBy     String   @map("created_by") @db.Uuid
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt     DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  business      Business       @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  creator       User           @relation(fields: [createdBy], references: [id])
+  broadcastLogs BroadcastLog[]
+
+  @@index([businessId])
+  @@index([businessId, status])
+  @@index([businessId, scheduleAt])
+  @@map("broadcasts")
+}
+
+model BroadcastLog {
+  id            String    @id @default(uuid()) @db.Uuid
+  businessId    String    @map("business_id") @db.Uuid
+  broadcastId   String    @map("broadcast_id") @db.Uuid
+  leadId        String    @map("lead_id") @db.Uuid
+  waMessageId   String?   @map("wa_message_id") @db.VarChar(100)
+  status        String    @default("PENDING") @db.VarChar(20)
+  errorMessage  String?   @map("error_message")
+  sentAt        DateTime? @map("sent_at") @db.Timestamptz()
+  deliveredAt   DateTime? @map("delivered_at") @db.Timestamptz()
+  readAt        DateTime? @map("read_at") @db.Timestamptz()
+  createdAt     DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+
+  business  Business  @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  broadcast Broadcast @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+  lead      Lead      @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@unique([broadcastId, leadId])
+  @@index([businessId])
+  @@index([businessId, broadcastId])
+  @@index([businessId, leadId])
+  @@index([businessId, status])
+  @@map("broadcast_logs")
+}
+
+model Session {
+  id           String   @id @default(uuid()) @db.Uuid
+  businessId   String   @map("business_id") @db.Uuid
+  userId       String   @map("user_id") @db.Uuid
+  refreshToken String   @unique @map("refresh_token") @db.VarChar(500)
+  userAgent    String?
+  ipAddress    String?  @map("ip_address") @db.VarChar(45)
+  expiresAt    DateTime @map("expires_at") @db.Timestamptz()
+  createdAt    DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  user     User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([businessId, userId])
+  @@index([refreshToken])
+  @@map("sessions")
+}
+
+model Knowledge {
+  id         String    @id @default(uuid()) @db.Uuid
+  businessId String    @map("business_id") @db.Uuid
+  title      String    @db.VarChar(200)
+  content    String    @db.Text
+  embedding  Unsupported("vector(384)")?
+  sourceFile String?   @map("source_file") @db.VarChar(500)
+  syncedAt   DateTime? @map("synced_at") @db.Timestamptz()
+  createdAt  DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt  DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@index([businessId])
+  @@index([businessId, sourceFile])
+  @@map("knowledge")
+}
+
+
+// ──────────────────────────────────────────────────────────────────────────────
+// QUESTION MINER
+//
+// Berbeda tujuan dari Shadow Mining, dan perbedaannya disengaja:
+//   Shadow Mining  → AI membaca percakapan dan MENULIS SENDIRI dokumennya.
+//   Question Miner → AI hanya memungut PERTANYAAN pelanggan; jawaban CS DIBUANG,
+//                    dan yang mengisi jawabannya adalah pemilik bisnis.
+//
+// Alasannya ada di catatan prinsip: jawaban CS dari chat lama bisa memuat harga
+// dan kebijakan yang sudah berubah, sedangkan pertanyaan pelanggan tidak pernah
+// basi — "berapa harga X" tetap relevan bertahun-tahun kemudian.
+// ──────────────────────────────────────────────────────────────────────────────
+
+model MiningSession {
+  id          String   @id @default(uuid()) @db.Uuid
+  businessId  String   @map("business_id") @db.Uuid
+  /** Nama file zip yang diunggah, sekadar supaya Angga ingat ini sesi yang mana. */
+  label       String   @db.VarChar(200)
+  /** pending | running | done | failed */
+  status      String   @default("pending") @db.VarChar(20)
+  totalFiles     Int @default(0) @map("total_files")
+  processedFiles Int @default(0) @map("processed_files")
+  totalMessages  Int @default(0) @map("total_messages")
+  /** Berapa file yang gagal ditambang. Sengaja dihitung terpisah, bukan bikin
+   *  seluruh sesi berstatus "failed": satu file bermasalah tidak membatalkan
+   *  puluhan file lain yang berhasil, dan menandai semuanya gagal cuma
+   *  menakut-nakuti tanpa memberi informasi yang benar. */
+  failedFiles    Int @default(0) @map("failed_files")
+  /** Nama-nama yang ditandai Angga sebagai tim CS. */
+  csNames     Json     @default("[]") @map("cs_names")
+  errorMessage String? @map("error_message") @db.Text
+  createdAt   DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt   DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  business  Business        @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  questions MinedQuestion[]
+
+  @@index([businessId, createdAt])
+  @@map("mining_sessions")
+}
+
+model MinedQuestion {
+  id         String  @id @default(uuid()) @db.Uuid
+  businessId String  @map("business_id") @db.Uuid
+  sessionId  String  @map("session_id") @db.Uuid
+
+  /** Bentuk baku pertanyaan, hasil perapian model. */
+  question   String  @db.Text
+  /** Kutipan asli pertama yang memicu pertanyaan ini — supaya Angga bisa menilai
+   *  apakah pengelompokannya masuk akal, bukan cuma percaya pada hasil mesin. */
+  sampleRaw  String  @map("sample_raw") @db.Text
+  /** Berapa kali pertanyaan semakna ini muncul. Dasar pengurutan tabel. */
+  occurrences Int    @default(1)
+
+  /** Vektor untuk menggabungkan pertanyaan yang maknanya sama. Dimensinya sama
+   *  dengan tabel Knowledge (384) karena memakai model embedding yang sama. */
+  embedding  Unsupported("vector(384)")?
+
+  /** Jawaban yang DITULIS ANGGA. Kosong = belum dijawab. Sengaja tidak pernah
+   *  diisi otomatis dari chat — itulah inti seluruh fitur ini. */
+  answer     String? @db.Text
+  /** Produk | SOP | FAQ — tebakan awal dari model, bisa diubah Angga. */
+  category   String  @default("FAQ") @db.VarChar(20)
+  /** open | answered | dismissed | published */
+  status     String  @default("open") @db.VarChar(20)
+  /** Path relatif dokumen di vault, diisi setelah "Susun Dokumen". */
+  vaultPath  String? @map("vault_path") @db.VarChar(500)
+
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt  DateTime @updatedAt @map("updated_at") @db.Timestamptz()
+
+  business Business      @relation(fields: [businessId], references: [id], onDelete: Cascade)
+  session  MiningSession @relation(fields: [sessionId], references: [id], onDelete: Cascade)
+
+  @@index([businessId, status])
+  @@index([sessionId])
+  @@map("mined_questions")
+}
+
+/// Ingatan jawaban untuk pertanyaan yang berulang. Isinya sengaja dianggap
+/// sekali-buang: dihapus seluruhnya setiap kali pustaka berubah, karena jawaban
+/// lama yang menyebut harga lama tidak akan tertangkap pengaman anti-ngarang.
+model AnswerCache {
+  id         String   @id @default(uuid()) @db.Uuid
+  businessId String   @map("business_id") @db.Uuid
+  question   String   @db.Text
+  answer     String   @db.Text
+  embedding  Unsupported("vector(384)")?
+  createdAt  DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  @@index([businessId, createdAt])
+  @@map("answer_cache")
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// HUMAN LEARNING
+//
+// Sesi Baileys read-only yang "mengikuti" nomor CS secara transparan.
+// CS tetap balas WA dari HP biasa; sesi shadow hanya mendengar.
+// Semua chat yang masuk/keluar di-buffer per kontak, lalu dikirim ke pipeline
+// Shadow Mining dengan mode 'lenient' setelah ada cukup interaksi atau sepi
+// selama HL_BUFFER_IDLE_SEC detik.
+// ──────────────────────────────────────────────────────────────────────────────
+
+model CsHumanLearningSession {
+  id           String    @id @default(uuid()) @db.Uuid
+  businessId   String    @map("business_id") @db.Uuid
+  /// Nomor HP CS dalam format internasional tanpa '+': "6281234567890"
+  csPhone      String    @map("cs_phone") @db.VarChar(20)
+  /// Nama tampilan CS untuk UI dashboard
+  csName       String    @map("cs_name") @db.VarChar(100)
+  /// CONNECTING | CONNECTED | DISCONNECTED | BANNED
+  status       String    @default("DISCONNECTED") @db.VarChar(20)
+  /// QR code base64 untuk dipindai CS (dikosongkan setelah konek)
+  qrCode       String?   @map("qr_code") @db.Text
+  qrExpiresAt  DateTime? @map("qr_expires_at") @db.Timestamptz()
+  linkedAt     DateTime? @map("linked_at") @db.Timestamptz()
+  lastSeenAt   DateTime? @map("last_seen_at") @db.Timestamptz()
+  /// Berapa BUFFER chat yang berhasil dikirim ke Shadow Mining (bukan per pair —
+  /// bertambah 1 tiap satu buffer kontak di-flush)
+  totalPairsCaptured Int @default(0) @map("total_pairs_captured")
+
+  // ── Penghitung per PESAN (bukan per buffer) ─────────────────────────────────
+  // `totalPairsCaptured` baru bergerak setelah buffer di-flush (≥4 pesan atau
+  // idle 30 menit), jadi tidak bisa dipakai untuk memastikan sesi memang sedang
+  // mendengar. Dua kolom ini bertambah tiap pesan, jadi pergerakannya terlihat
+  // dalam hitungan detik. Ditulis dari Redis tiap ~60 detik (lihat
+  // commitPendingCounts di human-learning.service.ts), bukan tiap pesan, supaya
+  // Postgres tidak dihajar satu UPDATE per pesan masuk.
+  //
+  // ⚠️ Kolomnya HILANG dari schema.prisma di Fase 59 (regresi Cowork: skema
+  // dibangun dari salinan basi mount uploads) walau migrasinya sudah jalan.
+  // Dipulihkan Fase 60. Yang menangkapnya `tsc`, bukan ledger — ledger cuma
+  // menjaga hash, bukan kebenaran isi.
+  /// Pesan yang DIBALAS CS dari HP-nya (key.fromMe = true)
+  totalCsReplies      Int @default(0) @map("total_cs_replies")
+  /// Pesan yang masuk dari pembeli
+  totalBuyerMessages  Int @default(0) @map("total_buyer_messages")
+
+  // Analitik Lanjutan & CWRAG (Conversion-Weighted RAG)
+  totalFactsSaved       Int      @default(0) @map("total_facts_saved")
+  totalFactsDiscarded   Int      @default(0) @map("total_facts_discarded")
+  totalClosingDetected  Int      @default(0) @map("total_closing_detected")
+  totalLostDetected     Int      @default(0) @map("total_lost_detected")
+  intentStats           Json?    @map("intent_stats")
+
+  createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz()
+  updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz()
+
+  business Business @relation(fields: [businessId], references: [id], onDelete: Cascade)
+
+  @@unique([businessId, csPhone])
+  @@index([businessId])
+  @@index([businessId, status])
+  @@map("cs_human_learning_sessions")
+}
+
+/// Satu baris per panggilan model bahasa — sumber kebenaran untuk biaya.
+///
+/// Dibuat karena sebelumnya objek `usage` yang Groq kembalikan gratis di setiap
+/// respons dibuang di kesembilan titik panggil, sehingga setiap pembicaraan soal
+/// biaya cuma bisa jadi taksiran dari membaca kode.
+///
+/// Tidak digabung ke `Message` karena dari sembilan pekerjaan LLM, hanya SATU
+/// (balasan pelanggan) yang punya baris `Message`. Lima lainnya — Shadow Mining
+/// Layer 1 & 2, detectIntent, penyusun dokumen question-miner, dan validator
+/// Supervisor — memanggil model tanpa pernah membuat baris pesan.
+model LlmCall {
+  id String @id @default(uuid()) @db.Uuid
+
+  /// Nullable & TANPA relasi: CLI audit memanggil model tanpa konteks bisnis,
+  /// dan tabel pengukuran tidak boleh bisa menggagalkan penghapusan bisnis.
+  businessId String? @map("business_id") @db.Uuid
+
+  /// Kunci yang SAMA dengan nama pekerjaan di src/services/llm.ts:
+  /// reply | fallback | intent | supervisor | classify | extract | miner | publish | audit
+  job      String @db.VarChar(32)
+  provider String @db.VarChar(16)
+  model    String @db.VarChar(100)
+
+  promptTokens     Int  @default(0) @map("prompt_tokens")
+  completionTokens Int  @default(0) @map("completion_tokens")
+  /// Hanya keluarga `gpt-oss` yang melaporkan token masukan yang kena cache.
+  cachedTokens     Int? @map("cached_tokens")
+
+  latencyMs Int     @default(0) @map("latency_ms")
+  attempts  Int     @default(1)
+  ok        Boolean @default(true)
+  /// mis. rate_limit_429, http_500, unknown. Diisi hanya kalau ok = false.
+  errorKind String? @map("error_kind") @db.VarChar(32)
+
+  correlationId String?  @map("correlation_id") @db.VarChar(64)
+  createdAt     DateTime @default(now()) @map("created_at") @db.Timestamptz()
+
+  @@index([businessId, createdAt])
+  @@index([job, createdAt])
+  @@map("llm_calls")
+}

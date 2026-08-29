@@ -1,0 +1,52 @@
+'use client';
+
+/**
+ * GlobalAgentWidget — tombol bulat mengambang pojok kanan bawah yang membuka panel
+ * `GlobalAgentChat` (mode="floating"). Dipasang sekali di `app/layout.tsx` supaya tetap ada
+ * di semua halaman `/app/*` sampai user close manual, tidak hilang saat pindah menu.
+ *
+ * Bagian dari Langkah B blueprint "Ekstensi Fase 3: Global Agent Workspace & Multi-BM Token
+ * Vault" v1.3 — lihat GlobalAgentChat.tsx untuk logika chat/PIC/session yang sesungguhnya;
+ * komponen ini murni shell buka/tutup + posisi.
+ */
+
+import { useState } from 'react';
+import { Bot, X } from 'lucide-react';
+import GlobalAgentChat from './GlobalAgentChat';
+
+export default function GlobalAgentWidget() {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <>
+      {open && (
+        <div className="fixed bottom-24 right-6 z-50 w-96 max-w-[calc(100vw-2rem)] h-[560px] max-h-[calc(100vh-8rem)] bg-white rounded-xl shadow-2xl border border-gray-200 flex flex-col overflow-hidden">
+          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100 bg-indigo-600 text-white flex-shrink-0">
+            <div className="flex items-center gap-2">
+              <Bot className="w-4 h-4" />
+              <span className="text-sm font-semibold">Agent Workspace</span>
+            </div>
+            <button
+              onClick={() => setOpen(false)}
+              className="p-1 rounded hover:bg-indigo-500/60 transition-colors"
+              title="Tutup"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+          <div className="flex-1 min-h-0">
+            <GlobalAgentChat mode="floating" />
+          </div>
+        </div>
+      )}
+
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="fixed bottom-6 right-6 z-50 w-14 h-14 rounded-full bg-indigo-600 hover:bg-indigo-700 text-white shadow-xl flex items-center justify-center transition-transform hover:scale-105"
+        title={open ? 'Tutup Agent Workspace' : 'Buka Agent Workspace'}
+      >
+        {open ? <X className="w-6 h-6" /> : <Bot className="w-6 h-6" />}
+      </button>
+    </>
+  );
+}

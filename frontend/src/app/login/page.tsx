@@ -16,7 +16,7 @@ export default function Login() {
     clearError();
     try {
       await login(email, password);
-      router.push('/app/dashboard');
+      router.push('/app/hub');
     } catch {}
   };
 

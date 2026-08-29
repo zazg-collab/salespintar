@@ -1,0 +1,43 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# BASIS DEBIAN (python:3.11-slim), BUKAN Alpine — keputusan sudah diambil di
+# TECHNICAL_SYSTEM_DESIGN_BLUEPRINT.md Section 3.1 sebelum file ini ditulis, dengan alasan yang
+# sama persis dengan Dockerfile.backend di repo ini (lihat komentar di sana): `opencv-python-headless`
+# butuh `libgl1`/`libglib2.0-0` yang jauh lebih menyakitkan dipasang di Alpine (musl) daripada Debian.
+# Belum ada insiden produksi tercatat untuk file INI secara spesifik (belum pernah di-build/deploy
+# sama sekali) — ini murni preventif, mengikuti pola yang SUDAH terbukti di backend/frontend repo ini.
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.11-slim AS base
+
+WORKDIR /app
+
+# ffmpeg: dipakai reinforcement.py (_apply_ffmpeg_layers). libgl1/libglib2.0-0: runtime dep
+# opencv-python-headless (validate_video_asset, _soften_highlights). curl: healthcheck.
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      ffmpeg libgl1 libglib2.0-0 curl tini \
+ && rm -rf /var/lib/apt/lists/*
+
+COPY metaguard_service/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt \
+ && playwright install --with-deps chromium
+
+COPY metaguard_service/ ./metaguard_service/
+
+# NOTE: reinforcement.py (Layer 1 -- template_overlay) mereferensikan
+# metaguard_service/assets/farming_overlay_badge.png relatif terhadap cwd ffmpeg -- file PNG-nya
+# SENDIRI belum pernah dibuat/didesain (item terpisah dari coding ini, perlu aset asli dari tim
+# kreatif). Sampai ada asetnya, layer TEMPLATE_OVERLAY akan gagal di step ffmpeg (`-i` file not
+# found) kalau di-toggle aktif -- 4 layer lain (color_grade/metadata_label/highlight_soften/
+# micro_reframe) tidak terpengaruh.
+RUN mkdir -p /app/metaguard_service/assets /app/metaguard-uploads
+
+WORKDIR /app/metaguard_service
+
+# Port default 4010 -- lihat config.py (env PORT) & catatan pemilihan port di
+# TECHNICAL_SYSTEM_DESIGN_BLUEPRINT.md Section 9 (dicek `ss -lntp` di VPS 45 2026-08-25, bebas
+# bentrok dengan service lain yang sudah jalan di situ saat pengecekan).
+EXPOSE 4010
+ENV PORT=4010
+
+ENTRYPOINT ["/usr/bin/tini", "--"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT}"]

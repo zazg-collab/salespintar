@@ -11,3 +11,4 @@ wa_sessions/
 sessions/
 uploads/*
 !uploads/.gitkeep
+deploy/upcloud/*.env

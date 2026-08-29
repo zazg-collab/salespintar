@@ -1,0 +1,137 @@
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import Link from 'next/link';
+import { ArrowLeft, SlidersHorizontal, Loader2, Save, CheckCircle2, KeyRound } from 'lucide-react';
+import { apiGet, apiPut } from '../../../../lib/api';
+
+interface SettingsResponse {
+  geminiApiKeyConfigured: boolean;
+  geminiApiKeyPreview: string | null;
+  defaultReinforcementLayers: string[];
+}
+
+const LAYERS: { key: string; label: string }[] = [
+  { key: 'template_overlay', label: 'Template Overlay' },
+  { key: 'color_grade', label: 'Color Grade' },
+  { key: 'metadata_label', label: 'Metadata Label' },
+  { key: 'highlight_soften', label: 'Highlight Soften' },
+  { key: 'micro_reframe', label: 'Micro Reframe' },
+];
+
+export default function VideoGuardSettingsPage() {
+  const [settings, setSettings] = useState<SettingsResponse | null>(null);
+  const [apiKeyInput, setApiKeyInput] = useState('');
+  const [defaultLayers, setDefaultLayers] = useState<string[]>([]);
+  const [saving, setSaving] = useState(false);
+  const [saved, setSaved] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    apiGet<SettingsResponse>('/video-guard/settings')
+      .then((res) => {
+        setSettings(res);
+        setDefaultLayers(res.defaultReinforcementLayers ?? []);
+      })
+      .catch((e) => setError(e.message || 'Gagal memuat pengaturan.'));
+  }, []);
+
+  function toggleLayer(key: string) {
+    setDefaultLayers((prev) => (prev.includes(key) ? prev.filter((l) => l !== key) : [...prev, key]));
+  }
+
+  async function handleSave(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    setSaved(false);
+    setSaving(true);
+    try {
+      const body: { geminiApiKey?: string; defaultReinforcementLayers?: string[] } = {
+        defaultReinforcementLayers: defaultLayers as any,
+      };
+      if (apiKeyInput.trim()) body.geminiApiKey = apiKeyInput.trim();
+      await apiPut('/video-guard/settings', body);
+      const fresh = await apiGet<SettingsResponse>('/video-guard/settings');
+      setSettings(fresh);
+      setApiKeyInput('');
+      setSaved(true);
+      setTimeout(() => setSaved(false), 3000);
+    } catch (e) {
+      setError((e as Error).message || 'Gagal menyimpan pengaturan.');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="max-w-2xl mx-auto space-y-6">
+      <Link href="/app/video-guard" className="inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700">
+        <ArrowLeft className="w-4 h-4" /> Kembali ke Dashboard
+      </Link>
+
+      <div>
+        <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2">
+          <SlidersHorizontal className="w-6 h-6 text-indigo-600" /> Pengaturan Meta Video AI Guards
+        </h1>
+        <p className="text-xs text-gray-500 mt-1">Atur kunci Gemini API per business dan default layer reinforcement.</p>
+      </div>
+
+      {error && <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>}
+
+      {!settings && !error && (
+        <div className="flex items-center gap-2 text-gray-500 text-sm py-12 justify-center">
+          <Loader2 className="w-4 h-4 animate-spin text-indigo-600" /> Memuat…
+        </div>
+      )}
+
+      {settings && (
+        <form onSubmit={handleSave} className="bg-white rounded-2xl border border-gray-200 p-6 space-y-6">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1 flex items-center gap-1.5">
+              <KeyRound className="w-4 h-4 text-indigo-600" /> Gemini API Key (fallback per business)
+            </label>
+            <p className="text-xs text-gray-500 mb-2">
+              {settings.geminiApiKeyConfigured
+                ? `Sudah diisi (${settings.geminiApiKeyPreview}). Isi kolom di bawah untuk mengganti, kosongkan untuk menghapus.`
+                : 'Belum diisi — audit akan pakai fallback key generik dari server MetaGuard.'}
+            </p>
+            <input
+              type="password"
+              value={apiKeyInput}
+              onChange={(e) => setApiKeyInput(e.target.value)}
+              placeholder={settings.geminiApiKeyConfigured ? 'Ganti key (opsional)…' : 'Masukkan Gemini API Key…'}
+              className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">Default Layer Reinforcement</label>
+            <div className="flex flex-wrap gap-2">
+              {LAYERS.map((l) => (
+                <label
+                  key={l.key}
+                  className={`px-3 py-1.5 rounded-full text-xs font-semibold border cursor-pointer transition-colors ${
+                    defaultLayers.includes(l.key) ? 'bg-indigo-600 border-indigo-600 text-white' : 'bg-white border-gray-200 text-gray-600 hover:bg-gray-50'
+                  }`}
+                >
+                  <input type="checkbox" checked={defaultLayers.includes(l.key)} onChange={() => toggleLayer(l.key)} className="hidden" />
+                  {l.label}
+                </label>
+              ))}
+            </div>
+            <p className="text-xs text-gray-400 mt-2">Cuma preselect di halaman Reinforcement — tetap bisa diubah tiap kali submit.</p>
+          </div>
+
+          <button
+            type="submit"
+            disabled={saving}
+            className="w-full flex items-center justify-center gap-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-colors shadow-sm"
+          >
+            {saving ? <Loader2 className="w-4 h-4 animate-spin" /> : saved ? <CheckCircle2 className="w-4 h-4" /> : <Save className="w-4 h-4" />}
+            {saving ? 'Menyimpan…' : saved ? 'Tersimpan' : 'Simpan Pengaturan'}
+          </button>
+        </form>
+      )}
+    </div>
+  );
+}

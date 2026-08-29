@@ -2,7 +2,11 @@ import { MengantarReceiverScoreResult } from '../../services/mengantar.service';
 import { ConversionStatus } from './dto/lead-profile.dto';
 import { SegmentedSession, SessionBoundaryParser } from './session-parser';
 
-export type RtsRiskLevel = 'LOW' | 'MEDIUM' | 'HIGH';
+// Langkah D Fase 26 (Temuan T2): tambah 'EVALUATION_FAILED' -- sentinel eksplisit dipakai
+// lead-profiler.service.ts saat evaluasi RTS gagal total (exception) dan lead ini belum pernah
+// punya hasil evaluasi sah sebelumnya. WAJIB dirender beda dari 'LOW' oleh semua consumer
+// (timeline.service.ts, dashboard.routes.ts) -- jangan pernah diperlakukan sbg "aman".
+export type RtsRiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'EVALUATION_FAILED';
 
 export interface RtsAnalysisResult {
   rtsRiskScore: number; // 0 - 100% (makin tinggi makin berisiko retur)
@@ -99,17 +103,17 @@ export class RtsRiskEngine {
     }
 
     // 2. DIMENSI B: Kelengkapan Alamat & Patokan (Address Granularity)
-    const hasRtRw = /(rt|rw|\/|\bno\b|\bnomor\b|jl\b|jalan\b|gang|blok|dusun)/i.test(fullTranscriptText);
-    const hasDusunDesa = /(desa|kelurahan|kel\b|dusun|kampung|kp\.|ds\.|kecamatan|kec\b|kabupaten|kab\b|kota)/i.test(fullTranscriptText);
-    const hasPatokan = /(patokan|dekat|sebelah|depan|belakang|samping|gang|pos|masjid|mushola|sekolah|warung|toko|pagar|cat|komplek|perum)/i.test(fullTranscriptText);
+    const hasRtRw = /\b(rt\b|rw\b|rt\/rw|rtrw|nomor\b|no\.\s*\d+|no\s*\d+|jl\b|jalan\b|gang\b|gg\b|blok\b|dusun\b)|\d+\/\d+/i.test(fullTranscriptText);
+    const hasDusunDesa = /\b(desa\b|kelurahan\b|kel\b|dusun\b|kampung\b|kp\b|ds\b|kecamatan\b|kec\b|kabupaten\b|kab\b|kota\b)/i.test(fullTranscriptText);
+    const hasPatokan = /\b(patokan\b|ancer|dekat\b|sebelah\b|depan\b|belakang\b|samping\b|seberang\b|pos\s*ronda|pos\s*satpam|masjid\b|mesjid\b|mushola\b|musholla\b|surau\b|sekolah\b|sd\b|smp\b|sma\b|warung\b|toko\b|pagar\b|komplek\b|perum\b|perumahan\b|lapangan\b|kantor\s*desa|balai\s*desa|pasar\b|jembatan\b)/i.test(fullTranscriptText);
 
     if (conversion === 'CLOSING') {
       if (!hasRtRw && !hasDusunDesa) {
-        qualityScore -= 25;
+        qualityScore -= 40;
         chatReasons.push('Alamat pembeli sangat minim (tidak ada RT/RW atau Dusun/Kecamatan)');
       } else if (!hasPatokan && !hasRtRw) {
-        qualityScore -= 10;
-        chatReasons.push('Alamat belum dilengkapi patokan rumah (berisiko kurir gagal antar)');
+        qualityScore -= 25;
+        chatReasons.push('Alamat belum dilengkapi patokan rumah atau nomor RT/RW spesifik (berisiko kurir gagal antar)');
       }
     }
 
@@ -208,7 +212,7 @@ export class RtsRiskEngine {
       }
     }
 
-    // 4. Tentukan Level Risiko RTS
+    // 4. Tentukan Level Risiko RTS & Susun Rincian Alasan
     let rtsRiskLevel: RtsRiskLevel = 'LOW';
     if (rtsRiskScore <= 15) {
       rtsRiskLevel = 'LOW';
@@ -218,11 +222,19 @@ export class RtsRiskEngine {
       rtsRiskLevel = 'HIGH';
     }
 
+    const finalReasons: string[] = [];
+    if (chatReasons.length > 0) {
+      finalReasons.push(...chatReasons);
+    }
+    if (finalReasons.length === 0) {
+      finalReasons.push('SOP percakapan CS terpenuhi & komitmen pembeli terpantau baik');
+    }
+
     return {
       rtsRiskScore,
       rtsRiskLevel,
       chatQualityScore,
-      reasons: chatReasons.length > 0 ? chatReasons : ['SOP percakapan CS terpenuhi & komitmen pembeli terpantau baik'],
+      reasons: finalReasons,
       courierRecommendation,
       mengantarData: mengantarData || undefined,
     };

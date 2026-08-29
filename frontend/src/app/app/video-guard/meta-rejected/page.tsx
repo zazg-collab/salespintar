@@ -1,0 +1,657 @@
+'use client';
+
+import React, { useEffect, useState } from 'react';
+import { ShieldAlert, RefreshCw, Loader2, X, Play, ImageIcon, Sparkles, ExternalLink, Zap } from 'lucide-react';
+import { apiGet, apiPost } from '../../../../lib/api';
+
+interface RejectedCreative {
+  metaAdId: string;
+  adAccountId: string;
+  adName: string;
+  campaignName: string;
+  thumbnailUrl: string | null;
+  mediaType: 'VIDEO' | 'IMAGE';
+  platform?: 'meta' | 'google' | string;
+  metaVideoId: string | null;
+  violationLabel: string;
+  violationMessage: string;
+  spend: number;
+  ctr: number;
+  impressions: number;
+  previewIframe?: string | null;
+  existingAuditId: string | null;
+  existingOverallScore: number | null;
+  existingVerdict: string | null;
+}
+
+interface BatchProgress {
+  current: number;
+  total: number;
+  metaAdId: string;
+  adName: string;
+}
+
+interface BatchSummary {
+  success: number;
+  failed: number;
+}
+
+function formatCurrency(n: number) {
+  return new Intl.NumberFormat('id-ID', { style: 'currency', currency: 'IDR', maximumFractionDigits: 0 }).format(n || 0);
+}
+
+function verdictBadge(verdict: string | null | undefined) {
+  switch (verdict) {
+    case 'APPROVED':
+      return { label: 'Approved', className: 'bg-emerald-50 text-emerald-700 border-emerald-200' };
+    case 'NEEDS_MINOR_TWEAK':
+      return { label: 'Perlu Perbaikan Kecil', className: 'bg-amber-50 text-amber-700 border-amber-200' };
+    case 'HIGH_RISK_REJECT':
+      return { label: 'Risiko Tinggi', className: 'bg-rose-50 text-rose-700 border-rose-200' };
+    // [2026-08-27] fix (feedback Bossfren -- "Perlu Review Manual, skor 0/100" bikin kegagalan
+    // TEKNIS keliatan kayak hasil audit konten beneran): TECHNICAL_ERROR verdict baru dari
+    // metaguard_service (lihat compute_final_assessment() di engine.py) dan MANUAL_REVIEW lama
+    // (baris SEBELUM fix ini ada) dua-duanya berarti PROSES audit-nya gagal total, bukan hasil
+    // analisis konten yang valid -- disamakan labelnya, dibedain warnanya (oranye) dari verdict
+    // konten asli spy gak disangka hasil audit beneran.
+    case 'TECHNICAL_ERROR':
+    case 'MANUAL_REVIEW':
+      return { label: 'Audit Gagal - Kesalahan Teknis', className: 'bg-orange-50 text-orange-700 border-orange-200' };
+    default:
+      return { label: verdict || '-', className: 'bg-gray-100 text-gray-700 border-gray-300' };
+  }
+}
+
+function getPlatformBadge(item: RejectedCreative) {
+  const p = ((item.platform || (item as any).channel || '') as string).toLowerCase();
+  if (p.includes('google') || item.metaAdId?.startsWith('google_') || item.adAccountId?.startsWith('google_')) {
+    return { label: 'Google', className: 'bg-amber-600/90 text-white' };
+  }
+  if (p.includes('tiktok') || item.metaAdId?.startsWith('tt_')) {
+    return { label: 'TikTok', className: 'bg-black/90 text-white' };
+  }
+  return { label: 'Meta', className: 'bg-blue-600/90 text-white' };
+}
+
+// Polling generik dipakai baik oleh modal (audit satu-satu) maupun batch "Audit Semua" di bawah --
+// satu sumber kebenaran soal berapa lama boleh nunggu & kapan menyerah.
+// MAX_POLL_ATTEMPTS * POLL_INTERVAL_MS harus SELALU lebih besar dari plafon timeout agy Video Guard
+// di api-bridge (saat ini 600000ms/10 menit, lihat projek-ceo/20260729-ledger-anti-drift-baseline.md
+// lanjutan #10) -- kalau tidak, frontend menyerah duluan padahal server masih beneran mengerjakan.
+const POLL_INTERVAL_MS = 5000;
+const MAX_POLL_ATTEMPTS = 200; // 200 x 5 detik = ~16.7 menit, > plafon 10 menit agy + buffer aman
+
+function pollAuditUntilDone(auditId: string): Promise<{ status: 'done' | 'error'; report?: any; error?: string }> {
+  return new Promise((resolve) => {
+    let attempts = 0;
+    const interval = setInterval(async () => {
+      attempts += 1;
+      try {
+        const res = await apiGet<any>(`/video-guard/audit/${auditId}`);
+        if (res.status === 'done' && res.report) {
+          clearInterval(interval);
+          resolve({ status: 'done', report: res.report });
+        } else if (res.status === 'error') {
+          clearInterval(interval);
+          resolve({ status: 'error', error: res.error || 'Audit MetaGuard AI gagal diproses.' });
+        } else if (attempts >= MAX_POLL_ATTEMPTS) {
+          clearInterval(interval);
+          resolve({ status: 'error', error: 'Audit belum selesai setelah ditunggu lama -- coba cek lagi manual nanti.' });
+        }
+      } catch (e) {
+        clearInterval(interval);
+        resolve({ status: 'error', error: (e as Error).message || 'Gagal memuat status audit.' });
+      }
+    }, POLL_INTERVAL_MS);
+  });
+}
+
+export default function MetaRejectedCreativesPage() {
+  const [items, setItems] = useState<RejectedCreative[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [selected, setSelected] = useState<RejectedCreative | null>(null);
+  const [batchRunning, setBatchRunning] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<BatchProgress | null>(null);
+  const [batchSummary, setBatchSummary] = useState<BatchSummary | null>(null);
+  const batchCancelRef = React.useRef(false);
+
+  async function load(forceRefresh = false) {
+    setLoading(true);
+    setError(null);
+    try {
+      const res = await apiGet<{ data: RejectedCreative[] }>(
+        `/video-guard/meta-rejected-creatives${forceRefresh ? '?forceRefresh=true' : ''}`,
+      );
+      setItems(res.data || []);
+    } catch (e) {
+      setError((e as Error).message || 'Gagal memuat data creative yang ditolak Meta.');
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  function handleAudited(metaAdId: string, auditId: string, score: number | null, verdict: string | null) {
+    setItems((prev) =>
+      prev.map((i) =>
+        i.metaAdId === metaAdId
+          ? { ...i, existingAuditId: auditId, existingOverallScore: score, existingVerdict: verdict }
+          : i,
+      ),
+    );
+    setSelected((prev) =>
+      prev && prev.metaAdId === metaAdId
+        ? { ...prev, existingAuditId: auditId, existingOverallScore: score, existingVerdict: verdict }
+        : prev,
+    );
+  }
+
+  // "Audit Semua" -- nyisir creative yang BELUM punya existingAuditId (yang sudah pernah diaudit
+  // dilewati/skip, sesuai instruksi Bossfren), submit + poll SATU PER SATU (bukan paralel -- agy di
+  // VPS 45 cuma bisa proses 1 job bersamaan lintas semua fitur, jadi paralel dari sisi frontend cuma
+  // bikin request menumpuk di antrean backend tanpa mempercepat apa pun). Tiap item audit ini
+  // asinkron di server (submit balik cepat, hasil diproses di background) -- jadi walau batch ini
+  // ditinggal/tab ditutup, audit yang SUDAH distart tetap jalan di server, cuma hasilnya baru
+  // kesimpen ke DB begitu ada yang polling GET /audit/:id lagi (lihat persistAuditReport di backend).
+  async function runBatchAudit() {
+    if (batchRunning) return;
+    const targets = items.filter((i) => !i.existingAuditId);
+    if (targets.length === 0) return;
+
+    batchCancelRef.current = false;
+    setBatchRunning(true);
+    setBatchSummary(null);
+    let success = 0;
+    let failed = 0;
+
+    for (let idx = 0; idx < targets.length; idx++) {
+      if (batchCancelRef.current) break;
+      const target = targets[idx];
+      setBatchProgress({ current: idx + 1, total: targets.length, metaAdId: target.metaAdId, adName: target.adName });
+      try {
+        const res = await apiPost<{ audit_id: string }>(`/video-guard/meta-rejected-creatives/${target.metaAdId}/audit`, {});
+        const result = await pollAuditUntilDone(res.audit_id);
+        if (result.status === 'done' && result.report) {
+          handleAudited(target.metaAdId, res.audit_id, result.report.overall_compliance_score ?? null, result.report.verdict ?? null);
+          success += 1;
+        } else {
+          failed += 1;
+        }
+      } catch (e) {
+        failed += 1;
+      }
+    }
+
+    setBatchProgress(null);
+    setBatchRunning(false);
+    setBatchSummary({ success, failed });
+  }
+
+  function cancelBatch() {
+    // Cuma menghentikan ANTREAN item berikutnya -- item yang lagi diproses server tetap jalan
+    // sampai selesai (tidak ada cara aman membatalkan job agy yang sudah jalan dari sini).
+    batchCancelRef.current = true;
+  }
+
+  const pendingCount = items.filter((i) => !i.existingAuditId).length;
+
+  return (
+    <div className="max-w-7xl mx-auto space-y-6">
+      <div>
+        <h1 className="text-lg md:text-xl font-bold text-gray-900 flex items-center gap-2">
+          <ShieldAlert className="w-6 h-6 text-rose-500" /> Ads Creative
+        </h1>
+        <p className="text-xs text-gray-500 mt-1">
+          Creative yang DITOLAK Meta sendiri (Ad Review) — dikumpulkan dari semua Business Manager yang
+          terkoneksi di salespintar.
+        </p>
+      </div>
+
+      {error && (
+        <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>
+      )}
+
+      {batchSummary && (
+        <div className="bg-indigo-50 border border-indigo-200 text-indigo-800 rounded-xl px-4 py-3 text-xs flex items-center justify-between">
+          <span>
+            Audit Semua selesai: <strong>{batchSummary.success}</strong> berhasil, <strong>{batchSummary.failed}</strong> gagal.
+          </span>
+          <button onClick={() => setBatchSummary(null)} className="text-indigo-400 hover:text-indigo-700">
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
+      <div className="bg-white rounded-xl border border-gray-200 shadow-xs overflow-hidden">
+        <div className="border-b border-gray-100 px-4 py-3 flex items-center justify-between bg-white flex-wrap gap-2">
+          <div>
+            <h2 className="text-xs font-bold text-gray-900">Daftar Creative Ditolak</h2>
+            <p className="text-[10px] text-gray-500">
+              {items.length} creative · {pendingCount} belum diaudit MetaGuard AI
+            </p>
+          </div>
+          <div className="flex items-center gap-2">
+            {batchRunning ? (
+              <button
+                onClick={cancelBatch}
+                className="flex items-center gap-1.5 text-[11px] font-semibold text-rose-600 hover:text-rose-800 bg-rose-50 border border-rose-200 rounded-lg px-3 py-1.5 transition-colors"
+              >
+                <Loader2 className="w-3 h-3 animate-spin" />
+                Mengaudit {batchProgress ? `${batchProgress.current}/${batchProgress.total}` : ''} — Batalkan
+              </button>
+            ) : (
+              <button
+                onClick={runBatchAudit}
+                disabled={loading || pendingCount === 0}
+                title={
+                  pendingCount === 0
+                    ? 'Semua creative sudah diaudit'
+                    : `Audit ${pendingCount} creative yang belum diaudit, satu per satu (bisa makan waktu lama)`
+                }
+                className="flex items-center gap-1.5 text-[11px] font-semibold text-white bg-indigo-600 hover:bg-indigo-700 disabled:opacity-40 disabled:cursor-not-allowed rounded-lg px-3 py-1.5 transition-colors"
+              >
+                <Zap className="w-3.5 h-3.5" /> Audit Semua{pendingCount > 0 ? ` (${pendingCount})` : ''}
+              </button>
+            )}
+            <button
+              onClick={() => load(true)}
+              disabled={loading || batchRunning}
+              className="flex items-center gap-1.5 text-[11px] font-semibold text-gray-600 hover:text-gray-900 bg-white border border-gray-200 rounded-lg px-3 py-1.5 disabled:opacity-50 transition-colors"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} /> Refresh
+            </button>
+          </div>
+        </div>
+
+        <div className="p-4 bg-gray-50/50">
+          {loading ? (
+            <div className="flex items-center justify-center py-24 text-gray-400">
+              <Loader2 className="w-6 h-6 animate-spin" />
+            </div>
+          ) : items.length === 0 ? (
+            <div className="text-center text-gray-500 text-xs py-16">
+              Tidak ada creative yang ditolak Meta saat ini di BM yang terkoneksi.
+            </div>
+          ) : (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
+              {items.map((item) => {
+                const isBatchTarget = batchRunning && batchProgress?.metaAdId === item.metaAdId;
+                return (
+                  <div
+                    key={item.metaAdId}
+                    className={`bg-white rounded-xl border overflow-hidden shadow-xs hover:shadow-md transition-all flex flex-col group relative ${
+                      isBatchTarget ? 'border-indigo-300 ring-2 ring-indigo-100' : 'border-gray-200'
+                    }`}
+                  >
+                    <div className="w-full h-36 bg-gray-950 relative flex items-center justify-center overflow-hidden border-b border-gray-100">
+                      {item.thumbnailUrl ? (
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={item.thumbnailUrl}
+                          alt={item.adName}
+                          className="object-cover w-full h-full group-hover:scale-105 transition-transform duration-300"
+                        />
+                      ) : (
+                        <div className="flex flex-col items-center justify-center text-gray-500 text-center p-2">
+                          <ImageIcon className="w-6 h-6 mb-1 opacity-40" />
+                          <span className="text-[10px]">Tanpa preview</span>
+                        </div>
+                      )}
+                      {/* Platform Badge (Pojok Kiri) */}
+                      {(() => {
+                        const pb = getPlatformBadge(item);
+                        return (
+                          <span
+                            className={`absolute top-2 left-2 ${pb.className} text-[9px] font-bold px-1.5 py-0.5 rounded shadow-xs flex items-center gap-1 z-10 backdrop-blur-xs`}
+                          >
+                            {pb.label}
+                          </span>
+                        );
+                      })()}
+
+                      {/* Media Type Badge (Pojok Kanan) */}
+                      {item.mediaType === 'VIDEO' ? (
+                        <span className="absolute top-2 right-2 bg-rose-600/90 text-white text-[9px] font-bold px-1.5 py-0.5 rounded shadow-xs flex items-center gap-1 z-10 backdrop-blur-xs">
+                          <Play className="w-2.5 h-2.5 fill-current" /> Video
+                        </span>
+                      ) : (
+                        <span className="absolute top-2 right-2 bg-indigo-600/90 text-white text-[9px] font-bold px-1.5 py-0.5 rounded shadow-xs flex items-center gap-1 z-10 backdrop-blur-xs">
+                          <ImageIcon className="w-2.5 h-2.5" /> Gambar
+                        </span>
+                      )}
+                      {isBatchTarget && (
+                        <span className="absolute top-8 left-2 bg-indigo-600 text-white text-[9px] font-bold px-1.5 py-0.5 rounded shadow-xs flex items-center gap-1 z-10">
+                          <Loader2 className="w-2.5 h-2.5 animate-spin" /> Diaudit
+                        </span>
+                      )}
+                      {item.mediaType === 'VIDEO' && (
+                        <div className="absolute inset-0 flex items-center justify-center bg-black/25 group-hover:bg-black/40 transition-colors pointer-events-none">
+                          <div className="w-9 h-9 rounded-full bg-white/90 shadow-md flex items-center justify-center text-rose-600 group-hover:scale-110 transition-transform">
+                            <Play className="w-4 h-4 fill-current ml-0.5" />
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                    <div className="p-2.5 flex flex-col flex-grow space-y-1.5">
+                      <h3 className="font-bold text-gray-900 text-xs truncate" title={item.adName}>
+                        {item.adName}
+                      </h3>
+                      <p className="text-[9px] text-gray-500 truncate" title={item.campaignName}>
+                        {item.campaignName}
+                      </p>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-gray-500">CTR</span>
+                        <span className="font-mono text-xs font-bold text-emerald-600">{item.ctr.toFixed(2)}%</span>
+                      </div>
+                      <div className="flex justify-between items-center">
+                        <span className="text-[10px] text-gray-500">Spend</span>
+                        <span className="font-mono text-[10px] font-semibold text-gray-700">{formatCurrency(item.spend)}</span>
+                      </div>
+                      <span
+                        className="inline-block text-[9px] font-bold px-1.5 py-1 rounded bg-rose-50 text-rose-700 border border-rose-100 truncate text-center"
+                        title={item.violationLabel}
+                      >
+                        🚫 {item.violationLabel}
+                      </span>
+                      {item.existingAuditId && (
+                        <span
+                          className={`inline-block text-[9px] font-bold px-1.5 py-1 rounded border text-center truncate ${
+                            verdictBadge(item.existingVerdict).className
+                          }`}
+                        >
+                          {item.existingVerdict ? `✓ ${verdictBadge(item.existingVerdict).label}` : '⏳ Diproses'}
+                        </span>
+                      )}
+                      <button
+                        onClick={() => setSelected(item)}
+                        className="mt-auto w-full text-[11px] font-semibold text-indigo-600 bg-indigo-50 hover:bg-indigo-100 border border-indigo-100 rounded-lg py-1.5 transition-colors"
+                      >
+                        Lihat Detail
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {selected && (
+        <RejectedCreativeModal
+          item={selected}
+          onClose={() => setSelected(null)}
+          onAudited={(auditId, score, verdict) => handleAudited(selected.metaAdId, auditId, score, verdict)}
+        />
+      )}
+    </div>
+  );
+}
+
+function RejectedCreativeModal({
+  item,
+  onClose,
+  onAudited,
+}: {
+  item: RejectedCreative;
+  onClose: () => void;
+  onAudited: (auditId: string, score: number | null, verdict: string | null) => void;
+}) {
+  const [status, setStatus] = useState<'idle' | 'submitting' | 'polling' | 'done' | 'error'>(
+    item.existingAuditId ? 'polling' : 'idle',
+  );
+  const [report, setReport] = useState<any | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const mountedRef = React.useRef(true);
+  useEffect(() => () => { mountedRef.current = false; }, []);
+
+  useEffect(() => {
+    if (item.existingAuditId) {
+      checkThenPoll(item.existingAuditId);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [item.existingAuditId]);
+
+  // FIX 2026-08-25: dulu di sini cuma 1x fetch status tanpa lanjut polling -- kalau audit item ini
+  // masih beneran jalan di server (mis. baru distart lewat "Audit Semua" atau modal ditutup lalu
+  // dibuka lagi sebelum selesai), modal jadi stuck permanen di "Memuat laporan..." padahal servernya
+  // sendiri akan selesai beberapa menit kemudian. Sekarang: cek dulu, kalau BELUM selesai, lanjut
+  // poll() yang sama persis dipakai audit baru.
+  async function checkThenPoll(auditId: string) {
+    try {
+      const res = await apiGet<any>(`/video-guard/audit/${auditId}`);
+      if (!mountedRef.current) return;
+      if (res.status === 'done' && res.report) {
+        setReport(res.report);
+        setStatus('done');
+      } else if (res.status === 'error') {
+        setError(res.error || 'Audit MetaGuard AI gagal diproses.');
+        setStatus('error');
+      } else {
+        setStatus('polling');
+        poll(auditId);
+      }
+    } catch (e) {
+      if (mountedRef.current) {
+        setError((e as Error).message || 'Gagal memuat status audit.');
+        setStatus('error');
+      }
+    }
+  }
+
+  async function runAudit() {
+    setStatus('submitting');
+    setError(null);
+    try {
+      const res = await apiPost<{ audit_id: string; already_audited?: boolean }>(
+        `/video-guard/meta-rejected-creatives/${item.metaAdId}/audit`,
+        {},
+      );
+      setStatus('polling');
+      poll(res.audit_id);
+    } catch (e) {
+      setError((e as Error).message || 'Gagal memulai audit MetaGuard AI.');
+      setStatus('error');
+    }
+  }
+
+  function poll(auditId: string) {
+    const interval = setInterval(async () => {
+      try {
+        const res = await apiGet<any>(`/video-guard/audit/${auditId}`);
+        if (!mountedRef.current) { clearInterval(interval); return; }
+        if (res.status === 'done' && res.report) {
+          clearInterval(interval);
+          setReport(res.report);
+          setStatus('done');
+          onAudited(auditId, res.report.overall_compliance_score ?? null, res.report.verdict ?? null);
+        } else if (res.status === 'error') {
+          clearInterval(interval);
+          setError(res.error || 'Audit MetaGuard AI gagal diproses.');
+          setStatus('error');
+        }
+      } catch (e) {
+        clearInterval(interval);
+        if (mountedRef.current) {
+          setError((e as Error).message || 'Gagal memuat status audit.');
+          setStatus('error');
+        }
+      }
+    }, 4000);
+  }
+
+  const vb = verdictBadge(report?.verdict);
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-gray-900/60 backdrop-blur-xs">
+      <div className="bg-white rounded-2xl shadow-2xl max-w-5xl w-full overflow-hidden border border-gray-200 flex flex-col max-h-[92vh]">
+        {/* Header */}
+        <div className="px-5 py-3.5 border-b border-gray-100 flex justify-between items-center bg-gray-50/80">
+          <div className="flex items-center gap-2.5">
+            <div className="w-9 h-9 rounded-xl bg-indigo-100 flex items-center justify-center text-indigo-600 shadow-xs">
+              <ShieldAlert className="w-4 h-4" />
+            </div>
+            <div>
+              <h3 className="font-bold text-gray-900 text-sm">Preview Creative Ditolak</h3>
+              <p className="text-[11px] text-gray-500 truncate max-w-lg">{item.adName}</p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="w-8 h-8 rounded-lg flex items-center justify-center text-gray-400 hover:text-gray-700 hover:bg-gray-200 transition-colors"
+          >
+            <X className="w-5 h-5" />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="p-6 overflow-y-auto grid grid-cols-1 lg:grid-cols-12 gap-6 flex-grow">
+          {/* Left: preview */}
+          <div className="lg:col-span-6 flex flex-col items-center justify-center bg-gray-950 rounded-2xl p-4 border border-gray-800 shadow-inner overflow-hidden min-h-[420px]">
+            {item.previewIframe ? (
+              <div
+                className="w-full flex items-center justify-center overflow-hidden [&>iframe]:w-full [&>iframe]:max-w-[360px] [&>iframe]:h-[540px] [&>iframe]:border-0 [&>iframe]:rounded-xl [&>iframe]:shadow-2xl"
+                dangerouslySetInnerHTML={{ __html: item.previewIframe }}
+              />
+            ) : item.thumbnailUrl ? (
+              <div className="relative w-full h-full flex flex-col items-center justify-center p-2">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={item.thumbnailUrl}
+                  alt={item.adName}
+                  className="max-h-[480px] w-auto object-contain rounded-xl shadow-2xl"
+                />
+              </div>
+            ) : (
+              <div className="flex flex-col items-center justify-center h-64 text-gray-500">
+                <ImageIcon className="w-12 h-12 mb-2 opacity-30" />
+                <span className="text-xs">Preview visual tidak tersedia dari Meta API</span>
+              </div>
+            )}
+          </div>
+
+          {/* Right: info */}
+          <div className="lg:col-span-6 flex flex-col space-y-4">
+            <div>
+              <span className="text-[10px] text-gray-400 uppercase font-bold tracking-wider">Campaign</span>
+              <p className="text-xs font-semibold text-gray-800 mt-0.5">{item.campaignName}</p>
+            </div>
+
+            <div className="grid grid-cols-3 gap-2 bg-gray-50 p-3 rounded-xl border border-gray-200">
+              <div className="text-center">
+                <span className="text-[10px] text-gray-500">CTR</span>
+                <p className="text-sm font-bold text-gray-800 mt-0.5">{item.ctr.toFixed(2)}%</p>
+              </div>
+              <div className="text-center border-x border-gray-200">
+                <span className="text-[10px] text-gray-500">Total Spend</span>
+                <p className="text-xs font-bold text-gray-800 mt-0.5">{formatCurrency(item.spend)}</p>
+              </div>
+              <div className="text-center">
+                <span className="text-[10px] text-gray-500">Tayangan (Imp)</span>
+                <p className="text-xs font-bold text-gray-800 mt-0.5">{item.impressions.toLocaleString('id-ID')}</p>
+              </div>
+            </div>
+
+            {/* Meta Ad Review */}
+            <div className="bg-white p-3.5 rounded-xl border border-rose-200 space-y-2">
+              <div className="flex items-center justify-between">
+                <p className="text-xs font-bold text-gray-900">🚫 Alasan Ditolak Meta:</p>
+                <span className="text-[10px] text-gray-400">Ad Review Resmi Meta</span>
+              </div>
+              <span className="inline-block text-[11px] font-semibold px-2 py-1 rounded bg-rose-50 text-rose-700 border border-rose-100">
+                {item.violationLabel}
+              </span>
+              <p className="text-[11px] text-gray-600 leading-relaxed">{item.violationMessage}</p>
+            </div>
+
+            {/* MetaGuard AI section */}
+            <div className="bg-indigo-50/80 p-4 rounded-xl border border-indigo-100 flex-grow flex flex-col justify-center space-y-3">
+              <h4 className="text-xs font-bold text-indigo-900 flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-indigo-600" /> Audit MetaGuard AI
+              </h4>
+
+              {status === 'idle' && (
+                <>
+                  <p className="text-[11px] text-indigo-900 leading-relaxed">
+                    Belum pernah dianalisis MetaGuard AI. Klik tombol di bawah untuk menjalankan audit
+                    kepatuhan penuh (visual, audio, teks, landing page) atas creative ini.
+                  </p>
+                  <button
+                    onClick={runAudit}
+                    className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-xl transition-colors shadow-sm"
+                  >
+                    Audit MetaGuard AI
+                  </button>
+                </>
+              )}
+
+              {(status === 'submitting' || status === 'polling') && (
+                <div className="flex items-center gap-2 text-[11px] text-indigo-900">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                  {status === 'submitting' ? 'Mengirim ke MetaGuard AI…' : 'Menganalisis — bisa makan waktu sampai 10 menit…'}
+                </div>
+              )}
+
+              {status === 'error' && (
+                <>
+                  <p className="text-[11px] text-rose-700 leading-relaxed">{error || 'Audit gagal diproses.'}</p>
+                  <button
+                    onClick={runAudit}
+                    className="w-full py-2 bg-white border border-indigo-200 text-indigo-700 text-xs font-bold rounded-xl hover:bg-indigo-50 transition-colors"
+                  >
+                    Coba Lagi
+                  </button>
+                </>
+              )}
+
+              {status === 'done' && report && (
+                <>
+                  <div className="flex items-center gap-2">
+                    <span className={`text-[10px] font-bold px-2 py-1 rounded border ${vb.className}`}>{vb.label}</span>
+                    {/* [2026-08-27] fix: skor 0/100 pada TECHNICAL_ERROR/MANUAL_REVIEW BUKAN skor asli
+                        (lihat compute_final_assessment() di engine.py) -- jangan ditampilkan biar tidak
+                        disangka hasil audit konten yang beneran. */}
+                    {typeof report.overall_compliance_score === 'number' && report.verdict !== 'TECHNICAL_ERROR' && report.verdict !== 'MANUAL_REVIEW' && (
+                      <span className="text-[10px] text-indigo-900 font-semibold">
+                        Skor: {report.overall_compliance_score}/100
+                      </span>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-indigo-900 leading-relaxed line-clamp-4">
+                    {report.raw_assessment?.executive_summary || 'Tidak ada ringkasan.'}
+                  </p>
+                  {report.audit_id && (
+                    <a
+                      href={`/app/video-guard/audit/${report.audit_id}/analysis`}
+                      className="inline-flex items-center gap-1 text-[11px] font-semibold text-indigo-700 hover:text-indigo-900"
+                    >
+                      Lihat Laporan Lengkap <ExternalLink className="w-3 h-3" />
+                    </a>
+                  )}
+                </>
+              )}
+
+              {status === 'done' && !report && (
+                <div className="flex items-center gap-2 text-[11px] text-indigo-900">
+                  <Loader2 className="w-3.5 h-3.5 animate-spin" /> Memuat laporan…
+                </div>
+              )}
+            </div>
+
+            <button
+              onClick={onClose}
+              className="w-full py-2.5 bg-gray-900 text-white text-xs font-bold rounded-xl hover:bg-gray-800 transition-colors shadow-sm"
+            >
+              Tutup Preview
+            </button>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}

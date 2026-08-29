@@ -3,6 +3,7 @@
 import { useState, useEffect, useCallback, useMemo } from 'react';
 import { createPortal } from 'react-dom';
 import { apiGet } from '../../../lib/api';
+import { formatWibDate, formatWibDateTime, getJakartaTodayStr, getJakartaOffsetStr, getJakartaFirstDayOfMonthStr } from '../../../lib/date';
 import {
   Users,
   Search,
@@ -32,54 +33,47 @@ import {
   Check,
   Send,
   UserCheck,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
 } from 'lucide-react';
+import { LeadItem, LeadStats } from '../../../components/leads/types';
+import { RtsAuditModal } from '../../../components/leads/RtsAuditModal';
+import { LeadInsightModal } from '../../../components/leads/LeadInsightModal';
+import { CustomerTimelineModal } from '../../../components/leads/CustomerTimelineModal';
+import { CapiFunnelModal, MetaLogoIcon } from '../../../components/leads/CapiFunnelModal';
 
-interface LeadItem {
-  id: string;
-  waNumber: string;
-  waId: string | null;
-  leadCategory?: 'NEW_INBOUND' | 'AFTER_SALES';
-  minatProduk: string | null;
-  lastInsight: string | null;
-  leadStage: 'COLD' | 'WARM' | 'HOT' | 'VERY_HOT';
-  score: number;
-  conversionStatus: 'CLOSING' | 'PENDING' | 'LOST';
-  assignedCsName: string | null;
-  assignedCsPhone: string | null;
-  rtsRiskScore: number | null;
-  rtsRiskLevel: 'LOW' | 'MEDIUM' | 'HIGH' | null;
-  rtsReasons: string[];
-  courierRecommendation: string | null;
-  mengantarData: any;
-  totalMessages: number;
-  lastMessageAt: string | null;
-  createdAt: string;
-}
-
-interface LeadStats {
-  totalLeads: number;
-  hotLeads: number;
-  warmLeads: number;
-  coldLeads: number;
-  closingLeads: number;
-  pendingLeads: number;
-  lostLeads: number;
-  avgRtsRisk?: number;
-  highRiskRtsLeads?: number;
-}
+// Langkah E-lanjutan (T-FE-4, Fase 29, 2026-08-18): halaman ini sebelumnya TIDAK PERNAH
+// menyegarkan diri sendiri -- CS/ops harus klik "Segarkan" manual tiap kali mau melihat lead/chat
+// terbaru (beda dg dashboard/page.tsx yg sudah auto-refresh via react-query refetchInterval sejak
+// Fase 27). Didefer di Fase 27 sbg "refactor besar, halaman ini belum pakai react-query" -- di
+// fase ini dipilih pendekatan lebih murah/rendah-risiko: polling `setInterval` yg memanggil ULANG
+// fetchLeads/fetchStats yg SUDAH ADA (bukan migrasi ke react-query), supaya seluruh state
+// pagination/filter/modal/error yg sudah teruji tidak perlu ditulis ulang.
+const POLL_INTERVAL_MS = 20000;
 
 export default function RiwayatPelangganPage() {
   const [leads, setLeads] = useState<LeadItem[]>([]);
   const [selectedRtsLead, setSelectedRtsLead] = useState<LeadItem | null>(null);
   const [selectedInsightLead, setSelectedInsightLead] = useState<LeadItem | null>(null);
+  const [selectedTimelineLead, setSelectedTimelineLead] = useState<string | null>(null);
+  const [selectedCapiLead, setSelectedCapiLead] = useState<LeadItem | null>(null);
   const [stats, setStats] = useState<LeadStats | null>(null);
   const [loading, setLoading] = useState(true);
+  // Langkah E Fase 27 (error-state): pisahkan "gagal fetch" dari "data memang kosong" --
+  // sebelumnya fetchLeads/fetchStats cuma console.error tanpa state, jadi tabel kosong
+  // krn API down terlihat identik dgn tabel kosong krn filter tidak ada hasil.
+  const [leadsError, setLeadsError] = useState<string | null>(null);
+  const [statsError, setStatsError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
+  const [sortBy, setSortBy] = useState<'lastMessageAt' | 'createdAt'>('lastMessageAt');
+  const [sortOrder, setSortOrder] = useState<'desc' | 'asc'>('desc');
   // debouncedSearch: nilai search yang benar-benar dikirim ke API (delay 500ms).
   // Ini memisahkan UI state (search) dari API call state (debouncedSearch),
   // mencegah spam request ke backend dan race condition pada hasil tabel.
   const [debouncedSearch, setDebouncedSearch] = useState('');
-  const [categoryFilter, setCategoryFilter] = useState<string>('NEW_INBOUND');
+  const [categoryFilter, setCategoryFilter] = useState<string>('ALL');
+  const [filterBy, setFilterBy] = useState<'createdAt' | 'lastMessageAt'>('createdAt');
   const [stageFilter, setStageFilter] = useState<string>('ALL');
   const [statusFilter, setStatusFilter] = useState<string>('ALL');
   const [rtsFilter, setRtsFilter] = useState<string>('ALL');
@@ -107,148 +101,196 @@ export default function RiwayatPelangganPage() {
     return () => clearTimeout(timer); // Cleanup: batalkan timer jika search berubah lagi
   }, [search]);
 
+  // Auto-sort: saat mode Chat Aktif (lastMessageAt) diaktifkan, sort otomatis by lastMessageAt.
+  // Saat kembali ke mode normal (createdAt), sort otomatis by createdAt.
+  // Ini memastikan tampilan tabel konsisten dengan mode yang dipilih tanpa perlu klik manual.
+  useEffect(() => {
+    setSortBy(filterBy === 'lastMessageAt' ? 'lastMessageAt' : 'createdAt');
+    setSortOrder('desc');
+  }, [filterBy]);
+
+  const cleanMinatProduk = (p?: string | null): string | null => {
+    if (!p) return null;
+    const s = p.trim();
+    if (!s || s.toLowerCase() === 'null' || s.toLowerCase() === 'undefined' || s.toLowerCase() === 'none' || s.toLowerCase() === 'n/a' || s === '-') {
+      return null;
+    }
+    return s;
+  };
+
   const getObjectionDetail = useCallback((lead: LeadItem) => {
-    if (lead.conversionStatus === 'CLOSING') {
-      return {
-        type: 'RESOLVED_CLOSING',
+    const prodName = cleanMinatProduk(lead.minatProduk);
+    const objType = (lead.objectionType || '').toUpperCase();
+
+    // Map Tag, Label, dan Warna berdasarkan objectionType AI
+    let meta = {
+      shortTag: 'Follow Up',
+      tagClass: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+      label: '💬 Tindak Lanjut Percakapan',
+    };
+
+    const isDeliveryConfirm =
+      objType === 'AFTER_SALES_DELIVERY' ||
+      /(sdh|sudah|telah|pun)\s+(diterima|sampai|sampe|tiba|mendarat|nyampe|masuk)/i.test(
+        (lead.lastInsight || '') + ' ' + (lead.objectionType || '')
+      );
+
+    const isAfterSalesQuery =
+      objType === 'AFTER_SALES_RESI' ||
+      /(resi|status pengiriman|kurir|paket|kirim|sampai mana|belum sampai|lacak)/i.test(
+        (lead.lastInsight || '') + ' ' + (lead.objectionType || '')
+      );
+
+    if (isDeliveryConfirm) {
+      meta = {
+        shortTag: 'Paket Diterima',
+        tagClass: 'bg-teal-50 text-teal-700 border-teal-200',
+        label: '📦 Paket Berhasil Diterima Pembeli',
+      };
+    } else if (isAfterSalesQuery) {
+      meta = {
+        shortTag: 'Tanya Resi',
+        tagClass: 'bg-blue-50 text-blue-700 border-blue-200',
+        label: '📦 Lacak Resi & Status Pengiriman',
+      };
+    } else if (objType === 'PRICE_OBJECTION') {
+      meta = {
+        shortTag: 'Nego Harga',
+        tagClass: 'bg-orange-50 text-orange-700 border-orange-200',
+        label: '🏷️ Nego Harga Produk',
+      };
+    } else if (objType === 'SHIPPING_COST') {
+      meta = {
+        shortTag: 'Nego Ongkir',
+        tagClass: 'bg-amber-50 text-amber-700 border-amber-200',
+        label: '💸 Keberatan Biaya Ongkir',
+      };
+    } else if (objType === 'SEEKING_PERMISSION') {
+      meta = {
+        shortTag: 'Izin Keluarga',
+        tagClass: 'bg-teal-50 text-teal-700 border-teal-200',
+        label: '👥 Musyawarah Keluarga / Pasangan',
+      };
+    } else if (objType === 'WAITING_SALARY') {
+      meta = {
+        shortTag: 'Nunggu Gajian',
+        tagClass: 'bg-indigo-50 text-indigo-700 border-indigo-200',
+        label: '🗓️ Menunggu Kesiapan Dana / Gajian',
+      };
+    } else if (objType === 'COD_UNCERTAINTY') {
+      meta = {
+        shortTag: 'Ragu COD',
+        tagClass: 'bg-purple-50 text-purple-700 border-purple-200',
+        label: '📦 Ragu SOP Kurir COD',
+      };
+    } else if (objType === 'PRODUCT_INQUIRY') {
+      meta = {
+        shortTag: 'Tanya Produk',
+        tagClass: 'bg-sky-50 text-sky-700 border-sky-200',
+        label: '🔍 Eksplorasi Kebutuhan Produk',
+      };
+    } else if (objType === 'COMPLAINT_DEFECT') {
+      meta = {
+        shortTag: 'Komplain Garansi',
+        tagClass: 'bg-rose-50 text-rose-700 border-rose-200',
+        label: '⚠️ Layanan Garansi & Retur',
+      };
+    } else if (lead.conversionStatus === 'CLOSING' || objType === 'DEAL_CONFIRMED') {
+      meta = {
         shortTag: 'Deal Closing',
         tagClass: 'bg-emerald-50 text-emerald-700 border-emerald-200',
         label: '✅ Transaksi Selesai (Deal Closing)',
+      };
+    } else if (lead.conversionStatus === 'LOST' || objType === 'LOST') {
+      meta = {
+        shortTag: 'Batal',
+        tagClass: 'bg-rose-50 text-rose-700 border-rose-200',
+        label: '❌ Transaksi Batal (Lost)',
+      };
+    } else if (objType === 'PENDING_TRANSFER') {
+      meta = {
+        shortTag: 'Transfer',
+        tagClass: 'bg-cyan-50 text-cyan-700 border-cyan-200',
+        label: '💳 Menunggu Transfer Bank',
+      };
+    } else if (objType === 'SWITCH_SHOPEE') {
+      meta = {
+        shortTag: 'Shopee',
+        tagClass: 'bg-fuchsia-50 text-fuchsia-700 border-fuchsia-200',
+        label: '🛒 Alih Transaksi ke Shopee',
+      };
+    }
+
+    // Jika AI sudah menghasilkan taktik dan draft WA khusus, gunakan data AI murni!
+    if (lead.taktikCS && lead.draftWA) {
+      return {
+        type: objType || 'AI_GENERATED',
+        shortTag: meta.shortTag,
+        tagClass: meta.tagClass,
+        label: meta.label,
+        summary: lead.lastInsight || 'Analisis percakapan diproses otomatis oleh AI.',
+        suggestedAction: lead.taktikCS,
+        followUpScript: lead.draftWA,
+      };
+    }
+
+    // Fallback untuk data legacy:
+    if (isDeliveryConfirm) {
+      return {
+        type: 'AFTER_SALES_DELIVERY',
+        shortTag: meta.shortTag,
+        tagClass: meta.tagClass,
+        label: meta.label,
+        summary: lead.lastInsight || 'Pelanggan mengonfirmasi bahwa paket pesanan telah sampai dan diterima dengan baik.',
+        suggestedAction: 'Apresiasi kepuasan pelanggan, berikan doa keberkahan, dan tawarkan panduan perawatan bilah.',
+        followUpScript: `Alhamdulillah, terima kasih banyak atas kepercayaannya ya Kak! Semoga berkah dan bermanfaat untuk aktivitas Kakak. Jika butuh panduan perawatan bilah, kami selalu siap bantu ya kak 🙏`,
+      };
+    }
+
+    if (isAfterSalesQuery) {
+      return {
+        type: 'AFTER_SALES_RESI',
+        shortTag: meta.shortTag,
+        tagClass: meta.tagClass,
+        label: meta.label,
+        summary: lead.lastInsight || 'Pelanggan menanyakan status pengiriman / nomor resi paket.',
+        suggestedAction: 'Segera koordinasikan dengan tim gudang untuk cek nomor resi ekspedisi dan sampaikan estimasi tiba secara ramah.',
+        followUpScript: `Halo Kak! Untuk paket pesanannya sedang kami mintakan nomor resinya ke tim gudang ya kak. Mohon ditunggu sebentar ya kak 🙏`,
+      };
+    }
+
+    if (lead.conversionStatus === 'CLOSING') {
+      return {
+        type: 'RESOLVED_CLOSING',
+        shortTag: meta.shortTag,
+        tagClass: meta.tagClass,
+        label: meta.label,
         summary: 'Pembeli telah menyetujui pesanan dan mengonfirmasi alamat pengiriman.',
         suggestedAction: 'Segera cetak label pengiriman & serahkan paket ke kurir rekomendasi.',
-        followUpScript: `Halo Kak! Pesanan ${lead.minatProduk || 'produk'} sedang disiapkan untuk proses packing ya kak. Resi pengiriman akan segera kami informasikan begitu paket diserahkan ke kurir. Terima kasih banyak atas kepercayaannya! 🙏`,
+        followUpScript: `Halo Kak! Pesanan ${prodName || 'Kakak'} sedang disiapkan untuk proses packing ya kak. Resi pengiriman akan segera kami informasikan begitu paket diserahkan ke kurir. Terima kasih banyak atas kepercayaannya! 🙏`,
       };
     }
 
     if (lead.conversionStatus === 'LOST') {
       return {
         type: 'LOST',
-        shortTag: 'Batal',
-        tagClass: 'bg-rose-50 text-rose-700 border-rose-200',
-        label: '❌ Transaksi Batal (Lost)',
+        shortTag: meta.shortTag,
+        tagClass: meta.tagClass,
+        label: meta.label,
         summary: 'Prospek menolak atau membatalkan pembelian.',
         suggestedAction: 'Arsipkan kontak dan hindari spam chat berlebihan. Simpan nomor untuk broadcast promo khusus peluncuran produk baru.',
-        followUpScript: `Terima kasih atas waktunya ya Kak! Jika nanti membutuhkan ${lead.minatProduk || 'alat pisau/golok berkualitas'}, kami selalu siap membantu. Semoga lancar selalu aktivitasnya! 🙏`,
+        followUpScript: `Terima kasih atas waktunya ya Kak! Jika nanti membutuhkan ${prodName || 'alat bilah berkualitas'}, kami selalu siap membantu. Semoga lancar selalu aktivitasnya! 🙏`,
       };
     }
 
-    // Status: PENDING (Follow Up)
-    const text = (lead.lastInsight || '').toLowerCase();
-    const isBladeProduct = /(golok|pisau|bilah|sembelih|gke|mamba|situmang|betekok|duralium|pedang|tajam)/i.test(
-      (lead.minatProduk || '') + ' ' + text
-    );
-
-    // 1. Ragu SOP COD / Takut Tertipu
-    if (/(cek barang|buka paket|lihat dulu|sebelum bayar|takut tertipu|buka dulu|marketplace|shopee)/i.test(text)) {
-      return {
-        type: 'COD_HESITATION',
-        shortTag: 'Ragu SOP COD',
-        tagClass: 'bg-purple-50 text-purple-700 border-purple-200',
-        label: '📦 Ragu SOP COD / Minta Cek Fisik Sebelum Bayar',
-        summary: 'Pembeli ragu/takut tertipu dan ingin memastikan barang asli sebelum membayar ke kurir.',
-        suggestedAction: isBladeProduct
-          ? 'Edukasi SOP kurir resmi COD, berikan Garansi 100% Ganti Baru, dan tawarkan BONUS BATU ASAHAN + video tes ketajaman bilah dari gudang.'
-          : 'Edukasi bahwa SOP resmi kurir COD tidak mengizinkan buka segel sebelum bayar, namun toko memberikan Garansi Retur 100% / Kirim video real produk.',
-        followUpScript: isBladeProduct
-          ? `Halo Kak! Untuk metode COD sesuai SOP resmi ekspedisi memang pembayaran dilakukan ke kurir sebelum buka paket ya kak. Namun jangan khawatir, kami berikan Garansi 100% Ganti Baru + kami sertakan BONUS BATU ASAHAN. Boleh kami kirimkan video tes ketajaman ${lead.minatProduk || 'pisaunya'} langsung dari gudang kak? 🙏`
-          : `Halo Kak! Untuk metode COD sesuai SOP resmi ekspedisi pembayaran dilakukan ke kurir sebelum buka paket ya kak. Namun toko kami berikan Garansi 100% Ganti Baru jika barang tidak sesuai. Mau kami kirimkan video fisik asli ${lead.minatProduk || 'barangnya'} kak? 🙏`,
-      };
-    }
-
-    // 2. Ragu Gambar / Ketidaksesuaian Fisik Produk
-    if (/(gambar|foto|fisik|asli|bentuk|ketidaksesuaian|sesuai)/i.test(text)) {
-      return {
-        type: 'PICTURE_MISMATCH',
-        shortTag: 'Ragu Gambar',
-        tagClass: 'bg-rose-50 text-rose-700 border-rose-200',
-        label: '📸 Keraguan Bentuk Fisik & Gambar Produk',
-        summary: 'Pembeli ragu dengan bentuk fisik atau keaslian barang berdasarkan foto iklan.',
-        suggestedAction: isBladeProduct
-          ? 'Kirimkan foto & video fisik asli produk langsung dari gudang, serta sertakan BONUS BATU ASAHAN untuk meyakinkan pembeli tanpa diskon ongkir.'
-          : 'Kirimkan foto & video detail fisik asli produk langsung dari gudang toko.',
-        followUpScript: isBladeProduct
-          ? `Halo Kak! Terkait keraguan bentuk fisik ${lead.minatProduk || 'pisaunya'}, ini kami fotokan barang aslinya langsung dari gudang ya kak. Khusus hari ini kami sertakan juga BONUS BATU ASAHAN jika diproseskan sekarang kak. Mau kami amankan slot kirimnya kak? 🙏`
-          : `Halo Kak! Untuk ${lead.minatProduk || 'barangnya'}, ini kami fotokan fisik aslinya langsung dari gudang ya kak. Barangnya ready dan siap dipacking hari ini. Mau kami bantu proseskan pengirimannya kak? 😊`,
-      };
-    }
-
-    // 3. Keberatan Biaya Ongkir Murni
-    if (/(ongkir|biaya kirim|ongkos kirim|kirimnya mahal)/i.test(text)) {
-      return {
-        type: 'SHIPPING_COST',
-        shortTag: 'Nego Ongkir',
-        tagClass: 'bg-amber-50 text-amber-700 border-amber-200',
-        label: '💸 Keberatan Biaya Ongkir Pengiriman',
-        summary: 'Pembeli merasa total ongkir ekspedisi terlalu tinggi di luar estimasi budgetnya.',
-        suggestedAction: 'Bantu carikan opsi kurir termurah atau terapkan SOP DISKON ONGKIR (Maksimal 20%). Simpan bonus asahan untuk negosiasi lanjutan jika masih mentok.',
-        followUpScript: `Halo Kak! Terkait pemesanan ${lead.minatProduk || 'produknya'}, khusus hari ini kami bantu subsidi potongan ongkir hingga 20% ke alamat Kakak agar lebih hemat. Mau kami bantu proseskan pengirimannya sekarang kak? 😊`,
-      };
-    }
-
-    // 4. Nego Harga Produk / Kemahalan Barang
-    if (/(kemahalan|mahal|diskon harga|potongan harga|kurang mas|nego|harga)/i.test(text)) {
-      return {
-        type: 'PRICE_OBJECTION',
-        shortTag: 'Nego Harga',
-        tagClass: 'bg-orange-50 text-orange-700 border-orange-200',
-        label: '🏷️ Nego Harga Produk',
-        summary: 'Pembeli merasa harga barang kemahalan dan meminta potongan harga jual.',
-        suggestedAction: isBladeProduct
-          ? 'Pertahankan harga produk dengan edukasi kualitas baja tempa asli, dan tawarkan BONUS BATU ASAHAN sebagai nilai tambah tanpa memotong harga jual.'
-          : 'Edukasi keunggulan material dan ketahanan produk untuk mempertahankan harga jual.',
-        followUpScript: isBladeProduct
-          ? `Halo Kak! Untuk ${lead.minatProduk || 'produk ini'} harganya sudah pas karena materialnya baja tempa asli dengan ketajaman teruji kak. Tapi khusus hari ini, kami sertakan BONUS BATU ASAHAN gratis agar Kakak tidak perlu beli asahan lagi. Boleh kami bantu siapkan pesanannya kak? 😊`
-          : `Halo Kak! Untuk ${lead.minatProduk || 'produk ini'} harganya sudah sangat hemat sebanding dengan kualitas dan daya tahannya kak. Mau kami bantu siapkan pengirimannya hari ini kak? 😊`,
-      };
-    }
-
-    // 5. Menunggu Gajian / Tanggal Tertentu
-    if (/(gajian|tanggal|tgl|akhir bulan|awal bulan|minggu depan|nunggu uang|gaji)/i.test(text)) {
-      return {
-        type: 'SALARY_PENDING',
-        shortTag: 'Nunggu Gajian',
-        tagClass: 'bg-blue-50 text-blue-700 border-blue-200',
-        label: '🗓️ Menunggu Gajian / Kesiapan Dana',
-        summary: 'Pembeli sangat berminat namun meminta penundaan transaksi sampai tanggal gajian tiba.',
-        suggestedAction: isBladeProduct
-          ? 'Amankan slot booking promo + simpan kuota BONUS BATU ASAHAN, dan jadwalkan pesan pengingat sopan pada pagi hari tanggal gajian.'
-          : 'Amankan data booking pesanan agar promo tidak hangus, dan jadwalkan follow-up sopan pada tanggal perkiraan gajian.',
-        followUpScript: isBladeProduct
-          ? `Halo Kak! Mau info untuk promo ${lead.minatProduk || 'pesanannya'} beserta slot BONUS BATU ASAHAN sudah kami amankan ya kak. Kalau nanti gajiannya sudah siap, boleh langsung kabari kami agar bisa segera dipacking dan dikirim ya kak. Terima kasih Kak! 🙏`
-          : `Halo Kak! Mau info untuk promo ${lead.minatProduk || 'pesanannya'} sudah kami amankan slotnya ya kak. Kalau nanti gajiannya sudah siap, boleh kabari kami agar langsung kami prioritaskan packing ya kak 🙏`,
-      };
-    }
-
-    // 6. Tanya Keluarga / Pasangan
-    if (/(tanya suami|tanya istri|tanya bapak|rembukan|diskusi)/i.test(text)) {
-      return {
-        type: 'DECISION_MAKER',
-        shortTag: 'Musyawarah Keluarga',
-        tagClass: 'bg-teal-50 text-teal-700 border-teal-200',
-        label: '👥 Musyawarah dengan Pasangan / Keluarga',
-        summary: 'Pembeli bukan pengambil keputusan tunggal dan perlu persetujuan keluarga.',
-        suggestedAction: isBladeProduct
-          ? 'Kirimkan foto detail orisinalitas bahan baja tempa dan video uji ketajaman bilah kertas/tali yang mudah diperlihatkan ke pasangan/keluarga.'
-          : 'Kirimkan foto detail orisinalitas bahan dan spesifikasi produk yang ringkas untuk diperlihatkan ke keluarga.',
-        followUpScript: isBladeProduct
-          ? `Halo Kak! Bagaimana hasil diskusinya dengan keluarga untuk ${lead.minatProduk || 'produk bilahnya'}? Jika butuh foto detail atau video tes ketajaman untuk diperlihatkan ke keluarga, boleh kami kirimkan sekarang ya kak 😊`
-          : `Halo Kak! Bagaimana hasil diskusinya dengan keluarga untuk ${lead.minatProduk || 'produknya'}? Jika butuh foto detail atau spesifikasinya boleh kami bantu kirimkan ya kak 😊`,
-      };
-    }
-
-    // Default: Follow Up / Tanya Spesifikasi
     return {
       type: 'GENERAL_INQUIRY',
-      shortTag: 'Tanya Spesifikasi',
-      tagClass: 'bg-indigo-50 text-indigo-700 border-indigo-200',
-      label: '🔍 Eksplorasi Produk & Kebutuhan Bilah',
-      summary: 'Prospek sedang mencari informasi bahan, dimensi, atau peruntukan alat.',
-      suggestedAction: isBladeProduct
-        ? 'Tanyakan kebutuhan pemakaian (misal sembelih sapi, kambing, tebas ranting, atau semak kebun) agar CS bisa merekomendasikan tipe & ukuran yang paling presisi.'
-        : 'Tanyakan kebutuhan pemakaian spesifik pembeli agar CS bisa merekomendasikan varian produk yang paling cocok.',
-      followUpScript: isBladeProduct
-        ? `Halo Kak! Untuk ${lead.minatProduk || 'produk ini'} bahan bilahnya sudah baja tempa asli dengan ketajaman siap pakai kak. Rencananya mau digunakan untuk sembelih hewan atau kebutuhan kebun kak? Biar kami rekomendasikan varian yang paling pas 🙏`
-        : `Halo Kak! Untuk ${lead.minatProduk || 'produk ini'} spesifikasinya sudah teruji berkualitas kak. Rencananya untuk kebutuhan apa kak biar kami bantu rekomendasikan yang terbaik? 😊`,
+      shortTag: meta.shortTag,
+      tagClass: meta.tagClass,
+      label: meta.label,
+      summary: lead.lastInsight || 'Calon pembeli sedang mengeksplorasi pilihan produk.',
+      suggestedAction: 'Sapa dengan ramah dan tanyakan kebutuhan penggunaan alat agar CS bisa merekomendasikan varian produk yang paling tepat.',
+      followUpScript: `Halo Kak! Untuk ${prodName || 'produk kami'} ready siap kirim ya kak. Rencananya mau digunakan untuk kebutuhan apa kak biar kami bantu siapkan varian yang paling pas? 😊`,
     };
   }, []);
 
@@ -260,17 +302,12 @@ export default function RiwayatPelangganPage() {
     }, 2500);
   };
 
-  const [datePreset, setDatePreset] = useState<'all' | 'today' | '7d' | '30d' | 'this_month' | 'custom'>('all');
-  const [customStart, setCustomStart] = useState(() => {
-    const d = new Date();
-    d.setDate(d.getDate() - 6);
-    return d.toISOString().split('T')[0];
-  });
-  const [customEnd, setCustomEnd] = useState(() => new Date().toISOString().split('T')[0]);
+  const [datePreset, setDatePreset] = useState<'all' | 'today' | 'yesterday' | '7d' | '30d' | 'this_month' | 'custom'>('all');
+  const [customStart, setCustomStart] = useState(() => getJakartaOffsetStr(-6));
+  const [customEnd, setCustomEnd] = useState(() => getJakartaTodayStr());
 
   const { startDate, endDate, dateRangeLabel } = useMemo(() => {
-    const now = new Date();
-    const todayStr = now.toISOString().split('T')[0];
+    const todayStr = getJakartaTodayStr();
 
     if (datePreset === 'all') {
       return { startDate: undefined, endDate: undefined, dateRangeLabel: 'Semua Waktu' };
@@ -278,19 +315,18 @@ export default function RiwayatPelangganPage() {
     if (datePreset === 'today') {
       return { startDate: todayStr, endDate: todayStr, dateRangeLabel: 'Hari Ini' };
     }
+    if (datePreset === 'yesterday') {
+      const yesterdayStr = getJakartaOffsetStr(-1);
+      return { startDate: yesterdayStr, endDate: yesterdayStr, dateRangeLabel: 'Kemarin' };
+    }
     if (datePreset === '7d') {
-      const d = new Date();
-      d.setDate(d.getDate() - 6);
-      return { startDate: d.toISOString().split('T')[0], endDate: todayStr, dateRangeLabel: '7 Hari Terakhir' };
+      return { startDate: getJakartaOffsetStr(-6), endDate: todayStr, dateRangeLabel: '7 Hari Terakhir' };
     }
     if (datePreset === '30d') {
-      const d = new Date();
-      d.setDate(d.getDate() - 29);
-      return { startDate: d.toISOString().split('T')[0], endDate: todayStr, dateRangeLabel: '30 Hari Terakhir' };
+      return { startDate: getJakartaOffsetStr(-29), endDate: todayStr, dateRangeLabel: '30 Hari Terakhir' };
     }
     if (datePreset === 'this_month') {
-      const firstDay = new Date(now.getFullYear(), now.getMonth(), 1);
-      return { startDate: firstDay.toISOString().split('T')[0], endDate: todayStr, dateRangeLabel: 'Bulan Ini' };
+      return { startDate: getJakartaFirstDayOfMonthStr(), endDate: todayStr, dateRangeLabel: 'Bulan Ini' };
     }
     return {
       startDate: customStart || todayStr,
@@ -312,12 +348,29 @@ export default function RiwayatPelangganPage() {
     fetchCsList();
   }, [fetchCsList]);
 
-  const fetchLeads = useCallback(async () => {
-    setLoading(true);
+  const handleSortToggle = (field: 'lastMessageAt' | 'createdAt') => {
+    if (sortBy === field) {
+      setSortOrder(prev => (prev === 'desc' ? 'asc' : 'desc'));
+    } else {
+      setSortBy(field);
+      setSortOrder('desc');
+    }
+    setPage(1);
+  };
+
+  const fetchLeads = useCallback(async (opts: { silent?: boolean } = {}) => {
+    // silent=true dipakai oleh polling auto-refresh di bawah -- data tabel tetap diperbarui,
+    // tapi TANPA memicu spinner "Memuat riwayat pelanggan..." yg menimpa seluruh tabel tiap
+    // POLL_INTERVAL_MS detik (mengganggu kalau CS sedang membaca/scroll). Klik tombol "Segarkan"
+    // manual & load pertama kali tetap pakai jalur biasa (silent=false) supaya spinner tetap
+    // muncul di sana, sesuai perilaku lama.
+    if (!opts.silent) setLoading(true);
     try {
       const params = new URLSearchParams({
         page: String(page),
-        limit: '20',
+        limit: '50',
+        sortBy,
+        sortOrder,
       });
       if (categoryFilter !== 'ALL') params.set('leadCategory', categoryFilter);
       if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim());
@@ -327,6 +380,7 @@ export default function RiwayatPelangganPage() {
       if (csFilter !== 'ALL') params.set('csName', csFilter);
       if (startDate) params.set('startDate', startDate);
       if (endDate) params.set('endDate', endDate);
+      params.set('filterBy', filterBy);
 
       const res = await apiGet<{
         leads: LeadItem[];
@@ -338,30 +392,58 @@ export default function RiwayatPelangganPage() {
       setLeads(res.leads || []);
       setTotalLeads(res.total || 0);
       setTotalPages(res.totalPages || 1);
+      setLeadsError(null);
     } catch (err) {
       console.error('Gagal memuat daftar leads:', err);
+      // Poll silent yg gagal (mis. blip jaringan sesaat) SENGAJA tidak menimpa tabel yg sedang
+      // menampilkan data valid dgn layar error penuh -- itu regresi UX yg lebih buruk drpd sekadar
+      // data belum ter-refresh. Error penuh hanya utk load pertama / klik "Segarkan" manual.
+      if (!opts.silent) {
+        setLeadsError('Gagal memuat data dari server. Periksa koneksi lalu coba lagi.');
+      }
     } finally {
-      setLoading(false);
+      if (!opts.silent) setLoading(false);
     }
-  }, [page, debouncedSearch, categoryFilter, stageFilter, statusFilter, rtsFilter, csFilter, startDate, endDate]);
+  }, [page, debouncedSearch, categoryFilter, filterBy, stageFilter, statusFilter, rtsFilter, csFilter, startDate, endDate, sortBy, sortOrder]);
 
-  const fetchStats = useCallback(async () => {
+  const fetchStats = useCallback(async (opts: { silent?: boolean } = {}) => {
     try {
       const params = new URLSearchParams();
       if (categoryFilter !== 'ALL') params.set('leadCategory', categoryFilter);
       if (csFilter !== 'ALL') params.set('csName', csFilter);
       if (startDate) params.set('startDate', startDate);
       if (endDate) params.set('endDate', endDate);
+      params.set('filterBy', filterBy);
       const data = await apiGet<LeadStats>(`/leads/stats?${params.toString()}`);
       setStats(data);
+      setStatsError(null);
     } catch (err) {
       console.error('Gagal memuat stats leads:', err);
+      // Sama seperti fetchLeads: poll silent yg gagal sesaat tidak boleh menimpa kartu ringkasan
+      // yg sudah menampilkan angka valid dgn banner error -- lihat catatan di fetchLeads.
+      if (!opts.silent) {
+        setStatsError('Gagal memuat ringkasan statistik.');
+      }
     }
-  }, [categoryFilter, csFilter, startDate, endDate]);
+  }, [categoryFilter, filterBy, csFilter, startDate, endDate]);
 
   useEffect(() => {
     fetchStats();
   }, [fetchStats]);
+
+  // Auto-refresh polling (Langkah E-lanjutan, T-FE-4, Fase 29): jeda otomatis saat tab browser
+  // tidak aktif (document.visibilityState) supaya tidak boros request ke server saat halaman
+  // di-minimize/pindah tab -- interval-nya sendiri tetap jalan (browser timer), cuma tick-nya
+  // yg dilewati kalau tab sedang tidak terlihat.
+  useEffect(() => {
+    const tick = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') return;
+      fetchLeads({ silent: true });
+      fetchStats({ silent: true });
+    };
+    const interval = setInterval(tick, POLL_INTERVAL_MS);
+    return () => clearInterval(interval);
+  }, [fetchLeads, fetchStats]);
 
   useEffect(() => {
     fetchLeads();
@@ -377,6 +459,7 @@ export default function RiwayatPelangganPage() {
     if (debouncedSearch.trim()) params.set('search', debouncedSearch.trim());
     if (startDate) params.set('startDate', startDate);
     if (endDate) params.set('endDate', endDate);
+    params.set('filterBy', filterBy);
 
     const token = localStorage.getItem('token');
     const url = `/api/v1/leads/export?${params.toString()}`;
@@ -428,6 +511,18 @@ export default function RiwayatPelangganPage() {
     }
 
     // 3. Status CLOSING (Sudah Deal Transaksi)
+    // Langkah E Fase 27 (Temuan T6, kritis): evaluasi RTS yang gagal total (sentinel
+    // EVALUATION_FAILED dari Langkah D Fase 26) sebelumnya jatuh ke fallback hijau
+    // "Aman (0%)" di paling bawah -- alamat/SOP BELUM tervalidasi tapi CS bisa
+    // membaca badge ini sbg "aman kirim COD". Harus tegas beda dari benar-benar LOW.
+    if (lead.rtsRiskLevel === 'EVALUATION_FAILED') {
+      return (
+        <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold bg-amber-100 text-amber-800 border border-amber-300 shadow-xs">
+          <AlertTriangle className="w-3.5 h-3.5 text-amber-700" />
+          Belum Tervalidasi (Cek Manual)
+        </span>
+      );
+    }
     const score = lead.rtsRiskScore ?? 0;
     if (score >= 46 || lead.rtsRiskLevel === 'HIGH') {
       return (
@@ -483,6 +578,13 @@ export default function RiwayatPelangganPage() {
 
   const getConversionBadge = (status: string) => {
     switch (status) {
+      case 'REPEAT_ORDER':
+        return (
+          <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-bold bg-purple-50 text-purple-700 border border-purple-200 shadow-sm">
+            <span>👑</span>
+            Repeat Order
+          </span>
+        );
       case 'CLOSING':
         return (
           <span className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-md text-xs font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
@@ -508,56 +610,17 @@ export default function RiwayatPelangganPage() {
     }
   };
 
-  const formatWibDate = (isoStr: string | null) => {
-    if (!isoStr) return '-';
-    return new Date(isoStr).toLocaleDateString('id-ID', {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-      timeZone: 'Asia/Jakarta',
-    });
-  };
-
-  const formatWibDateTime = (isoStr: string | null) => {
-    if (!isoStr) return '-';
-    const d = new Date(isoStr);
-    const datePart = d.toLocaleDateString('id-ID', {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-      timeZone: 'Asia/Jakarta',
-    });
-    const timePart = d.toLocaleTimeString('id-ID', {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-      timeZone: 'Asia/Jakarta',
-    }).replace('.', ':');
-    return `${datePart}, ${timePart} WIB`;
-  };
-
   const renderStackedTimestamp = (isoStr: string | null) => {
     if (!isoStr) return <span className="text-gray-400 text-xs">-</span>;
-    const d = new Date(isoStr);
-    const datePart = d.toLocaleDateString('id-ID', {
-      day: 'numeric',
-      month: 'short',
-      year: 'numeric',
-      timeZone: 'Asia/Jakarta',
-    });
-    const timePart = d.toLocaleTimeString('id-ID', {
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-      timeZone: 'Asia/Jakarta',
-    }).replace('.', ':');
+    const datePart = formatWibDate(isoStr);
+    const timePart = formatWibDateTime(isoStr).split(', ')[1] || '';
 
     return (
       <div className="flex flex-col">
         <span className="font-semibold text-gray-900 text-xs whitespace-nowrap">{datePart}</span>
         <span className="text-[11px] text-gray-500 font-mono flex items-center gap-1 mt-0.5 whitespace-nowrap">
           <Clock className="w-2.5 h-2.5 text-gray-400" />
-          {timePart} WIB
+          {timePart || '-'}
         </span>
       </div>
     );
@@ -569,35 +632,92 @@ export default function RiwayatPelangganPage() {
         <div>
           <h1 className="text-xl md:text-2xl font-bold text-gray-900 flex items-center gap-2">
             <Users className="w-6 h-6 text-indigo-600" />
-            Riwayat Pelanggan & CRM Prospek
+            Riwayat Pelanggan
           </h1>
           <p className="text-xs md:text-sm text-gray-500 mt-1">
             Database prospek otomatis dari percakapan WhatsApp. Dilengkapi minat produk, insight AI, dan scoring lead.
           </p>
         </div>
 
-        <div className="flex items-center gap-2.5">
+        <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap">
+          {/* Status Auto-refresh */}
+          <span
+            className="hidden lg:inline-flex items-center gap-1.5 text-[11px] text-gray-400 font-medium whitespace-nowrap mr-1"
+            title={`Data disegarkan otomatis tiap ${POLL_INTERVAL_MS / 1000} detik`}
+          >
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse" />
+            Auto-refresh aktif
+          </span>
+
+          {/* Tombol Segarkan */}
           <button
             onClick={() => {
               fetchStats();
               fetchLeads();
             }}
             disabled={loading}
-            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs md:text-sm font-medium text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition shadow-sm"
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-xs font-semibold text-gray-700 bg-white border border-gray-200 rounded-lg hover:bg-gray-50 transition shadow-xs whitespace-nowrap h-9"
           >
-            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-            Segarkan
+            <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+            <span>Segarkan</span>
           </button>
 
+          {/* Segmented Pill Switch: Tanggal Masuk vs Chat Terakhir */}
+          <div className="inline-flex items-center p-0.5 bg-gray-100/90 rounded-lg border border-gray-200 shadow-2xs h-9">
+            <button
+              onClick={() => {
+                if (filterBy !== 'createdAt') {
+                  setFilterBy('createdAt');
+                  setPage(1);
+                }
+              }}
+              title="Filter berdasarkan tanggal awal lead masuk (stabil & konsisten dengan Dashboard CS)"
+              className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold rounded-md transition-all whitespace-nowrap h-7.5 ${
+                filterBy === 'createdAt'
+                  ? 'bg-white text-indigo-700 shadow-xs border border-gray-200/80 ring-1 ring-black/5'
+                  : 'text-gray-500 hover:text-gray-800'
+              }`}
+            >
+              <Calendar className="w-3.5 h-3.5" />
+              <span>Tanggal Masuk</span>
+            </button>
+            <button
+              onClick={() => {
+                if (filterBy !== 'lastMessageAt') {
+                  setFilterBy('lastMessageAt');
+                  setPage(1);
+                }
+              }}
+              title="Filter berdasarkan interaksi pesan / chat WhatsApp terakhir"
+              className={`inline-flex items-center gap-1 px-2.5 py-1 text-xs font-bold rounded-md transition-all whitespace-nowrap h-7.5 ${
+                filterBy === 'lastMessageAt'
+                  ? 'bg-white text-indigo-700 shadow-xs border border-gray-200/80 ring-1 ring-black/5'
+                  : 'text-gray-500 hover:text-gray-800'
+              }`}
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              <span>Chat Terakhir</span>
+            </button>
+          </div>
+
+          {/* Tombol Export CSV */}
           <button
             onClick={handleExportCsv}
-            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs md:text-sm font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition shadow-sm"
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold text-white bg-indigo-600 rounded-lg hover:bg-indigo-700 transition shadow-xs whitespace-nowrap h-9"
+            title="Download data lead format CSV/Excel"
           >
-            <Download className="w-4 h-4" />
-            Export CSV / Excel
+            <Download className="w-3.5 h-3.5" />
+            <span>Export CSV</span>
           </button>
         </div>
       </div>
+
+      {statsError && (
+        <div className="flex items-center gap-2 p-3 bg-rose-50 border border-rose-200 rounded-xl text-xs text-rose-800">
+          <AlertCircle className="w-4 h-4 text-rose-600 flex-shrink-0" />
+          <span>{statsError} Kartu ringkasan di bawah mungkin belum menampilkan angka terbaru.</span>
+        </div>
+      )}
 
       <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 bg-white p-3.5 rounded-xl border border-gray-200 shadow-sm">
         <div className="flex items-center gap-2">
@@ -623,6 +743,14 @@ export default function RiwayatPelangganPage() {
               }`}
             >
               Hari Ini
+            </button>
+            <button
+              onClick={() => setDatePreset('yesterday')}
+              className={`px-2.5 py-1 text-xs font-semibold rounded-md transition-colors ${
+                datePreset === 'yesterday' ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-600 hover:text-gray-900'
+              }`}
+            >
+              Kemarin
             </button>
             <button
               onClick={() => setDatePreset('7d')}
@@ -877,40 +1005,40 @@ export default function RiwayatPelangganPage() {
             )}
           </div>
 
-          {/* Segmented Pills untuk Kategori Lead / Sumber */}
           <div className="flex items-center gap-1 bg-gray-100/80 p-1 rounded-xl border border-gray-200/60 overflow-x-auto">
             <button
-              onClick={() => {
-                setCategoryFilter('NEW_INBOUND');
-                setPage(1);
-              }}
+              onClick={() => { setCategoryFilter('PROSPEK_IKLAN'); setPage(1); }}
+              className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap ${
+                categoryFilter === 'PROSPEK_IKLAN'
+                  ? 'bg-indigo-600 text-white shadow-sm ring-1 ring-indigo-500'
+                  : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200/50'
+              }`}
+            >
+              <Sparkles className="w-3.5 h-3.5" />
+              <span>🎯 Prospek Iklan (Form)</span>
+            </button>
+            <button
+              onClick={() => { setCategoryFilter('NEW_INBOUND'); setPage(1); }}
               className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap ${
                 categoryFilter === 'NEW_INBOUND'
                   ? 'bg-indigo-600 text-white shadow-sm ring-1 ring-indigo-500'
                   : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200/50'
               }`}
             >
-              <Sparkles className="w-3.5 h-3.5" />
-              <span>🎯 Prospek Iklan (Form Baru)</span>
+              <span>🌱 Prospek Organik</span>
             </button>
             <button
-              onClick={() => {
-                setCategoryFilter('AFTER_SALES');
-                setPage(1);
-              }}
+              onClick={() => { setCategoryFilter('OTHERS'); setPage(1); }}
               className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap ${
-                categoryFilter === 'AFTER_SALES'
+                categoryFilter === 'OTHERS'
                   ? 'bg-indigo-600 text-white shadow-sm ring-1 ring-indigo-500'
                   : 'text-gray-600 hover:text-gray-900 hover:bg-gray-200/50'
               }`}
             >
-              <span>📦 After-Sales (Resi/Layanan)</span>
+              <span>📦 Layanan & Lainnya</span>
             </button>
             <button
-              onClick={() => {
-                setCategoryFilter('ALL');
-                setPage(1);
-              }}
+              onClick={() => { setCategoryFilter('ALL'); setPage(1); }}
               className={`px-3 py-1.5 text-xs font-bold rounded-lg transition-all flex items-center gap-1.5 whitespace-nowrap ${
                 categoryFilter === 'ALL'
                   ? 'bg-indigo-600 text-white shadow-sm ring-1 ring-indigo-500'
@@ -960,6 +1088,7 @@ export default function RiwayatPelangganPage() {
               >
                 <option value="ALL">Status: Semua</option>
                 <option value="CLOSING">✅ Closing Deal</option>
+                <option value="REPEAT_ORDER">👑 Repeat Order</option>
                 <option value="PENDING">⏳ Follow Up / Pending</option>
                 <option value="LOST">❌ Lost / Batal</option>
               </select>
@@ -1026,14 +1155,48 @@ export default function RiwayatPelangganPage() {
             <thead className="bg-gray-50/80 text-gray-600 text-xs font-semibold uppercase tracking-wider border-b border-gray-200">
               <tr>
                 <th className="px-4 py-3.5">Nomor HP (WhatsApp)</th>
-                <th className="px-4 py-3.5">Tgl Masuk</th>
+                <th
+                  onClick={() => handleSortToggle('createdAt')}
+                  className="px-4 py-3.5 cursor-pointer select-none hover:bg-gray-100/90 hover:text-indigo-600 transition-colors"
+                  title="Klik untuk mengurutkan berdasarkan Tanggal Masuk"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span>Tgl Masuk</span>
+                    {sortBy === 'createdAt' ? (
+                      sortOrder === 'desc' ? (
+                        <ArrowDown className="w-3.5 h-3.5 text-indigo-600 font-bold" />
+                      ) : (
+                        <ArrowUp className="w-3.5 h-3.5 text-indigo-600 font-bold" />
+                      )
+                    ) : (
+                      <ArrowUpDown className="w-3.5 h-3.5 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
                 <th className="px-4 py-3.5">Minat Produk</th>
                 <th className="px-4 py-3.5 min-w-[260px]">Insight Terakhir AI</th>
                 <th className="px-4 py-3.5">Kategori Lead</th>
                 <th className="px-4 py-3.5">Status Closing</th>
                 <th className="px-4 py-3.5">Risiko RTS & Ekspedisi</th>
                 <th className="px-4 py-3.5">CS Pemegang</th>
-                <th className="px-4 py-3.5">Terakhir Chat</th>
+                <th
+                  onClick={() => handleSortToggle('lastMessageAt')}
+                  className="px-4 py-3.5 cursor-pointer select-none hover:bg-gray-100/90 hover:text-indigo-600 transition-colors"
+                  title="Klik untuk mengurutkan berdasarkan Aktivitas Chat Terkini"
+                >
+                  <div className="flex items-center gap-1.5">
+                    <span>Terakhir Chat</span>
+                    {sortBy === 'lastMessageAt' ? (
+                      sortOrder === 'desc' ? (
+                        <ArrowDown className="w-3.5 h-3.5 text-indigo-600 font-bold" />
+                      ) : (
+                        <ArrowUp className="w-3.5 h-3.5 text-indigo-600 font-bold" />
+                      )
+                    ) : (
+                      <ArrowUpDown className="w-3.5 h-3.5 text-gray-400 opacity-60" />
+                    )}
+                  </div>
+                </th>
               </tr>
             </thead>
             <tbody className="divide-y divide-gray-100">
@@ -1043,6 +1206,21 @@ export default function RiwayatPelangganPage() {
                     <div className="inline-flex items-center gap-2">
                       <RefreshCw className="w-4 h-4 animate-spin text-indigo-600" />
                       Memuat riwayat pelanggan...
+                    </div>
+                  </td>
+                </tr>
+              ) : leadsError ? (
+                <tr>
+                  <td colSpan={9} className="px-4 py-12 text-center text-rose-500">
+                    <AlertCircle className="w-8 h-8 mx-auto text-rose-400 mb-2" />
+                    {leadsError}
+                    <div className="mt-2">
+                      <button
+                        onClick={() => fetchLeads()}
+                        className="text-xs font-semibold text-indigo-600 hover:text-indigo-700 underline"
+                      >
+                        Coba lagi
+                      </button>
                     </div>
                   </td>
                 </tr>
@@ -1061,13 +1239,20 @@ export default function RiwayatPelangganPage() {
                   >
                     <td className="px-4 py-3.5 whitespace-nowrap">
                       <div className="flex items-center gap-1.5 font-semibold text-gray-900 font-mono text-xs">
-                        <span>{lead.waNumber}</span>
+                        <button
+                          onClick={() => setSelectedTimelineLead(lead.waNumber)}
+                          className="hover:text-indigo-600 hover:underline flex items-center gap-1 transition-colors"
+                          title="Lihat Timeline Customer Journey"
+                        >
+                          {lead.waNumber}
+                          <Calendar className="w-3 h-3 text-indigo-400" />
+                        </button>
                         <a
                           href={`https://wa.me/${lead.waNumber}`}
                           target="_blank"
                           rel="noreferrer"
                           title="Buka Chat WhatsApp"
-                          className="text-emerald-600 hover:text-emerald-700"
+                          className="text-emerald-600 hover:text-emerald-700 ml-1"
                         >
                           <ExternalLink className="w-3.5 h-3.5" />
                         </a>
@@ -1083,13 +1268,18 @@ export default function RiwayatPelangganPage() {
                     </td>
 
                     <td className="px-4 py-3.5">
-                      <span className={`inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold max-w-[200px] truncate ${
-                        lead.minatProduk 
-                          ? 'bg-indigo-50 text-indigo-700 border border-indigo-100' 
-                          : 'bg-gray-100 text-gray-500 border border-gray-200 italic'
-                      }`}>
-                        {lead.minatProduk || 'Belum Memilih Produk'}
-                      </span>
+                      {(() => {
+                        const prod = cleanMinatProduk(lead.minatProduk);
+                        return (
+                          <span className={`inline-flex items-center px-2.5 py-1 rounded-md text-xs font-semibold max-w-[200px] truncate ${
+                            prod 
+                              ? 'bg-indigo-50 text-indigo-700 border border-indigo-100' 
+                              : 'bg-gray-100 text-gray-500 border border-gray-200 italic'
+                          }`}>
+                            {prod || 'Belum Memilih Produk'}
+                          </span>
+                        );
+                      })()}
                     </td>
                     {/* INSIGHT TERAKHIR AI (MICRO-CARD ELEGAN & TYPOGRAPHY TAJAM) */}
                     <td 
@@ -1107,7 +1297,23 @@ export default function RiwayatPelangganPage() {
                       </div>
                     </td>
                     <td className="px-4 py-3.5 whitespace-nowrap">
-                      {getStageBadge(lead.leadStage, lead.score)}
+                      <div className="flex flex-col gap-1.5 items-start">
+                        <div>{getStageBadge(lead.leadStage, lead.score)}</div>
+                        {lead.capiEventsSent && lead.capiEventsSent.length > 0 && (
+                          <button
+                            type="button"
+                            onClick={(e) => {
+                              e.stopPropagation();
+                              setSelectedCapiLead(lead);
+                            }}
+                            className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-semibold bg-blue-50 text-blue-700 border border-blue-200 hover:bg-blue-100 hover:border-blue-300 transition-all shadow-2xs group cursor-pointer"
+                            title="Klik untuk melihat Detail Funnel Meta CAPI"
+                          >
+                            <MetaLogoIcon className="w-3 h-3 text-[#0668E1] group-hover:scale-110 transition-transform flex-shrink-0" />
+                            <span>Meta CAPI ({lead.capiEventsSent.length})</span>
+                          </button>
+                        )}
+                      </div>
                     </td>
                     <td className="px-4 py-3.5 whitespace-nowrap">
                       <div className="flex flex-col gap-1">
@@ -1183,399 +1389,43 @@ export default function RiwayatPelangganPage() {
         </div>
       </div>
 
-      {/* ── MODAL 1: DETAIL PACKING & AUDIT ANTI-RTS (PORTAL TO BODY) ── */}
-      {mounted && selectedRtsLead && createPortal(
-        <div className="fixed inset-0 z-[99999] w-screen h-screen bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
-          <div className="relative bg-white rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl border border-gray-100 p-6 space-y-5 my-auto">
-            {/* Header Modal */}
-            <div className="flex items-start justify-between border-b border-gray-100 pb-4">
-              <div>
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-base font-bold text-gray-900">{selectedRtsLead.waNumber}</span>
-                  {getConversionBadge(selectedRtsLead.conversionStatus)}
-                  {getStageBadge(selectedRtsLead.leadStage, selectedRtsLead.score)}
-                </div>
-                <p className="text-xs text-gray-500 mt-1">
-                  CS Pemegang: <strong>{selectedRtsLead.assignedCsName || 'CS'}</strong> ({selectedRtsLead.assignedCsPhone || '-'}) • Terakhir Chat: {formatWibDateTime(selectedRtsLead.lastMessageAt)}
-                </p>
-              </div>
-              <button
-                onClick={() => setSelectedRtsLead(null)}
-                className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
+      {/* ── MODAL 1: DETAIL PACKING & AUDIT ANTI-RTS ── */}
+      <RtsAuditModal
+        lead={selectedRtsLead}
+        isOpen={Boolean(mounted && selectedRtsLead)}
+        onClose={() => setSelectedRtsLead(null)}
+        getConversionBadge={getConversionBadge}
+        getStageBadge={getStageBadge}
+      />
 
-            {/* Rekomendasi Ekspedisi Otomatis di Layar CRM / Packing */}
-            <div className={`p-4 rounded-xl border space-y-1.5 ${
-              selectedRtsLead.courierRecommendation 
-                ? 'bg-gradient-to-r from-emerald-50 to-teal-50 border-emerald-200'
-                : 'bg-gray-50 border-gray-200'
-            }`}>
-              <div className="flex items-center gap-2 font-bold text-xs">
-                <Lightbulb className="w-4 h-4 text-amber-500" />
-                <span className={selectedRtsLead.courierRecommendation ? 'text-emerald-900' : 'text-gray-700'}>
-                  SARAN OTOMATIS LAYAR CRM / PACKING:
-                </span>
-              </div>
-              <div className="text-sm font-semibold text-gray-900 flex items-center gap-2">
-                <Truck className={`w-5 h-5 ${selectedRtsLead.courierRecommendation ? 'text-emerald-600' : 'text-gray-400'}`} />
-                <span>
-                  {selectedRtsLead.courierRecommendation ? (
-                    `Rekomendasi Ekspedisi: Kirim pakai ${selectedRtsLead.courierRecommendation}`
-                  ) : (
-                    'Belum Ada Rekomendasi Kurir Khusus (Bebas Pilih Ekspedisi Rekanan Toko)'
-                  )}
-                </span>
-              </div>
-              <p className={`text-xs leading-relaxed ${selectedRtsLead.courierRecommendation ? 'text-emerald-700' : 'text-gray-500'}`}>
-                {selectedRtsLead.courierRecommendation
-                  ? `Kurir di atas memiliki riwayat keberhasilan pengantaran tertinggi ke pembeli ini berdasarkan database logistik Mengantar.`
-                  : `Nomor ini belum memiliki riwayat pengantaran di database Mengantar. Evaluasi risiko retur murni dihitung dari kualitas chat CS.`}
-              </p>
-            </div>
+      {/* ── MODAL 2: DETAIL INSIGHT & PROFIL PEMBELI AI ── */}
+      <LeadInsightModal
+        lead={selectedInsightLead}
+        isOpen={Boolean(mounted && selectedInsightLead)}
+        onClose={() => setSelectedInsightLead(null)}
+        getConversionBadge={getConversionBadge}
+        getStageBadge={getStageBadge}
+        getObjectionDetail={getObjectionDetail}
+        copiedScript={copiedScript}
+        handleCopyScript={handleCopyScript}
+      />
 
-            {/* Analisis 2-Layer Anti-RTS Firewall */}
-            <div className="space-y-3">
-              <h4 className="text-xs font-bold uppercase tracking-wider text-gray-700 flex items-center gap-1.5">
-                <ShieldCheck className="w-4 h-4 text-emerald-600" />
-                Audit 2-Layer Anti-RTS Firewall
-              </h4>
+      {/* ── MODAL 3: CUSTOMER 360° TIMELINE MODAL ── */}
+      <CustomerTimelineModal
+        waNumber={selectedTimelineLead}
+        isOpen={Boolean(mounted && selectedTimelineLead)}
+        onClose={() => setSelectedTimelineLead(null)}
+        getConversionBadge={getConversionBadge}
+      />
 
-              {/* Layer 1: Audit Chat AI (Kualitas Chat CS) */}
-              <div className="p-3.5 bg-gray-50 rounded-xl border border-gray-200 space-y-2">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <span className="text-xs font-bold text-gray-800 block">
-                      Layer 1: Audit Kualitas Chat CS (Bobot 65%)
-                    </span>
-                    <span className="text-[11px] text-gray-500">
-                      Evaluasi SOP CS: Persetujuan pembeli, patokan rumah, rincian COD & kesiapan uang tunai.
-                    </span>
-                  </div>
-                  <span className="px-2 py-0.5 rounded text-xs font-bold bg-indigo-50 text-indigo-700 border border-indigo-200">
-                    Audit SOP CS
-                  </span>
-                </div>
-
-                <div className="text-xs text-gray-600 space-y-1 pt-1.5 border-t border-gray-200/60">
-                  <div className="font-semibold text-gray-700">Temuan SOP Percakapan:</div>
-                  {(() => {
-                    if (selectedRtsLead.conversionStatus === 'PENDING') {
-                      return (
-                        <p className="text-amber-800 bg-amber-50 p-2 rounded-lg border border-amber-200/60 leading-relaxed">
-                          ℹ️ <strong>Masih Tahap Follow Up / Tanya-Jawab:</strong> Prospek belum melakukan pemesanan (deal). Audit kelengkapan alamat dan SOP komitmen COD akan aktif otomatis saat prospek mencapai tahap Closing.
-                        </p>
-                      );
-                    }
-                    if (selectedRtsLead.conversionStatus === 'LOST') {
-                      return (
-                        <p className="text-gray-500 italic bg-gray-100/70 p-2 rounded-lg border border-gray-200/60">
-                          ❌ Percakapan selesai tanpa transaksi (batal beli / tidak ada pengiriman paket).
-                        </p>
-                      );
-                    }
-
-                    // Status CLOSING
-                    const chatFindings = (selectedRtsLead.rtsReasons || []).filter(
-                      (r: string) => !r.toLowerCase().includes('mengantar') && !r.toLowerCase().includes('riwayat logistik')
-                    );
-
-                    // Pengecekan jika transkrip belum ada / belum tersinkronisasi
-                    if (chatFindings.some((r: string) => r.toLowerCase().includes('belum tersinkronisasi') || r.toLowerCase().includes('kosong atau tidak terdeteksi'))) {
-                      return (
-                        <div className="flex items-center gap-2 text-slate-700 bg-slate-100 p-2.5 rounded-lg border border-slate-200 text-xs">
-                          <Info className="w-4 h-4 text-slate-500 flex-shrink-0" />
-                          <span>Transkrip percakapan belum tersinkronisasi. Evaluasi SOP CS akan otomatis aktif saat riwayat chat masuk.</span>
-                        </div>
-                      );
-                    }
-
-                    if (chatFindings.length > 0 && chatFindings[0] !== 'SOP percakapan CS terpenuhi & komitmen pembeli terpantau baik' && chatFindings[0] !== 'Kualitas transaksi dan komitmen pembeli terpantau baik') {
-                      return (
-                        <ul className="list-disc list-inside space-y-1 text-gray-600">
-                          {chatFindings.map((reason: string, i: number) => (
-                            <li key={i} className={reason.includes('rawan') || reason.includes('tidak') || reason.includes('minim') || reason.includes('dipaksa') || reason.includes('belum') ? 'text-amber-800 font-medium' : ''}>
-                              {reason}
-                            </li>
-                          ))}
-                        </ul>
-                      );
-                    }
-                    return (
-                      <div className="flex items-center gap-1.5 text-emerald-800 bg-emerald-50 p-2 rounded-lg border border-emerald-200/60">
-                        <CheckCircle2 className="w-4 h-4 text-emerald-600 flex-shrink-0" />
-                        <span>Seluruh SOP closing CS terpenuhi (Persetujuan deal jelas, alamat lengkap, dan komitmen COD terkonfirmasi).</span>
-                      </div>
-                    );
-                  })()}
-                </div>
-              </div>
-
-              {/* Layer 2: Riwayat Logistik Mengantar */}
-              <div className="p-3.5 bg-gray-50 rounded-xl border border-gray-200 space-y-2">
-                <div className="flex items-center justify-between">
-                  <div>
-                    <span className="text-xs font-bold text-gray-800 block">
-                      Layer 2: Riwayat Pengiriman Ekspedisi Mengantar (Bobot 35%)
-                    </span>
-                    <span className="text-[11px] text-gray-500">
-                      Basis data multi-kurir Mengantar (keberhasilan kirim vs retur per kurir).
-                    </span>
-                  </div>
-                  {selectedRtsLead.mengantarData?.totalOrders ? (
-                    <span className={`px-2 py-0.5 rounded text-xs font-bold ${
-                      selectedRtsLead.mengantarData.isHighRisk 
-                        ? 'bg-rose-50 text-rose-700 border border-rose-200' 
-                        : 'bg-emerald-50 text-emerald-700 border border-emerald-200'
-                    }`}>
-                      {selectedRtsLead.mengantarData.overallDeliveryRate}% Sukses
-                    </span>
-                  ) : (
-                    <span className="px-2 py-0.5 rounded text-xs font-medium bg-gray-100 text-gray-600">
-                      Nomor Baru
-                    </span>
-                  )}
-                </div>
-
-                {/* Catatan Logistik Khusus Mengantar */}
-                {selectedRtsLead.mengantarData?.riskReasons && selectedRtsLead.mengantarData.riskReasons.length > 0 && (
-                  <div className="p-2 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-800 space-y-0.5">
-                    <div className="font-bold flex items-center gap-1">
-                      <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />
-                      Catatan Logistik Mengantar:
-                    </div>
-                    <ul className="list-disc list-inside space-y-0.5 pl-1">
-                      {selectedRtsLead.mengantarData.riskReasons.map((r: string, i: number) => (
-                        <li key={i}>{r}</li>
-                      ))}
-                    </ul>
-                  </div>
-                )}
-
-                {/* Kurir Breakdown */}
-                {selectedRtsLead.mengantarData?.courierBreakdown && Object.keys(selectedRtsLead.mengantarData.courierBreakdown).length > 0 ? (
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 pt-1">
-                    {Object.entries(selectedRtsLead.mengantarData.courierBreakdown).map(([courier, data]: [string, any]) => (
-                      <div key={courier} className="p-2.5 bg-white rounded-lg border border-gray-200 text-xs shadow-xs">
-                        <div className="font-bold text-gray-900 flex items-center justify-between">
-                          <span>{courier}</span>
-                          <span className="text-[10px] text-indigo-600 bg-indigo-50 px-1.5 py-0.5 rounded font-semibold">
-                            Rate {data.rate}
-                          </span>
-                        </div>
-                        <div className="text-[11px] text-gray-600 mt-1">
-                          Sukses: <strong className="text-emerald-600">{data.delivered || 0}</strong> / {data.total || 0}
-                        </div>
-                        <div className="text-[10px] text-rose-600 font-medium">
-                          Retur (RTS): {data.rts || 0}x
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                ) : (
-                  <p className="text-xs text-gray-500 italic bg-white p-2.5 rounded-lg border border-gray-200">
-                    Belum ada riwayat nomor ini di database Mengantar Logistics (Pembeli baru / belum pernah order via ekspedisi Mengantar).
-                  </p>
-                )}
-              </div>
-            </div>
-
-            {/* Footer Modal Actions */}
-            <div className="flex items-center justify-between border-t border-gray-100 pt-4">
-              <a
-                href={`https://wa.me/${selectedRtsLead.waNumber}`}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition shadow-sm"
-              >
-                <ExternalLink className="w-4 h-4" /> Buka WhatsApp Pembeli
-              </a>
-              <button
-                onClick={() => setSelectedRtsLead(null)}
-                className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-semibold transition"
-              >
-                Tutup
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
-
-      {/* ── MODAL 2: DETAIL INSIGHT & PROFIL PEMBELI AI (PORTAL TO BODY) ── */}
-      {mounted && selectedInsightLead && createPortal(
-        <div className="fixed inset-0 z-[99999] w-screen h-screen bg-slate-900/60 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
-          <div className="relative bg-white rounded-2xl max-w-2xl w-full max-h-[90vh] overflow-y-auto shadow-2xl border border-gray-100 p-6 space-y-5 my-auto">
-            {/* Header Modal */}
-            <div className="flex items-start justify-between border-b border-gray-100 pb-4">
-              <div className="space-y-1">
-                <div className="flex items-center gap-2">
-                  <span className="font-mono text-base font-bold text-gray-900">{selectedInsightLead.waNumber}</span>
-                  {getConversionBadge(selectedInsightLead.conversionStatus)}
-                  {getStageBadge(selectedInsightLead.leadStage, selectedInsightLead.score)}
-                </div>
-                <p className="text-xs text-gray-500">
-                  CS Pemegang: <strong>{selectedInsightLead.assignedCsName || 'CS'}</strong> ({selectedInsightLead.assignedCsPhone || '-'}) • Terakhir Chat: {formatWibDateTime(selectedInsightLead.lastMessageAt)}
-                </p>
-              </div>
-              <button
-                onClick={() => setSelectedInsightLead(null)}
-                className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-100 rounded-lg transition"
-              >
-                <X className="w-5 h-5" />
-              </button>
-            </div>
-
-            {/* Banner Minat Produk Teridentifikasi */}
-            <div className="p-4 bg-gradient-to-r from-indigo-50 to-purple-50 border border-indigo-200 rounded-xl flex items-center justify-between">
-              <div>
-                <span className="text-[11px] font-bold uppercase tracking-wider text-indigo-700 block">
-                  Produk Yang Diminati / Dipesan:
-                </span>
-                <span className="text-base font-bold text-gray-900 mt-0.5 block">
-                  {selectedInsightLead.minatProduk || 'Belum Menentukan Produk'}
-                </span>
-              </div>
-              <div className="text-right">
-                <span className="text-[10px] text-gray-500 block font-medium">Skor Minat Beli</span>
-                <span className="text-xl font-bold text-indigo-600">{selectedInsightLead.score} / 100</span>
-              </div>
-            </div>
-
-            {/* Rangkuman Insight Psikologi Pembeli */}
-            <div className="space-y-2">
-              <h4 className="text-xs font-bold uppercase tracking-wider text-gray-700 flex items-center gap-1.5">
-                <Sparkles className="w-4 h-4 text-indigo-600" />
-                Rangkuman Profil & Psikologi Pembeli (AI Profiler)
-              </h4>
-              <div className="p-4 bg-gray-50 rounded-xl border border-gray-200 text-xs text-gray-700 leading-relaxed space-y-2">
-                <p className="font-semibold text-gray-900 text-sm leading-relaxed">
-                  {selectedInsightLead.lastInsight || 'Belum ada catatan insight mendalam untuk prospek ini.'}
-                </p>
-                <p className="text-[11px] text-gray-500 pt-2 border-t border-gray-200/60">
-                  Analisis ini diekstrak otomatis oleh AI dari interaksi chat pembeli: gaya bahasa, respon harga, tingkat urgensi, serta form spesifikasi pesanan yang dikirim ke CS.
-                </p>
-              </div>
-            </div>
-
-            {/* ── OBJECTION & ACTIONABLE FOLLOW-UP INTELLIGENCE (GRID 2 KOLOM) ── */}
-            {(() => {
-              const obj = getObjectionDetail(selectedInsightLead);
-              return (
-                <div className="space-y-2">
-                  <h4 className="text-xs font-bold uppercase tracking-wider text-gray-700 flex items-center gap-1.5">
-                    <Lightbulb className="w-4 h-4 text-amber-500" />
-                    Strategi Follow-Up & Diagnosa Rintangan CS
-                  </h4>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    {/* Card Kiri: Diagnosa Rintangan & Taktik CS */}
-                    <div className="p-3.5 bg-gray-50 rounded-xl border border-gray-200 space-y-2.5 flex flex-col justify-between">
-                      <div className="space-y-1.5">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[11px] font-bold uppercase tracking-wider text-gray-700">
-                            🎯 Status Kendala:
-                          </span>
-                          <span className={`px-2 py-0.5 rounded text-[10px] font-bold border ${obj.tagClass}`}>
-                            {obj.shortTag}
-                          </span>
-                        </div>
-                        <h5 className="font-bold text-gray-900 text-xs">
-                          {obj.label}
-                        </h5>
-                        <p className="text-[11px] text-gray-600 leading-relaxed">
-                          {obj.summary}
-                        </p>
-                      </div>
-
-                      <div className="p-2.5 bg-indigo-50/70 border border-indigo-100 rounded-lg space-y-1">
-                        <span className="text-[10px] font-bold text-indigo-900 uppercase flex items-center gap-1">
-                          <Lightbulb className="w-3.5 h-3.5 text-amber-500" /> Taktik Penanganan CS:
-                        </span>
-                        <p className="text-[11px] text-indigo-950 font-medium leading-relaxed">
-                          {obj.suggestedAction}
-                        </p>
-                      </div>
-                    </div>
-
-                    {/* Card Kanan: Draft Kalimat Follow-up Siap Pakai */}
-                    <div className="p-3.5 bg-emerald-50/50 rounded-xl border border-emerald-200 space-y-2.5 flex flex-col justify-between">
-                      <div className="space-y-1.5">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-[11px] font-bold uppercase tracking-wider text-emerald-900 flex items-center gap-1 whitespace-nowrap">
-                            <MessageSquare className="w-3.5 h-3.5 text-emerald-600 flex-shrink-0" /> Draft Chat Siap Kirim
-                          </span>
-                          <span className="text-[10px] text-emerald-700 font-semibold bg-white px-1.5 py-0.5 rounded border border-emerald-200 whitespace-nowrap flex-shrink-0">
-                            WA Ready
-                          </span>
-                        </div>
-                        <div className="p-2.5 bg-white rounded-lg border border-emerald-200/80 text-[11px] text-gray-800 leading-relaxed font-sans shadow-2xs italic relative">
-                          "{obj.followUpScript}"
-                        </div>
-                      </div>
-
-                      <div className="pt-1 flex items-center gap-2">
-                        <button
-                          onClick={() => handleCopyScript(obj.followUpScript, selectedInsightLead.id)}
-                          className="w-full inline-flex items-center justify-center gap-1.5 px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-bold transition shadow-xs"
-                        >
-                          {copiedScript === selectedInsightLead.id ? (
-                            <>
-                              <Check className="w-3.5 h-3.5 text-emerald-300" />
-                              <span>Tersalin ke Clipboard!</span>
-                            </>
-                          ) : (
-                            <>
-                              <Copy className="w-3.5 h-3.5" />
-                              <span>Salin Draft Chat</span>
-                            </>
-                          )}
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              );
-            })()}
-
-            {/* Parameter Kualifikasi Prospek */}
-            <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
-              <div className="p-3 bg-gray-50 rounded-xl border border-gray-200 text-xs">
-                <span className="text-[10px] text-gray-400 block font-semibold uppercase">Tahap Corong (Funnel)</span>
-                <span className="font-bold text-gray-800 text-sm mt-0.5 block">{selectedInsightLead.leadStage}</span>
-              </div>
-              <div className="p-3 bg-gray-50 rounded-xl border border-gray-200 text-xs">
-                <span className="text-[10px] text-gray-400 block font-semibold uppercase">Status Transaksi</span>
-                <span className="font-bold text-gray-800 text-sm mt-0.5 block">{selectedInsightLead.conversionStatus}</span>
-              </div>
-              <div className="p-3 bg-gray-50 rounded-xl border border-gray-200 text-xs">
-                <span className="text-[10px] text-gray-400 block font-semibold uppercase">Volume Interaksi</span>
-                <span className="font-bold text-gray-800 text-sm mt-0.5 block">{selectedInsightLead.totalMessages} pesan buffer</span>
-              </div>
-            </div>
-
-            {/* Footer Actions */}
-            <div className="flex items-center justify-between border-t border-gray-100 pt-4">
-              <a
-                href={`https://wa.me/${selectedInsightLead.waNumber}`}
-                target="_blank"
-                rel="noreferrer"
-                className="inline-flex items-center gap-2 px-4 py-2 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-bold transition shadow-sm"
-              >
-                <ExternalLink className="w-4 h-4" /> Buka WhatsApp Pembeli
-              </a>
-              <button
-                onClick={() => setSelectedInsightLead(null)}
-                className="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-semibold transition"
-              >
-                Tutup
-              </button>
-            </div>
-          </div>
-        </div>,
-        document.body
-      )}
+      {/* ── MODAL 4: META CONVERSIONS API FUNNEL MODAL ── */}
+      <CapiFunnelModal
+        lead={selectedCapiLead}
+        isOpen={Boolean(mounted && selectedCapiLead)}
+        onClose={() => setSelectedCapiLead(null)}
+        getConversionBadge={getConversionBadge}
+        getStageBadge={getStageBadge}
+      />
     </div>
   );
 }

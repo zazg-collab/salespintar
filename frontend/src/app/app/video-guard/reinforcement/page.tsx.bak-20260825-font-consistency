@@ -1,0 +1,165 @@
+'use client';
+
+import React, { useEffect, useRef, useState } from 'react';
+import Link from 'next/link';
+import { ArrowLeft, Wand2, Loader2, CheckCircle2, UploadCloud } from 'lucide-react';
+import { apiUpload, apiGet } from '../../../../lib/api';
+
+const LAYERS: { key: string; label: string; description: string }[] = [
+  { key: 'template_overlay', label: 'Template Overlay', description: 'Tambah badge/bingkai "Perkakas Pertanian Tradisional" di video.' },
+  { key: 'color_grade', label: 'Color Grade', description: 'Sesuaikan warna & kontras agar lebih natural/aman.' },
+  { key: 'metadata_label', label: 'Metadata Label', description: 'Sisipkan label metadata konteks penggunaan alat.' },
+  { key: 'highlight_soften', label: 'Highlight Soften', description: 'Lembutkan highlight/silau pada bagian tajam alat.' },
+  { key: 'micro_reframe', label: 'Micro Reframe', description: 'Reframe halus supaya sudut kamera terlihat lebih aman.' },
+];
+
+type JobStatusResponse =
+  | { status: 'queued' | 'processing' }
+  | { status: 'done'; result: { job_id: string; output_video_path: string; layers_applied: string[] } }
+  | { status: 'error'; error: string };
+
+export default function ReinforcementPage() {
+  const [videoFile, setVideoFile] = useState<File | null>(null);
+  const [selectedLayers, setSelectedLayers] = useState<string[]>([]);
+  const [submitting, setSubmitting] = useState(false);
+  const [jobId, setJobId] = useState<string | null>(null);
+  const [status, setStatus] = useState<JobStatusResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  useEffect(() => () => { if (pollRef.current) clearInterval(pollRef.current); }, []);
+
+  function toggleLayer(key: string) {
+    setSelectedLayers((prev) => (prev.includes(key) ? prev.filter((l) => l !== key) : [...prev, key]));
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError(null);
+    if (!videoFile) { setError('Video wajib diunggah.'); return; }
+    if (selectedLayers.length === 0) { setError('Pilih minimal satu layer.'); return; }
+
+    setSubmitting(true);
+    try {
+      const form = new FormData();
+      form.set('layers', selectedLayers.join(','));
+      form.set('video_file', videoFile);
+      const res = await apiUpload<{ job_id: string; status: string }>('/video-guard/reinforce', form);
+      setJobId(res.job_id);
+      setStatus({ status: 'queued' });
+
+      pollRef.current = setInterval(async () => {
+        try {
+          const s = await apiGet<JobStatusResponse>(`/video-guard/reinforce/${res.job_id}/status`);
+          setStatus(s);
+          if (s.status === 'done' || s.status === 'error') {
+            if (pollRef.current) clearInterval(pollRef.current);
+          }
+        } catch (e2) {
+          setError((e2 as Error).message || 'Gagal memuat status job.');
+          if (pollRef.current) clearInterval(pollRef.current);
+        }
+      }, 3000);
+    } catch (e) {
+      setError((e as Error).message || 'Gagal mengirim video.');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  return (
+    <div className="max-w-2xl mx-auto space-y-6">
+      <Link href="/app/video-guard" className="inline-flex items-center gap-1 text-sm text-gray-500 hover:text-gray-700">
+        <ArrowLeft className="w-4 h-4" /> Kembali ke Dashboard
+      </Link>
+
+      <div>
+        <h1 className="text-2xl font-bold text-gray-900 flex items-center gap-2">
+          <Wand2 className="w-6 h-6 text-emerald-600" /> Presentation Reinforcement
+        </h1>
+        <p className="text-gray-500 mt-1">Perkuat presentasi visual video sebelum dikirim ke audit kepatuhan.</p>
+      </div>
+
+      {error && <div className="bg-rose-50 border border-rose-200 text-rose-700 rounded-xl px-4 py-3 text-sm">{error}</div>}
+
+      {!jobId && (
+        <form onSubmit={handleSubmit} className="bg-white rounded-2xl border border-gray-200 p-6 space-y-5">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Video</label>
+            <input
+              type="file"
+              accept="video/*"
+              onChange={(e) => setVideoFile(e.target.files?.[0] ?? null)}
+              className="w-full text-sm text-gray-600 file:mr-3 file:py-2 file:px-3 file:rounded-lg file:border-0 file:bg-emerald-50 file:text-emerald-700 file:text-sm file:font-medium"
+            />
+          </div>
+
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-2">Pilih Layer</label>
+            <div className="space-y-2">
+              {LAYERS.map((l) => (
+                <label
+                  key={l.key}
+                  className={`flex items-start gap-3 p-3 rounded-xl border cursor-pointer transition-colors ${
+                    selectedLayers.includes(l.key) ? 'border-emerald-400 bg-emerald-50' : 'border-gray-200 hover:bg-gray-50'
+                  }`}
+                >
+                  <input
+                    type="checkbox"
+                    checked={selectedLayers.includes(l.key)}
+                    onChange={() => toggleLayer(l.key)}
+                    className="mt-1"
+                  />
+                  <div>
+                    <p className="text-sm font-semibold text-gray-800">{l.label}</p>
+                    <p className="text-xs text-gray-500">{l.description}</p>
+                  </div>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          <button
+            type="submit"
+            disabled={submitting}
+            className="w-full flex items-center justify-center gap-2 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-semibold py-3 rounded-xl transition-colors"
+          >
+            {submitting ? <Loader2 className="w-4 h-4 animate-spin" /> : <UploadCloud className="w-4 h-4" />}
+            {submitting ? 'Mengirim…' : 'Jalankan Reinforcement'}
+          </button>
+        </form>
+      )}
+
+      {jobId && status && (status.status === 'queued' || status.status === 'processing') && (
+        <div className="bg-white rounded-2xl border border-gray-200 p-10 flex flex-col items-center gap-3 text-center">
+          <Loader2 className="w-8 h-8 text-emerald-500 animate-spin" />
+          <p className="font-medium text-gray-800">Sedang memproses video…</p>
+        </div>
+      )}
+
+      {jobId && status && status.status === 'error' && (
+        <div className="bg-rose-50 border border-rose-200 rounded-2xl p-6 text-rose-700">
+          <p className="font-semibold">Reinforcement gagal</p>
+          <p className="text-sm mt-1">{status.error}</p>
+        </div>
+      )}
+
+      {jobId && status && status.status === 'done' && (
+        <div className="bg-emerald-50 border border-emerald-200 rounded-2xl p-6 space-y-3">
+          <div className="flex items-center gap-2 text-emerald-700 font-semibold">
+            <CheckCircle2 className="w-5 h-5" /> Reinforcement selesai
+          </div>
+          <p className="text-sm text-emerald-800">
+            Layer diterapkan: {status.result.layers_applied.join(', ') || selectedLayers.join(', ')}
+          </p>
+          <p className="text-xs text-emerald-700 bg-white/60 rounded-lg p-3">
+            Catatan jujur: video hasil olahan disimpan sementara di server MetaGuard, belum ada fitur unduh
+            otomatis dari halaman ini. Untuk lanjut ke audit, unggah video ASLI di halaman{' '}
+            <Link href="/app/video-guard/audit-baru" className="underline font-medium">Audit Baru</Link>{' '}
+            dan isi kolom "Layer yang sudah diterapkan" dengan: <code className="font-mono">{selectedLayers.join(',')}</code>
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}

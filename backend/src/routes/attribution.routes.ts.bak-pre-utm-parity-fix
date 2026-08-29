@@ -1,0 +1,138 @@
+import { Router } from 'express';
+import express from 'express';
+import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import { prisma } from '../config/prisma';
+import { AppError } from '../utils/errors';
+
+const router = Router();
+
+// 1. CORS terbuka agar bisa dipanggil dari sembarang domain WP Landing Page
+router.use(cors({ origin: function(origin, callback) { callback(null, true); }, credentials: true }));
+
+// 2. Rate Limiting Ekstra Ketat: Max 5 request per IP per menit
+const attributionRateLimit = rateLimit({
+  windowMs: 60 * 1000,
+  max: 5,
+  message: { error: 'Too many attribution requests from this IP, please try again after a minute' },
+});
+
+// Middleware untuk mem-parsing body text/plain dari sendBeacon
+router.post('/', attributionRateLimit, express.text({ type: '*/*' }), async (req, res, next) => {
+  try {
+    let body = req.body;
+    
+    // Parse manual jika body berupa string (dari text/plain atau sendBeacon fallback)
+    if (typeof body === 'string') {
+      try {
+        body = JSON.parse(body);
+      } catch (e) {
+        // Abaikan error parse, biarkan undefined ditangkap validasi di bawah
+      }
+    } else if (req.headers['content-type']?.includes('text/plain')) {
+       // just in case express.text didn't catch it as string but it's an object?
+    }
+
+    // Jika body adalah Buffer (tergantung versi express)
+    if (Buffer.isBuffer(body)) {
+      try {
+        body = JSON.parse(body.toString());
+      } catch(e) {}
+    }
+
+    const { businessId, waNumber, name, fbp, fbc, userAgent, landingUrl, productName } = body || {};
+
+    if (!businessId || !waNumber) {
+      throw new AppError(400, 'businessId and waNumber are required');
+    }
+
+    // Ambil IP pengunjung dari header x-forwarded-for atau remoteAddress
+    const clientIp = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '') as string;
+    const ipStr = Array.isArray(clientIp) ? clientIp[0] : clientIp;
+
+    // Bersihkan nomor WA (hapus karakter selain angka, pastikan diawali 62/dsb, sesuai standar lokal)
+    let cleanWaNumber = waNumber.replace(/\D/g, '');
+    if (cleanWaNumber.startsWith('0')) {
+      cleanWaNumber = '62' + cleanWaNumber.substring(1);
+    }
+    if (cleanWaNumber.length < 9 || cleanWaNumber.length > 20) {
+      throw new AppError(400, 'Invalid waNumber format');
+    }
+
+    // Simpan ke DB FormAttribution
+    const attribution = await prisma.formAttribution.create({
+      data: {
+        businessId,
+        waNumber: cleanWaNumber,
+        name: name?.substring(0, 500) || null,
+        fbp: fbp?.substring(0, 100) || null,
+        fbc: fbc?.substring(0, 100) || null,
+        clientUserAgent: userAgent || null,
+        clientIp: ipStr,
+        eventSourceUrl: landingUrl || null,
+        productName: productName?.substring(0, 255) || null,
+        status: 'PENDING_MATCH'
+      }
+    });
+
+    // PENTING: Jangan lempar error ke frontend WP kalau gagal sync, krn form submission tidak boleh terhambat.
+    res.status(201).json({ success: true, id: attribution.id });
+
+    // ── AUTO-MATCH RETROAKTIF (background, tidak blocking response) ──
+    // Audit Fase 46 (2026-08-21): fix race condition window — WA webhook bisa tiba
+    // dan lead bisa terbuat SEBELUM POST plugin selesai (user mobile tap WA langsung).
+    // Setelah attribution disimpan, cek apakah lead sudah ada — kalau iya, langsung
+    // match sekarang supaya lead tidak kehabisan fbp/fbc/eventSourceUrl.
+    //
+    // Pakai findFirst (bukan findUnique) karena tidak semua leads punya composite
+    // unique key businessId_waNumber — ada skenario multiple leads per waNumber.
+    void (async () => {
+      try {
+        const existingLead = await prisma.lead.findFirst({
+          where: {
+            businessId,
+            waNumber: cleanWaNumber,
+            // Prioritaskan lead yang belum punya eventSourceUrl (belum ter-match sebelumnya)
+            eventSourceUrl: null,
+          },
+          orderBy: { createdAt: 'desc' },
+        });
+
+        if (existingLead) {
+          await prisma.$transaction([
+            prisma.lead.update({
+              where: { id: existingLead.id },
+              data: {
+                // Pakai || undefined (bukan || existing.*) supaya tidak overwrite
+                // nilai yang sudah ada jika previous match sudah mengisinya
+                fbp: attribution.fbp || undefined,
+                fbc: attribution.fbc || undefined,
+                clientUserAgent: attribution.clientUserAgent || undefined,
+                clientIp: attribution.clientIp || undefined,
+                eventSourceUrl: attribution.eventSourceUrl || undefined,
+              }
+            }),
+            prisma.formAttribution.update({
+              where: { id: attribution.id },
+              data: {
+                status: 'MATCHED',
+                matchedLeadId: existingLead.id,
+                matchedAt: new Date(),
+              }
+            })
+          ]);
+          console.info(
+            `[Attribution] Retroactive match: formAttribution ${attribution.id} → lead ${existingLead.id} (waNumber=${cleanWaNumber})`
+          );
+        }
+      } catch (bgError) {
+        console.error('[Attribution] Background retroactive match error:', bgError);
+      }
+    })();
+  } catch (error) {
+    next(error);
+  }
+});
+
+export default router;
+

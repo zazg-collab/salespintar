@@ -2699,7 +2699,32 @@ router.get('/modules/status', async (req, res, next) => {
             };
         }));
 
-        res.json({ ok: true, businessId, modules: results });
+        // Fase 9: gabungkan heartbeat real dari Bridge VPS45
+        const heartbeats = await _fetchHeartbeats();
+        const MODULE_HB_MAP: Record<string, string> = {
+            '7.1': 'module_7_1', '7.2': 'module_7_2', '7.3': 'module_7_3',
+            '7.4': 'module_7_4', '7.5': 'module_7_5', '7.6': 'module_7_6', '7.7': 'module_7_7',
+        };
+        const SLA_LATE_MS: Record<string, number> = {
+            module_7_1: 90*60*1000, module_7_2: 420*60*1000,
+            module_7_3: 60*60*1000, module_7_4: 420*60*1000,
+            module_7_5: 26*60*60*1000, module_7_6: 420*60*1000, module_7_7: 420*60*1000,
+        };
+        const nowMs = Date.now();
+        const enriched = results.map(m => {
+            const hbKey = MODULE_HB_MAP[m.moduleId];
+            const hb = hbKey ? (heartbeats[hbKey] ?? null) : null;
+            let cronStatus = hb ? (hb.status ?? 'unknown') : 'never';
+            const cronLastRun = hb ? (hb.last_run ?? null) : null;
+            const cronLastRunRelative = hb ? (hb.last_run_relative ?? 'Belum pernah') : 'Belum pernah';
+            const cronFindings = hb ? (hb.findings ?? 0) : 0;
+            if (cronLastRun && cronStatus !== 'error') {
+                const diffMs = nowMs - new Date(cronLastRun).getTime();
+                if (diffMs > (SLA_LATE_MS[hbKey ?? ''] ?? Infinity)) cronStatus = 'late';
+            }
+            return { ...m, cronStatus, cronLastRun, cronLastRunRelative, cronFindings };
+        });
+        res.json({ ok: true, businessId, modules: enriched });
     } catch (err) {
         next(err);
     }
@@ -2818,6 +2843,118 @@ router.get('/module/:key/findings', async (req, res, next) => {
 });
 
 // ╔════════════════════════════════════════════════════════════════════════════╗
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║  FASE 9 — Real Heartbeat, Radar Summary, Discovery Trigger               ║
+// ║  Ditulis oleh: Antigravity, 2026-08-29                                    ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+
+// Helper: ambil heartbeat dari Bridge VPS45
+async function _fetchHeartbeats(): Promise<Record<string, any>> {
+    if (!env.AI_ADS_BRIDGE_URL || !env.AI_ADS_BRIDGE_API_KEY) return {};
+    try {
+        const r = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/cron-status`, {
+            headers: { 'x-api-key': env.AI_ADS_BRIDGE_API_KEY },
+            signal: AbortSignal.timeout(5000),
+        });
+        if (!r.ok) return {};
+        const body = await r.json() as any;
+        return body.heartbeats ?? {};
+    } catch {
+        return {};
+    }
+}
+
+// ── GET /ai-ads/radar-summary — Radar Akun & BM Terpantau ────────────────────
+// Ambil daftar target aktif & standby dari Bridge /v1/targets,
+// gabung dengan metadata BM dari PostgreSQL (nama, label, pic).
+router.get('/radar-summary', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+
+        // Ambil data BM dari DB
+        const bms = await prisma.metaBusinessManager.findMany({
+            where: { businessId, isActive: true },
+            select: { id: true, name: true, metaBusinessId: true, picName: true, tokenStatus: true },
+        });
+        const bmMap = new Map();
+        for (const b of bms) {
+            if (b.metaBusinessId) bmMap.set(b.metaBusinessId, b);
+            bmMap.set(b.id, b); // Juga index by Prisma ID
+        }
+
+        // Ambil targets dari Bridge
+        let targets: any[] = [];
+        let standbyTargets: any[] = [];
+        let summary: any = { last_discovery: null, total_active: 0, total_standby: 0, total_bm: bms.length };
+
+        if (env.AI_ADS_BRIDGE_URL && env.AI_ADS_BRIDGE_API_KEY) {
+            try {
+                const r = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/targets`, {
+                    headers: { 'x-api-key': env.AI_ADS_BRIDGE_API_KEY },
+                    signal: AbortSignal.timeout(8000),
+                });
+                if (r.ok) {
+                    const body = await r.json() as any;
+                    targets = body.targets ?? [];
+                    standbyTargets = body.standby_targets ?? [];
+                    const bs = (body.summary ?? {}) as Record<string, unknown>; summary = { ...summary, ...bs };
+                }
+            } catch (e) {
+                logger.warn('[AiAds] /radar-summary: gagal hubungi Bridge:', e);
+            }
+        }
+
+        // Group targets per BM
+        const bmGroups: Record<string, { bm: any; active: any[]; standby: any[] }> = {};
+        for (const bm of bms) {
+            bmGroups[bm.id] = { bm, active: [], standby: [] }; // Key pakai Prisma ID
+        }
+        for (const t of targets) {
+            let key = t.bm_id ?? '__unknown__';
+            const matchedBm = bmMap.get(key);
+            if (matchedBm) key = matchedBm.id; // Selalu mapping ke Prisma ID untuk grouping
+            if (!bmGroups[key]) bmGroups[key] = { bm: matchedBm ?? { name: key }, active: [], standby: [] };
+            bmGroups[key].active.push(t);
+        }
+        for (const t of standbyTargets) {
+            let key = t.bm_id ?? '__unknown__';
+            const matchedBm = bmMap.get(key);
+            if (matchedBm) key = matchedBm.id; // Selalu mapping ke Prisma ID untuk grouping
+            if (!bmGroups[key]) bmGroups[key] = { bm: matchedBm ?? { name: key }, active: [], standby: [] };
+            bmGroups[key].standby.push(t);
+        }
+
+        res.json({
+            ok: true,
+            summary: { ...summary, total_bm: bms.length },
+            bm_groups: Object.values(bmGroups),
+        });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// ── POST /ai-ads/trigger-discovery — Trigger Manual Discovery ─────────────────
+// Dipanggil saat user klik tombol [Sync & Refresh] di UI.
+router.post('/trigger-discovery', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        if (!env.AI_ADS_BRIDGE_URL || !env.AI_ADS_BRIDGE_API_KEY) {
+            res.status(503).json({ error: { message: 'API Bridge belum dikonfigurasi' } });
+            return;
+        }
+        const bridgeResp = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/trigger-discovery`, {
+            method: 'POST',
+            headers: { 'x-api-key': env.AI_ADS_BRIDGE_API_KEY, 'Content-Type': 'application/json' },
+            body: JSON.stringify({}),
+            signal: AbortSignal.timeout(10000),
+        });
+        const body = await bridgeResp.json().catch(() => ({}));
+        const bodyObj = body as Record<string, unknown>; res.json({ ok: bridgeResp.ok, ...bodyObj });
+    } catch (err) {
+        next(err);
+    }
+});
+
 // ║  FASE 7D — Tab Pengaturan: GET/PUT /ai-ads/module-config                  ║
 // ║  Ditulis oleh: Antigravity (Gemini), 2026-08-29                           ║
 // ║  Claude trackback: sesi 26b52cab                                          ║
@@ -2983,6 +3120,49 @@ router.put('/module-config', authorize('ADMIN'), async (req, res, next) => {
     } catch (err) {
         next(err);
     }
+});
+
+
+// GET /ai-ads/global-config
+router.get('/global-config', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const b = await prisma.business.findUnique({ where: { id: req.user!.businessId }, select: { settings: true } });
+    const settings = (b?.settings ?? {}) as Record<string, unknown>;
+    const globalConfig = (settings['aiAdsGlobalDefaults'] ?? {}) as Record<string, any>;
+    res.json({
+      targetRoas: globalConfig.targetRoas ?? 2.0,
+      targetCpa: globalConfig.targetCpa ?? 150000,
+      maxDailyBudgetCeiling: globalConfig.maxDailyBudgetCeiling ?? 500000,
+      leadActionType: globalConfig.leadActionType ?? 'lead',
+      revenueActionType: globalConfig.revenueActionType ?? 'purchase',
+    });
+  } catch (e) { next(e); }
+});
+
+// PUT /ai-ads/global-config
+router.put('/global-config', authorize('ADMIN'), async (req: Request, res: Response, next: NextFunction) => {
+  try {
+    const { businessId } = req.user!;
+    const b = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+    const settings = (b?.settings ?? {}) as Record<string, unknown>;
+    
+    settings['aiAdsGlobalDefaults'] = {
+      targetRoas: Number(req.body.targetRoas) || 2.0,
+      targetCpa: Number(req.body.targetCpa) || 150000,
+      maxDailyBudgetCeiling: Number(req.body.maxDailyBudgetCeiling) || 500000,
+      leadActionType: req.body.leadActionType || 'lead',
+      revenueActionType: req.body.revenueActionType || 'purchase',
+    };
+    
+    await prisma.business.update({
+      where: { id: businessId },
+      data: { settings: settings as any },
+    });
+    
+    res.json({ success: true });
+    // Trigger sync to bridge so the VPS45 gets the new config
+    import('../services/token-vault-sync.service').then(m => m.syncAllActiveTokensToBridge(businessId));
+  } catch (e) { next(e); }
 });
 
 export default router;
