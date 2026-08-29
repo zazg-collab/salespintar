@@ -2639,39 +2639,41 @@ router.post('/automation/emergency-brake', authorize('ADMIN'), async (req, res, 
 // ║  Claude trackback: sesi 26b52cab                                          ║
 // ╚════════════════════════════════════════════════════════════════════════════╝
 
-// ── GET /ai-ads/modules/status — status semua modul (7.1–7.6) per business ──
+// ── GET /ai-ads/modules/status — status semua modul (7.1–7.7) per business ──
 // Response dipakai Dashboard Tab (7C) untuk render kartu per modul:
 // lastRun, findingCount, pendingApprovalCount, hasUrgent
 router.get('/modules/status', async (req, res, next) => {
     try {
         const { businessId } = req.user!;
 
-        // Daftar layerKey prefix per modul (sesuai blueprint Bagian 7)
+        // Daftar layerKey prefix per modul (sesuai blueprint Bagian 7 & 9 - 7 Modul)
         const MODULE_KEYS = [
-            { moduleId: '7.1', label: 'Threshold Shift & Early Kill', layerPrefix: 'layer0' },
-            { moduleId: '7.2', label: 'Velocity Spike & Stop Darurat', layerPrefix: 'layer07' },
-            { moduleId: '7.3', label: 'Landing Page & Message Match', layerPrefix: 'layer1' },
-            { moduleId: '7.4', label: 'Tiga Bot Spesialis', layerPrefix: 'layer04' },
-            { moduleId: '7.5', label: 'Budget Waste & CAPI EMQ', layerPrefix: 'layer16' },
-            { moduleId: '7.6', label: 'A/B Test Significance Engine', layerPrefix: 'layer14' },
+            { moduleId: '7.1', label: 'Tiga Aturan Budget & Badging', layerPrefix: 'layer01', layers: ['layer01', 'layer02', 'layer03', 'layer10'] },
+            { moduleId: '7.2', label: 'Shift Automation & Morning Briefing', layerPrefix: 'layer04', layers: ['layer04', 'layer10', 'briefing'] },
+            { moduleId: '7.3', label: 'Spend Anomaly & Circuit Breaker', layerPrefix: 'layer07', layers: ['layer06', 'layer07', 'layer08'] },
+            { moduleId: '7.4', label: 'Tiga Bot Otonom Spesialis', layerPrefix: 'layer09', layers: ['layer09', 'layer11', 'layer12', 'layer13'] },
+            { moduleId: '7.5', label: 'Budget Waste & CAPI EMQ', layerPrefix: 'layer16', layers: ['layer16', 'layer17'] },
+            { moduleId: '7.6', label: 'A/B Test Significance Engine', layerPrefix: 'layer14', layers: ['layer14', 'layer15'] },
+            { moduleId: '7.7', label: 'Kuota Meta API Rate Limit Guard', layerPrefix: 'layer17b', layers: ['layer17b'] },
         ];
 
         const now = new Date();
         const since24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
 
         const results = await Promise.all(MODULE_KEYS.map(async (m) => {
+            const orConditions = m.layers.map(prefix => ({ layerKey: { startsWith: prefix } }));
             const [pendingCount, urgentCount, recent] = await Promise.all([
                 (prisma as any).aiAdsRecommendation.count({
                     where: {
                         businessId,
-                        layerKey: { startsWith: m.layerPrefix },
+                        OR: orConditions,
                         status: 'PENDING_APPROVAL',
                     },
                 }),
                 (prisma as any).aiAdsRecommendation.count({
                     where: {
                         businessId,
-                        layerKey: { startsWith: m.layerPrefix },
+                        OR: orConditions,
                         status: 'PENDING_APPROVAL',
                         isUrgent: true,
                     },
@@ -2679,7 +2681,7 @@ router.get('/modules/status', async (req, res, next) => {
                 (prisma as any).aiAdsRecommendation.findFirst({
                     where: {
                         businessId,
-                        layerKey: { startsWith: m.layerPrefix },
+                        OR: orConditions,
                         createdAt: { gte: since24h },
                     },
                     orderBy: { createdAt: 'desc' },
@@ -2764,31 +2766,26 @@ router.get('/approval-queue', async (req, res, next) => {
     }
 });
 
-// ── GET /ai-ads/module/:key/findings — temuan terbaru 1 modul (24h) ──────────
-// Dipakai "Scan Sekarang" button per Kartu Modul (Fase 7C) dan juga drawer
-// detail modul. key: prefix layer seperti "layer01", "layer07", "layer16", dll.
-// Query params: ?hours=24&status=PENDING_APPROVAL|APPROVED|all
+// ── GET /ai-ads/module/:key/findings — temuan per modul (filter hours) ───────
+// Digunakan tombol "Scan Sekarang" / expand kartu di Dashboard Modul (7C)
+// Query params: ?hours=24&status=all|PENDING_APPROVAL|APPROVED|REJECTED
 router.get('/module/:key/findings', async (req, res, next) => {
     try {
         const { businessId } = req.user!;
         const layerPrefix = req.params.key;
-        if (!layerPrefix || layerPrefix.length < 3) {
-            res.status(400).json({ error: { message: 'Parameter key tidak valid (min 3 karakter).' } });
-            return;
-        }
+        const hours = Math.max(1, Math.min(168, parseInt(String(req.query.hours ?? '24'), 10)));
+        const statusFilter = typeof req.query.status === 'string' ? req.query.status : undefined;
 
-        const hours = Math.min(168, Math.max(1, parseInt(String(req.query.hours ?? '24'), 10)));
         const since = new Date(Date.now() - hours * 60 * 60 * 1000);
-        const statusFilter = typeof req.query.status === 'string' && req.query.status !== 'all'
-            ? req.query.status
-            : undefined;
 
         const where: any = {
             businessId,
             layerKey: { startsWith: layerPrefix },
             createdAt: { gte: since },
         };
-        if (statusFilter) where.status = statusFilter;
+        if (statusFilter && statusFilter !== 'all') {
+            where.status = statusFilter;
+        }
 
         const findings = await (prisma as any).aiAdsRecommendation.findMany({
             where,
@@ -2832,7 +2829,7 @@ router.get('/module/:key/findings', async (req, res, next) => {
 // tetap bisa tampil walau belum ada Bridge (graceful degradation).
 //
 // Response: { ok, source: 'bridge'|'default', config: ModuleConfigShape }
-// ModuleConfigShape mengikuti parameter Bagian 8 blueprint — 6 modul.
+// ModuleConfigShape mengikuti parameter Bagian 8 blueprint — 7 modul.
 router.get('/module-config', authorize('ADMIN'), async (req, res, next) => {
     try {
         const { businessId } = req.user!;
@@ -2856,7 +2853,7 @@ router.get('/module-config', authorize('ADMIN'), async (req, res, next) => {
             }
         }
 
-        // Fallback: config default hardcoded (nilai dari Bagian 8 blueprint)
+        // Fallback: config default hardcoded (nilai dari Bagian 8 blueprint - 7 Modul)
         const DEFAULT_MODULE_CONFIG = {
             module_7_1: {
                 enabled: true,
@@ -2917,6 +2914,12 @@ router.get('/module-config', authorize('ADMIN'), async (req, res, next) => {
                 max_test_days: 14,
                 early_loser_kill_cpa_multiplier: 2.0,
             },
+            module_7_7: {
+                enabled: true,
+                max_calls_per_hour: 180,
+                rate_limit_cooldown_minutes: 15,
+                auto_backoff_on_throttle: true,
+            },
         };
 
         res.json({ ok: true, source: 'default', config: DEFAULT_MODULE_CONFIG });
@@ -2934,6 +2937,7 @@ const moduleConfigUpdateSchema = z.object({
     module_7_4: z.record(z.any()).optional(),
     module_7_5: z.record(z.any()).optional(),
     module_7_6: z.record(z.any()).optional(),
+    module_7_7: z.record(z.any()).optional(),
 });
 
 // ── PUT /ai-ads/module-config — tulis konfigurasi modul ke VPS45 ─────────────

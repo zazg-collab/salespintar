@@ -2,29 +2,13 @@
 
 // === KETERANGAN PENGERJAAN ===
 // File ini ditulis ulang (ROMBAK TOTAL) oleh: Antigravity (Gemini), 2026-08-29
-// Fase: 7B (Approval Queue UI) + 7C (Dashboard Tab — scaffold Antigravity)
-// Claude dapat trackback ke sesi Antigravity 2026-08-29 siang (konv ID: 26b52cab)
-// Desain visual (warna, icon, kartu) akan difinalisasi Flash 3.7 di Sub-Fase 7C lanjutan.
-// File lama (Fase 3 blueprint v4.1) ada di git history — JANGAN restore tanpa konfirmasi.
+// Penyelarasan Presisi Blueprint Bagian 9 (UI/UX AI Command Center):
+//   1. Tab Dashboard (Urutan Atas ke Bawah):
+//      - 1. Kartu Antrian Approval (PALING ATAS)
+//      - 2. Kartu Status Modul (Ringkasan 7 Modul & Aturan Ringkas Bagian 8)
+//      - 3. 7 Kartu per Modul (Grid 7.1 s/d 7.7 + Scan Sekarang inline)
+//   2. Tab Pengaturan: Parameter Bagian 8 untuk 7 modul + toggle switch per modul
 // ============================
-
-/**
- * /app/ai-ads — "AI Ads Command Center" (Fase 7, Blueprint Revisi Bot 24/7 Meta 2026-08-28)
- *
- * Arsitektur baru: 2 Tab
- *   Tab 1 — Dashboard: Kartu per Modul (7.1–7.6) dengan status lastRun,
- *            pendingCount, urgencyBadge, dan tombol "⚡ Scan Sekarang" inline.
- *   Tab 2 — Antrian Approval: Semua rekomendasi PENDING_APPROVAL,
- *            2 tipe item (mutation vs content_review) dengan UI behavior berbeda.
- *
- * Yang DIBUANG SADAR dari halaman lama:
- *   - TriggerForm generik (diganti "Scan Sekarang" per kartu modul)
- *   - BudgetAutoPilotBlock (tetap ada di repo tapi tidak di-render — jalur #2 dormant)
- *   - SentinelRadarBlock (dipindah ke halaman settings/sentinel terpisah nanti)
- *   - SyncCronPlansButton (cron plans sekarang sync otomatis via automation-sync)
- *
- * Implementasi UI lengkap (warna akhir, animasi, icon set) diselesaikan Flash 3.7 di 7C.
- */
 
 import { useState, useEffect, useCallback } from 'react';
 import { apiGet, apiPost } from '../../../lib/api';
@@ -37,19 +21,11 @@ import {
   XCircle,
   RefreshCw,
   AlertTriangle,
-  AlertCircle,
   Clock,
   ChevronDown,
   ChevronUp,
   Zap,
-  Eye,
-  BarChart3,
-  TrendingDown,
-  Shield,
-  Brain,
-  FlaskConical,
   Layers,
-  FileText,
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -64,9 +40,7 @@ interface AiAdsRecommendation {
   layerKey: string | null;
   routingType: RoutingType | null;
   isUrgent: boolean;
-  shiftType: string | null;
   status: RecStatus;
-  requestedBy: string | null;
   planSummary: Record<string, unknown> | null;
   contentData: Record<string, unknown> | null;
   planPath: string | null;
@@ -84,30 +58,6 @@ interface ModuleStatus {
   pendingApprovalCount: number;
   hasUrgent: boolean;
   lastRunAt: string | null;
-  lastRunLayer: string | null;
-}
-
-interface ApprovalQueueResp {
-  ok: boolean;
-  page: number;
-  limit: number;
-  total: number;
-  totalPages: number;
-  items: AiAdsRecommendation[];
-}
-
-interface ModulesStatusResp {
-  ok: boolean;
-  businessId: string;
-  modules: ModuleStatus[];
-}
-
-interface ModuleFindingsResp {
-  ok: boolean;
-  layerPrefix: string;
-  hours: number;
-  count: number;
-  findings: AiAdsRecommendation[];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -116,20 +66,32 @@ interface ModuleFindingsResp {
 
 const MODULE_ICONS: Record<string, string> = {
   '7.1': '📉',
-  '7.2': '🚨',
-  '7.3': '👁️',
+  '7.2': '🕘',
+  '7.3': '🚨',
   '7.4': '🧠',
   '7.5': '🛡️',
   '7.6': '🧪',
+  '7.7': '⚡',
 };
 
 const MODULE_COLOR: Record<string, string> = {
   '7.1': 'from-blue-50 to-blue-100 border-blue-200',
-  '7.2': 'from-red-50 to-red-100 border-red-200',
+  '7.2': 'from-rose-50 to-rose-100 border-rose-200',
   '7.3': 'from-purple-50 to-purple-100 border-purple-200',
   '7.4': 'from-amber-50 to-amber-100 border-amber-200',
   '7.5': 'from-emerald-50 to-emerald-100 border-emerald-200',
   '7.6': 'from-cyan-50 to-cyan-100 border-cyan-200',
+  '7.7': 'from-indigo-50 to-indigo-100 border-indigo-200',
+};
+
+const MODULE_BRIEF_RULES: Record<string, string> = {
+  '7.1': 'Lock Period 48j · Soft -30% · Hard -50% · Hard Kill >3x CPA · Fatigue freq >3.5 / CTR -25%',
+  '7.2': 'Shift Pagi 09:00 WIB · Siang 13:00 WIB · Sore 16:00 WIB · Morning Briefing 07:30 WIB',
+  '7.3': 'Velocity Spike >50% (2j) · Zero-Conv Warning 1.5x / Stop 2.5x · Circuit Breaker >110% Plafon',
+  '7.4': 'CPC Surge >50%/100% · Hook Diagnostician CTR <0.60% · LP Message-Match CVR <0.80%',
+  '7.5': 'Waste Threshold >10% Spend 7d · EMQ Target Purchase 9.3+ / Lead 8.0+ · Exclude 180 Hari',
+  '7.6': 'Z-Test min 20 klik/varian · Max 14 hari · Early Loser Kill >2x CPA & 0 konversi',
+  '7.7': 'Token Bucket max 180 call/jam · Cooldown 15m · Auto Backoff Header Meta API',
 };
 
 const STATUS_BADGE: Record<RecStatus, string> = {
@@ -172,7 +134,7 @@ function UrgentBadge() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// KARTU MUTATION (Tab Antrian)
+// KARTU MUTATION (Item Antrian)
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface MutationCardProps {
@@ -189,7 +151,7 @@ function MutationCard({ item, onApprove, onReject, processing }: MutationCardPro
   const summary = item.planSummary as any;
 
   return (
-    <div className={`border rounded-xl overflow-hidden ${item.isUrgent ? 'border-red-300 shadow-red-100 shadow-md' : 'border-gray-200'}`}>
+    <div className={`border rounded-xl overflow-hidden ${item.isUrgent ? 'border-red-300 shadow-red-100 shadow-sm' : 'border-gray-200'}`}>
       <div className={`px-4 py-3 flex items-start justify-between gap-3 ${item.isUrgent ? 'bg-red-50' : 'bg-gray-50'}`}>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
@@ -236,7 +198,7 @@ function MutationCard({ item, onApprove, onReject, processing }: MutationCardPro
             </>
           ) : (
             <div className="flex-1 space-y-2">
-              <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} placeholder="Alasan (opsional)..." className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm resize-none" rows={2} />
+              <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} placeholder="Alasan penolakan..." className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm resize-none" rows={2} />
               <div className="flex gap-2">
                 <button disabled={processing} onClick={() => onReject(item.id, rejectReason)} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium disabled:opacity-50">Konfirmasi Tolak</button>
                 <button onClick={() => { setRejectMode(false); setRejectReason(''); }} className="px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-600">Batal</button>
@@ -250,7 +212,7 @@ function MutationCard({ item, onApprove, onReject, processing }: MutationCardPro
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// KARTU CONTENT REVIEW (Tab Antrian)
+// KARTU CONTENT REVIEW (Item Antrian)
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface ContentReviewCardProps {
@@ -269,7 +231,7 @@ function ContentReviewCard({ item, onApprove, onReject, processing }: ContentRev
   const summary = item.planSummary as any;
 
   return (
-    <div className="border border-purple-200 rounded-xl overflow-hidden">
+    <div className="border border-purple-200 rounded-xl overflow-hidden shadow-sm">
       <div className="px-4 py-3 bg-gradient-to-r from-purple-50 to-violet-50 flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
@@ -325,7 +287,7 @@ function ContentReviewCard({ item, onApprove, onReject, processing }: ContentRev
             </>
           ) : (
             <div className="flex-1 space-y-2">
-              <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} placeholder="Alasan (opsional)..." className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm resize-none" rows={2} />
+              <textarea value={rejectReason} onChange={e => setRejectReason(e.target.value)} placeholder="Alasan penolakan..." className="w-full border border-gray-200 rounded-lg px-3 py-2 text-sm resize-none" rows={2} />
               <div className="flex gap-2">
                 <button disabled={processing} onClick={() => onReject(item.id, rejectReason)} className="flex-1 px-4 py-2 bg-red-600 hover:bg-red-700 text-white rounded-lg text-sm font-medium disabled:opacity-50">Konfirmasi Tolak</button>
                 <button onClick={() => { setRejectMode(false); setRejectReason(''); }} className="px-3 py-2 border border-gray-200 rounded-lg text-sm text-gray-600">Batal</button>
@@ -339,7 +301,95 @@ function ContentReviewCard({ item, onApprove, onReject, processing }: ContentRev
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// KARTU MODUL (Tab Dashboard)
+// KARTU STATUS MODUL (Summary Card - Poin 2 Blueprint)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ModuleStatusSummaryProps {
+  modules: ModuleStatus[];
+  moduleConfig: Record<string, any> | null;
+}
+
+function ModuleStatusSummary({ modules, moduleConfig }: ModuleStatusSummaryProps) {
+  return (
+    <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
+      <div className="px-5 py-4 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+        <div>
+          <h2 className="text-sm font-bold text-gray-800 flex items-center gap-2">
+            <Activity size={16} className="text-blue-600" />
+            Kartu Status Modul Automasi (7 Modul)
+          </h2>
+          <p className="text-xs text-gray-500 mt-0.5">Status operasional dan ringkasan aturan aktif sistem Meta Bot 24/7</p>
+        </div>
+        <span className="px-2.5 py-1 bg-blue-50 text-blue-700 border border-blue-200 rounded-full text-xs font-semibold">
+          7 Modul Terdaftar
+        </span>
+      </div>
+
+      <div className="overflow-x-auto">
+        <table className="w-full text-left text-xs">
+          <thead className="bg-gray-50/50 text-gray-500 border-b border-gray-200">
+            <tr>
+              <th className="px-4 py-2.5 font-semibold">Modul</th>
+              <th className="px-4 py-2.5 font-semibold">Status</th>
+              <th className="px-4 py-2.5 font-semibold">Aturan Ringkas (Bagian 8)</th>
+              <th className="px-4 py-2.5 font-semibold text-center">Menunggu</th>
+              <th className="px-4 py-2.5 font-semibold text-right">Terakhir Jalan</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y divide-gray-100">
+            {modules.map((m) => {
+              const cfgKey = `module_${m.moduleId.replace('.', '_')}`;
+              const isEnabled = moduleConfig ? (moduleConfig[cfgKey]?.enabled ?? true) : true;
+              return (
+                <tr key={m.moduleId} className="hover:bg-gray-50/80 transition-colors">
+                  <td className="px-4 py-3 font-medium text-gray-900 flex items-center gap-2">
+                    <span className="text-base">{MODULE_ICONS[m.moduleId] ?? '⚙️'}</span>
+                    <div>
+                      <span className="font-semibold">{m.moduleId}</span> {m.label}
+                    </div>
+                  </td>
+                  <td className="px-4 py-3 whitespace-nowrap">
+                    {m.hasUrgent ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-red-100 text-red-700 border border-red-200">
+                        🚨 Darurat
+                      </span>
+                    ) : isEnabled ? (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+                        🟢 Aktif Memantau
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-gray-100 text-gray-600 border border-gray-200">
+                        ⏸️ Dinonaktifkan
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-gray-600 max-w-md">
+                    <span className="line-clamp-1">{MODULE_BRIEF_RULES[m.moduleId] ?? '-'}</span>
+                  </td>
+                  <td className="px-4 py-3 text-center">
+                    {m.pendingApprovalCount > 0 ? (
+                      <span className="inline-flex items-center justify-center px-2 py-0.5 rounded-full bg-amber-500 text-white font-bold text-[11px]">
+                        {m.pendingApprovalCount}
+                      </span>
+                    ) : (
+                      <span className="text-gray-400">0</span>
+                    )}
+                  </td>
+                  <td className="px-4 py-3 text-right text-gray-500 whitespace-nowrap">
+                    {m.lastRunAt ? formatWaktu(m.lastRunAt) : 'Belum pernah'}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KARTU MODUL (Grid 7 Modul - Poin 3 Blueprint)
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface ModuleCardProps {
@@ -354,7 +404,7 @@ function ModuleCard({ module, onScan, scanning, findings }: ModuleCardProps) {
   const colorClass = MODULE_COLOR[module.moduleId] ?? 'from-gray-50 to-gray-100 border-gray-200';
 
   return (
-    <div className={`border rounded-xl overflow-hidden bg-gradient-to-br ${colorClass}`}>
+    <div className={`border rounded-xl overflow-hidden bg-gradient-to-br ${colorClass} shadow-sm`}>
       <div className="px-4 py-3 flex items-start justify-between gap-3">
         <div className="flex items-center gap-2.5 flex-1 min-w-0">
           <span className="text-xl flex-shrink-0">{MODULE_ICONS[module.moduleId] ?? '⚙️'}</span>
@@ -419,12 +469,11 @@ function ModuleCard({ module, onScan, scanning, findings }: ModuleCardProps) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HALAMAN UTAMA
+// HALAMAN UTAMA (2 TAB RESMI: DASHBOARD & PENGATURAN)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function AiAdsCommandCenter() {
-  // [Fase 7D] Tambah 'settings' ke tipe tab
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'queue' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'settings'>('dashboard');
 
   const [modules, setModules] = useState<ModuleStatus[]>([]);
   const [modulesLoading, setModulesLoading] = useState(true);
@@ -439,7 +488,7 @@ export default function AiAdsCommandCenter() {
   const [processingId, setProcessingId] = useState<string | null>(null);
   const [toast, setToast] = useState<{ msg: string; ok: boolean } | null>(null);
 
-  // [Fase 7D] State Tab Pengaturan
+  // State Tab Pengaturan
   const [moduleConfig, setModuleConfig] = useState<Record<string, any> | null>(null);
   const [configLoading, setConfigLoading] = useState(false);
   const [configSource, setConfigSource] = useState<'bridge' | 'default'>('default');
@@ -454,9 +503,9 @@ export default function AiAdsCommandCenter() {
   }, []);
 
   const muatModules = useCallback(async () => {
-    setModulesLoading(true);
     try {
-      const resp = await apiGet<ModulesStatusResp>('/ai-ads/modules/status');
+      setModulesLoading(true);
+      const resp = await apiGet<{ ok: boolean; modules: ModuleStatus[] }>('/ai-ads/modules/status');
       setModules(resp.modules);
     } catch {
       showToast('Gagal memuat status modul.', false);
@@ -465,30 +514,30 @@ export default function AiAdsCommandCenter() {
     }
   }, [showToast]);
 
-  const scanModul = useCallback(async (prefix: string) => {
-    setScanningPrefix(prefix);
+  const scanModul = useCallback(async (layerPrefix: string) => {
+    setScanningPrefix(layerPrefix);
     try {
-      const resp = await apiGet<ModuleFindingsResp>(`/ai-ads/module/${prefix}/findings?hours=24&status=all`);
-      setScanResults(prev => ({ ...prev, [prefix]: resp.findings }));
+      const resp = await apiGet<{ ok: boolean; count: number; findings: AiAdsRecommendation[] }>(`/ai-ads/module/${layerPrefix}/findings?hours=24`);
+      setScanResults(prev => ({ ...prev, [layerPrefix]: resp.findings }));
+      showToast(`Scan selesai: ${resp.count} temuan (24 jam)`, true);
     } catch {
-      showToast(`Gagal scan modul ${prefix}.`, false);
+      showToast('Gagal menjalankan scan modul.', false);
     } finally {
       setScanningPrefix(null);
     }
   }, [showToast]);
 
-  const muatQueue = useCallback(async (page = 1, filter: typeof queueFilter = 'all') => {
-    setQueueLoading(true);
+  const muatQueue = useCallback(async (page: number, routingType: string) => {
     try {
-      const routingParam = filter === 'all' ? '' : `&routingType=${filter}`;
-      const resp = await apiGet<ApprovalQueueResp>(
-        `/ai-ads/approval-queue?page=${page}&limit=${QUEUE_LIMIT}&status=PENDING_APPROVAL${routingParam}`
-      );
+      setQueueLoading(true);
+      let url = `/ai-ads/approval-queue?page=${page}&limit=20&status=PENDING_APPROVAL`;
+      if (routingType !== 'all') url += `&routingType=${routingType}`;
+      const resp = await apiGet<{ ok: boolean; page: number; total: number; items: AiAdsRecommendation[] }>(url);
       setQueueItems(resp.items);
       setQueueTotal(resp.total);
-      setQueuePage(page);
+      setQueuePage(resp.page);
     } catch {
-      showToast('Gagal memuat antrian.', false);
+      showToast('Gagal memuat antrian approval.', false);
     } finally {
       setQueueLoading(false);
     }
@@ -524,7 +573,6 @@ export default function AiAdsCommandCenter() {
     }
   }, [queuePage, queueFilter, muatQueue, muatModules, showToast]);
 
-  // [Fase 7D] Muat konfigurasi modul
   const muatConfig = useCallback(async () => {
     setConfigLoading(true);
     try {
@@ -539,7 +587,6 @@ export default function AiAdsCommandCenter() {
     }
   }, [showToast]);
 
-  // [Fase 7D] Simpan konfigurasi modul ke VPS45
   const simpanConfig = useCallback(async () => {
     if (!moduleConfig) return;
     setConfigSaving(true);
@@ -554,7 +601,6 @@ export default function AiAdsCommandCenter() {
     }
   }, [moduleConfig, showToast]);
 
-  // Helper: update satu field di dalam satu modul config
   const updateConfigField = useCallback((moduleKey: string, field: string, value: any) => {
     setModuleConfig(prev => prev ? ({
       ...prev,
@@ -563,16 +609,20 @@ export default function AiAdsCommandCenter() {
     setConfigDirty(true);
   }, []);
 
-  useEffect(() => { muatModules(); }, [muatModules]);
-  useEffect(() => { muatQueue(1, queueFilter); }, [queueFilter]);
-  // Load config ketika user buka tab settings
-  useEffect(() => { if (activeTab === 'settings' && !moduleConfig) muatConfig(); }, [activeTab, moduleConfig, muatConfig]);
+  useEffect(() => {
+    muatModules();
+    muatConfig();
+  }, [muatModules, muatConfig]);
+
+  useEffect(() => {
+    muatQueue(1, queueFilter);
+  }, [queueFilter]);
 
   const totalUrgent = modules.filter(m => m.hasUrgent).length;
   const totalPending = modules.reduce((s, m) => s + m.pendingApprovalCount, 0);
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-gray-50 pb-16">
       {toast && (
         <div className={`fixed top-4 right-4 z-50 flex items-center gap-2 px-4 py-3 rounded-xl shadow-lg text-sm font-medium ${toast.ok ? 'bg-emerald-600 text-white' : 'bg-red-600 text-white'}`}>
           {toast.ok ? <CheckCircle2 size={16} /> : <XCircle size={16} />}
@@ -580,14 +630,15 @@ export default function AiAdsCommandCenter() {
         </div>
       )}
 
+      {/* Header Utama */}
       <div className="bg-white border-b border-gray-200 px-6 py-4">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
           <div>
             <h1 className="text-xl font-bold text-gray-900 flex items-center gap-2">
-              <BarChart3 size={22} className="text-blue-600" />
+              <LayoutDashboard className="text-blue-600" size={22} />
               AI Ads Command Center
             </h1>
-            <p className="text-sm text-gray-500 mt-0.5">Monitoring & approval sistem automasi Meta Ads 24/7</p>
+            <p className="text-sm text-gray-500 mt-0.5">Monitoring & approval sistem automasi Meta Ads 24/7 (7 Modul)</p>
           </div>
           <div className="flex items-center gap-3">
             {totalUrgent > 0 && (
@@ -597,7 +648,7 @@ export default function AiAdsCommandCenter() {
             )}
             {totalPending > 0 && (
               <span className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-50 text-amber-700 border border-amber-200 rounded-lg text-sm font-medium">
-                <ListChecks size={14} /> {totalPending} menunggu
+                <ListChecks size={14} /> {totalPending} menunggu approval
               </span>
             )}
             <button onClick={() => { muatModules(); muatQueue(queuePage, queueFilter); }} className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg">
@@ -607,15 +658,15 @@ export default function AiAdsCommandCenter() {
         </div>
       </div>
 
+      {/* Navigation: 2 TAB RESMI (Blueprint Bagian 9) */}
       <div className="bg-white border-b border-gray-200 px-6">
         <div className="max-w-6xl mx-auto flex">
           {[
-            { id: 'dashboard', label: '📊 Dashboard Modul' },
-            { id: 'queue', label: `✅ Antrian Approval${totalPending > 0 ? ` (${totalPending})` : ''}` },
-            { id: 'settings', label: `⚙️ Pengaturan${configDirty ? ' *' : ''}` },
+            { id: 'dashboard', label: `📊 Tab Dashboard${totalPending > 0 ? ` (${totalPending})` : ''}` },
+            { id: 'settings', label: `⚙️ Tab Pengaturan${configDirty ? ' *' : ''}` },
           ].map(tab => (
             <button key={tab.id} onClick={() => setActiveTab(tab.id as typeof activeTab)}
-              className={`px-5 py-3 text-sm font-medium border-b-2 transition-colors ${activeTab === tab.id ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}>
+              className={`px-6 py-3.5 text-sm font-semibold border-b-2 transition-colors ${activeTab === tab.id ? 'border-blue-600 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-700'}`}>
               {tab.label}
             </button>
           ))}
@@ -623,20 +674,108 @@ export default function AiAdsCommandCenter() {
       </div>
 
       <div className="max-w-6xl mx-auto px-6 py-6">
+
+        {/* ═══════════════════════════════════════════════════════════════ */}
+        {/* TAB 1: DASHBOARD (Antrian Paling Atas -> Summary -> 7 Modul) */}
+        {/* ═══════════════════════════════════════════════════════════════ */}
         {activeTab === 'dashboard' && (
-          <div>
-            {modulesLoading ? (
-              <div className="flex items-center justify-center py-20 text-gray-400">
-                <Loader2 size={28} className="animate-spin mr-3" /> Memuat status modul...
-              </div>
-            ) : (
-              <>
-                <div className="flex items-center justify-between mb-4">
-                  <h2 className="text-base font-semibold text-gray-700">Status Modul Automasi (6 Modul)</h2>
-                  <button onClick={muatModules} className="text-xs text-gray-500 hover:text-gray-700 flex items-center gap-1">
-                    <RefreshCw size={11} /> Refresh
+          <div className="space-y-8">
+
+            {/* ── 1. KARTU ANTRIAN APPROVAL (PALING ATAS) ──────────────── */}
+            <section className="bg-white border border-gray-200 rounded-xl p-5 shadow-sm space-y-4">
+              <div className="flex items-center justify-between gap-4 flex-wrap border-b border-gray-100 pb-4">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-base font-bold text-gray-800 flex items-center gap-2">
+                    <ListChecks className="text-blue-600" size={18} />
+                    Antrian Approval
+                  </h2>
+                  {queueTotal > 0 && (
+                    <span className="px-2.5 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800 border border-amber-200">
+                      {queueTotal} item
+                    </span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-2">
+                  <div className="flex gap-1 bg-gray-100 rounded-lg p-1">
+                    {[
+                      { val: 'all', label: 'Semua' },
+                      { val: 'mutation', label: '⚙️ Mutasi' },
+                      { val: 'content_review', label: '📝 Konten' },
+                    ].map(f => (
+                      <button key={f.val} onClick={() => setQueueFilter(f.val as typeof queueFilter)}
+                        className={`px-3 py-1 text-xs font-medium rounded-md transition-colors ${queueFilter === f.val ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
+                        {f.label}
+                      </button>
+                    ))}
+                  </div>
+                  <button onClick={() => muatQueue(queuePage, queueFilter)} className="p-1.5 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg">
+                    <RefreshCw size={14} />
                   </button>
                 </div>
+              </div>
+
+              {queueLoading ? (
+                <div className="flex items-center justify-center py-12 text-gray-400">
+                  <Loader2 size={24} className="animate-spin mr-2" /> Memuat antrian approval...
+                </div>
+              ) : queueItems.length === 0 ? (
+                <div className="text-center py-8 bg-emerald-50/50 border border-emerald-100 rounded-xl">
+                  <CheckCircle2 size={36} className="mx-auto mb-2 text-emerald-500" />
+                  <p className="font-semibold text-emerald-900 text-sm">Antrian Approval Bersih 🎉</p>
+                  <p className="text-xs text-emerald-700 mt-0.5">Tidak ada rekomendasi mutasi atau review konten yang menunggu tindakan.</p>
+                </div>
+              ) : (
+                <>
+                  <div className="space-y-3">
+                    {queueItems.map(item =>
+                      item.routingType === 'content_review' ? (
+                        <ContentReviewCard key={item.id} item={item} onApprove={handleApprove} onReject={handleReject} processing={processingId === item.id} />
+                      ) : (
+                        <MutationCard key={item.id} item={item} onApprove={handleApprove} onReject={handleReject} processing={processingId === item.id} />
+                      )
+                    )}
+                  </div>
+
+                  {queueTotal > QUEUE_LIMIT && (
+                    <div className="flex items-center justify-center gap-3 pt-3 text-xs">
+                      <button disabled={queuePage <= 1} onClick={() => muatQueue(queuePage - 1, queueFilter)} className="px-3 py-1.5 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-40">← Sebelumnya</button>
+                      <span className="text-gray-500">Hal. {queuePage} · Total {queueTotal}</span>
+                      <button disabled={queuePage * QUEUE_LIMIT >= queueTotal} onClick={() => muatQueue(queuePage + 1, queueFilter)} className="px-3 py-1.5 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-40">Berikutnya →</button>
+                    </div>
+                  )}
+                </>
+              )}
+            </section>
+
+            {/* ── 2. KARTU STATUS MODUL (RINGKASAN SISTEM) ─────────────── */}
+            <section>
+              {modulesLoading ? (
+                <div className="flex items-center justify-center py-10 text-gray-400">
+                  <Loader2 size={24} className="animate-spin mr-2" /> Memuat status modul...
+                </div>
+              ) : (
+                <ModuleStatusSummary modules={modules} moduleConfig={moduleConfig} />
+              )}
+            </section>
+
+            {/* ── 3. KARTU PER MODUL (GRID 7 MODUL) ────────────────────── */}
+            <section className="space-y-4">
+              <div className="flex items-center justify-between">
+                <h2 className="text-sm font-bold text-gray-800 flex items-center gap-2">
+                  <Layers size={16} className="text-blue-600" />
+                  Detail Modul Automasi (7 Modul)
+                </h2>
+                <button onClick={muatModules} className="text-xs text-gray-500 hover:text-gray-700 flex items-center gap-1">
+                  <RefreshCw size={11} /> Refresh Status
+                </button>
+              </div>
+
+              {modulesLoading ? (
+                <div className="flex items-center justify-center py-12 text-gray-400">
+                  <Loader2 size={24} className="animate-spin mr-2" /> Memuat kartu modul...
+                </div>
+              ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                   {modules.map(m => (
                     <ModuleCard key={m.moduleId} module={m} onScan={scanModul}
@@ -644,102 +783,48 @@ export default function AiAdsCommandCenter() {
                       findings={scanResults[m.layerPrefix] ?? null} />
                   ))}
                 </div>
-              </>
-            )}
+              )}
+            </section>
+
           </div>
         )}
 
-        {activeTab === 'queue' && (
-          <div>
-            <div className="flex items-center gap-3 mb-4 flex-wrap">
-              <h2 className="text-base font-semibold text-gray-700 flex-1">Antrian Approval</h2>
-              <div className="flex gap-1 bg-gray-100 rounded-lg p-1">
-                {[
-                  { val: 'all', label: 'Semua' },
-                  { val: 'mutation', label: '⚙️ Mutasi' },
-                  { val: 'content_review', label: '📝 Konten' },
-                ].map(f => (
-                  <button key={f.val} onClick={() => setQueueFilter(f.val as typeof queueFilter)}
-                    className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${queueFilter === f.val ? 'bg-white text-gray-800 shadow-sm' : 'text-gray-500 hover:text-gray-700'}`}>
-                    {f.label}
-                  </button>
-                ))}
-              </div>
-              <button onClick={() => muatQueue(queuePage, queueFilter)} className="p-2 text-gray-500 hover:text-gray-700 hover:bg-gray-100 rounded-lg">
-                <RefreshCw size={14} />
-              </button>
-            </div>
-
-            {queueLoading ? (
-              <div className="flex items-center justify-center py-20 text-gray-400">
-                <Loader2 size={28} className="animate-spin mr-3" /> Memuat antrian...
-              </div>
-            ) : queueItems.length === 0 ? (
-              <div className="text-center py-20">
-                <CheckCircle2 size={40} className="mx-auto mb-3 text-emerald-300" />
-                <p className="font-medium text-gray-500">Antrian kosong 🎉</p>
-                <p className="text-sm text-gray-400 mt-1">Tidak ada rekomendasi yang menunggu approval.</p>
-              </div>
-            ) : (
-              <>
-                <div className="space-y-4">
-                  {queueItems.map(item =>
-                    item.routingType === 'content_review' ? (
-                      <ContentReviewCard key={item.id} item={item} onApprove={handleApprove} onReject={handleReject} processing={processingId === item.id} />
-                    ) : (
-                      <MutationCard key={item.id} item={item} onApprove={handleApprove} onReject={handleReject} processing={processingId === item.id} />
-                    )
-                  )}
-                </div>
-
-                {queueTotal > QUEUE_LIMIT && (
-                  <div className="flex items-center justify-center gap-3 mt-6 text-sm">
-                    <button disabled={queuePage <= 1} onClick={() => muatQueue(queuePage - 1, queueFilter)} className="px-4 py-2 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-40">← Sebelumnya</button>
-                    <span className="text-gray-500">Hal. {queuePage} · {queueTotal} item</span>
-                    <button disabled={queuePage * QUEUE_LIMIT >= queueTotal} onClick={() => muatQueue(queuePage + 1, queueFilter)} className="px-4 py-2 border border-gray-200 rounded-lg hover:bg-gray-50 disabled:opacity-40">Berikutnya →</button>
-                  </div>
-                )}
-              </>
-            )}
-          </div>
-        )}
-
-        {/* ── TAB 3: PENGATURAN ─────────────────────────────────────────── */}
-        {/* [Fase 7D — Antigravity 2026-08-29] Form parameter Bagian 8 blueprint */}
+        {/* ═══════════════════════════════════════════════════════════════ */}
+        {/* TAB 2: PENGATURAN (Parameter Bagian 8 Blueprint - 7 Modul)    */}
+        {/* ═══════════════════════════════════════════════════════════════ */}
         {activeTab === 'settings' && (
-          <div>
-            {/* Header + tombol simpan */}
-            <div className="flex items-center justify-between mb-6">
+          <div className="space-y-6">
+            <div className="flex items-center justify-between">
               <div>
-                <h2 className="text-base font-semibold text-gray-700">Parameter Modul Automasi</h2>
+                <h2 className="text-base font-bold text-gray-800">Parameter Modul Automasi (Bagian 8)</h2>
                 <p className="text-xs text-gray-500 mt-0.5">
                   {configSource === 'bridge' ? '🟢 Terhubung ke VPS45 via Bridge' : '🟡 Menampilkan nilai default (Bridge belum dikonfigurasi)'}
                 </p>
               </div>
               <div className="flex items-center gap-2">
                 {configDirty && (
-                  <span className="text-xs text-amber-600 font-medium">● Ada perubahan belum disimpan</span>
+                  <span className="text-xs text-amber-600 font-semibold">● Perubahan belum disimpan</span>
                 )}
-                <button onClick={muatConfig} className="px-3 py-1.5 border border-gray-200 rounded-lg text-sm text-gray-600 hover:bg-gray-50 flex items-center gap-1">
-                  <RefreshCw size={13} /> Reset
+                <button onClick={muatConfig} className="px-3 py-1.5 border border-gray-200 rounded-lg text-xs text-gray-600 hover:bg-gray-50 flex items-center gap-1">
+                  <RefreshCw size={12} /> Reset
                 </button>
                 <button
                   disabled={!configDirty || configSaving || configSource === 'default'}
                   onClick={simpanConfig}
-                  className="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-sm font-medium disabled:opacity-40 flex items-center gap-1.5"
+                  className="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold disabled:opacity-40 flex items-center gap-1.5"
                 >
-                  {configSaving ? <Loader2 size={13} className="animate-spin" /> : <CheckCircle2 size={13} />}
+                  {configSaving ? <Loader2 size={12} className="animate-spin" /> : <CheckCircle2 size={12} />}
                   Simpan ke VPS45
                 </button>
               </div>
             </div>
 
             {configSource === 'default' && (
-              <div className="mb-4 p-3 bg-amber-50 border border-amber-200 rounded-xl text-sm text-amber-700 flex items-start gap-2">
-                <AlertTriangle size={16} className="flex-shrink-0 mt-0.5" />
+              <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-800 flex items-start gap-2.5">
+                <AlertTriangle size={16} className="flex-shrink-0 text-amber-600 mt-0.5" />
                 <div>
-                  <p className="font-medium">Mode Hanya-Baca (Bridge belum tersedia)</p>
-                  <p className="text-xs mt-0.5">Perubahan tidak bisa disimpan sampai <code>AI_ADS_BRIDGE_URL</code> + <code>AI_ADS_BRIDGE_API_KEY</code> dikonfigurasi di env VPS Upcloud. Gunakan form ini untuk preview nilai default Bagian 8 blueprint.</p>
+                  <p className="font-semibold">Mode Hanya-Baca (Bridge belum tersedia)</p>
+                  <p className="mt-0.5">Pengaturan tersimpan lokal di browser sebagai preview parameter Bagian 8. Sinkronisasi dua arah akan aktif otomatis setelah Bridge VPS45 siap.</p>
                 </div>
               </div>
             )}
@@ -757,19 +842,19 @@ export default function AiAdsCommandCenter() {
                 <SettingsSection title="Modul 7.1 — Tiga Aturan Budget & Badging" emoji="📉"
                   enabled={moduleConfig.module_7_1?.enabled ?? true}
                   onToggle={v => updateConfigField('module_7_1', 'enabled', v)}>
-                  <SettingsRow label="Lock Period (jam)" hint="Berapa jam setelah scale/reduce sebelum bisa diubah lagi">
-                    <NumInput value={moduleConfig.module_7_1?.lock_period_hours ?? 48} onChange={v => updateConfigField('module_7_1', 'lock_period_hours', v)} min={1} max={168} />
+                  <SettingsRow label="Lock Period (jam)" hint="Waktu jeda setelah scale/reduce sebelum bisa diubah lagi">
+                    <NumInput value={moduleConfig.module_7_1?.lock_period_hours ?? 48} onChange={v => updateConfigField('module_7_1', 'lock_period_hours', v)} min={1} max={168} suffix="jam" />
                   </SettingsRow>
-                  <SettingsRow label="Reduce Soft %" hint="Persentase pengurangan budget tier lunak">
+                  <SettingsRow label="Reduce Soft %" hint="Persentase pengurangan budget tier lunak (ROAS 70-85%)">
                     <NumInput value={Math.round((moduleConfig.module_7_1?.reduce_soft_pct ?? 0.30) * 100)} onChange={v => updateConfigField('module_7_1', 'reduce_soft_pct', v / 100)} min={1} max={99} suffix="%" />
                   </SettingsRow>
-                  <SettingsRow label="Reduce Hard %" hint="Persentase pengurangan budget tier keras">
+                  <SettingsRow label="Reduce Hard %" hint="Persentase pengurangan budget tier keras (ROAS 50-70%)">
                     <NumInput value={Math.round((moduleConfig.module_7_1?.reduce_hard_pct ?? 0.50) * 100)} onChange={v => updateConfigField('module_7_1', 'reduce_hard_pct', v / 100)} min={1} max={99} suffix="%" />
                   </SettingsRow>
-                  <SettingsRow label="Hard Kill CPA Multiplier" hint="Matikan adset kalau CPA > N × target">
+                  <SettingsRow label="Hard Kill CPA Multiplier" hint="Matikan adset jika CPA > N × target">
                     <NumInput value={moduleConfig.module_7_1?.hard_kill_cpa_multiplier ?? 3.0} onChange={v => updateConfigField('module_7_1', 'hard_kill_cpa_multiplier', v)} min={1} max={10} step={0.1} suffix="×" />
                   </SettingsRow>
-                  <SettingsRow label="Fatigue Frequency Threshold" hint="Frekuensi minimum sebelum dianggap kelelahan">
+                  <SettingsRow label="Fatigue Frequency Threshold" hint="Frekuensi minimum sebelum dianggap audiens lelah">
                     <NumInput value={moduleConfig.module_7_1?.fatigue_frequency_threshold ?? 3.5} onChange={v => updateConfigField('module_7_1', 'fatigue_frequency_threshold', v)} min={1} max={10} step={0.1} suffix="×" />
                   </SettingsRow>
                 </SettingsSection>
@@ -778,16 +863,16 @@ export default function AiAdsCommandCenter() {
                 <SettingsSection title="Modul 7.2 — Shift Automation & Morning Briefing" emoji="🕘"
                   enabled={moduleConfig.module_7_2?.enabled ?? true}
                   onToggle={v => updateConfigField('module_7_2', 'enabled', v)}>
-                  <SettingsRow label="Jam Shift Morning Early-Kill (WIB)" hint="Shift pagi — cek adset underperform">
+                  <SettingsRow label="Shift Pagi Early-Kill (WIB)" hint="Pembersihan adset underperforming di pagi hari">
                     <NumInput value={moduleConfig.module_7_2?.shift_morning_early_kill_hour ?? 9} onChange={v => updateConfigField('module_7_2', 'shift_morning_early_kill_hour', v)} min={0} max={23} suffix=":00" />
                   </SettingsRow>
-                  <SettingsRow label="Jam Shift Mid-Day Pacing (WIB)" hint="Shift siang — pacing budget">
+                  <SettingsRow label="Shift Siang Mid-Day Pacing (WIB)" hint="Evaluasi pacing spend tengah hari">
                     <NumInput value={moduleConfig.module_7_2?.shift_midday_pacing_hour ?? 13} onChange={v => updateConfigField('module_7_2', 'shift_midday_pacing_hour', v)} min={0} max={23} suffix=":00" />
                   </SettingsRow>
-                  <SettingsRow label="Jam Shift Golden Hour Scaling (WIB)" hint="Shift sore — scale winner">
+                  <SettingsRow label="Shift Sore Golden Hour Scaling (WIB)" hint="Injeksi budget untuk adset pemenang sore hari">
                     <NumInput value={moduleConfig.module_7_2?.shift_golden_hour_scaling_hour ?? 16} onChange={v => updateConfigField('module_7_2', 'shift_golden_hour_scaling_hour', v)} min={0} max={23} suffix=":00" />
                   </SettingsRow>
-                  <SettingsRow label="Jam Morning Briefing (WIB)" hint="Jam kirim ringkasan pagi ke Telegram">
+                  <SettingsRow label="Morning Briefing Telegram (WIB)" hint="Jadwal pengiriman ringkasan pagi ke Telegram">
                     <NumInput value={moduleConfig.module_7_2?.morning_briefing_hour ?? 7} onChange={v => updateConfigField('module_7_2', 'morning_briefing_hour', v)} min={0} max={23} suffix=":30" />
                   </SettingsRow>
                 </SettingsSection>
@@ -796,16 +881,16 @@ export default function AiAdsCommandCenter() {
                 <SettingsSection title="Modul 7.3 — Spend Anomaly & Circuit Breaker" emoji="🚨"
                   enabled={moduleConfig.module_7_3?.enabled ?? true}
                   onToggle={v => updateConfigField('module_7_3', 'enabled', v)}>
-                  <SettingsRow label="Velocity Spike % Daily Budget" hint="Threshold spend dalam window 2 jam">
+                  <SettingsRow label="Velocity Spike % Daily Budget" hint="Ambang batas spend agresif dalam window 2 jam">
                     <NumInput value={Math.round((moduleConfig.module_7_3?.velocity_spike_pct_daily_budget ?? 0.50) * 100)} onChange={v => updateConfigField('module_7_3', 'velocity_spike_pct_daily_budget', v / 100)} min={1} max={200} suffix="%" />
                   </SettingsRow>
-                  <SettingsRow label="Zero-Conv Warning CPA Multiplier" hint="Warning kalau spend > N × target CPA tanpa konversi">
+                  <SettingsRow label="Zero-Conv Warning CPA Multiplier" hint="Peringatan jika spend > N × target CPA tanpa konversi">
                     <NumInput value={moduleConfig.module_7_3?.zero_conv_warning_cpa_multiplier ?? 1.5} onChange={v => updateConfigField('module_7_3', 'zero_conv_warning_cpa_multiplier', v)} min={1} max={5} step={0.1} suffix="×" />
                   </SettingsRow>
-                  <SettingsRow label="Zero-Conv Hard Stop CPA Multiplier" hint="Hard stop kalau spend > N × target CPA tanpa konversi">
+                  <SettingsRow label="Zero-Conv Hard Stop CPA Multiplier" hint="Hentikan adset jika spend > N × target CPA tanpa konversi">
                     <NumInput value={moduleConfig.module_7_3?.zero_conv_hard_stop_cpa_multiplier ?? 2.5} onChange={v => updateConfigField('module_7_3', 'zero_conv_hard_stop_cpa_multiplier', v)} min={1} max={10} step={0.1} suffix="×" />
                   </SettingsRow>
-                  <SettingsRow label="Circuit Breaker Plafon Multiplier" hint="Darurat: pause akun kalau spend > N × plafon harian">
+                  <SettingsRow label="Circuit Breaker Plafon Multiplier" hint="Pause darurat seluruh akun jika spend harian > N × plafon">
                     <NumInput value={moduleConfig.module_7_3?.circuit_breaker_plafon_multiplier ?? 1.10} onChange={v => updateConfigField('module_7_3', 'circuit_breaker_plafon_multiplier', v)} min={1} max={2} step={0.01} suffix="×" />
                   </SettingsRow>
                 </SettingsSection>
@@ -814,19 +899,19 @@ export default function AiAdsCommandCenter() {
                 <SettingsSection title="Modul 7.4 — Tiga Bot Otonom Spesialis" emoji="🧠"
                   enabled={moduleConfig.module_7_4?.enabled ?? true}
                   onToggle={v => updateConfigField('module_7_4', 'enabled', v)}>
-                  <SettingsRow label="CPC Surge Warning %" hint="Warning kalau CPC naik lebih dari N% dari rata-rata 7 hari">
+                  <SettingsRow label="CPC Surge Warning %" hint="Peringatan jika CPC melonjak lebih dari N% dari 7d average">
                     <NumInput value={Math.round((moduleConfig.module_7_4?.cpc_surge_warning_pct ?? 0.50) * 100)} onChange={v => updateConfigField('module_7_4', 'cpc_surge_warning_pct', v / 100)} min={1} max={500} suffix="%" />
                   </SettingsRow>
-                  <SettingsRow label="CPC Surge Critical %" hint="Critical kalau CPC naik lebih dari N% dari rata-rata 7 hari">
+                  <SettingsRow label="CPC Surge Critical %" hint="Kritis jika CPC melonjak lebih dari N% dari 7d average">
                     <NumInput value={Math.round((moduleConfig.module_7_4?.cpc_surge_critical_pct ?? 1.00) * 100)} onChange={v => updateConfigField('module_7_4', 'cpc_surge_critical_pct', v / 100)} min={1} max={1000} suffix="%" />
                   </SettingsRow>
-                  <SettingsRow label="Hook Diagnostician Min Impressions" hint="Threshold impresi sebelum analisis hook">
-                    <NumInput value={moduleConfig.module_7_4?.hook_diagnostician_min_impressions ?? 1000} onChange={v => updateConfigField('module_7_4', 'hook_diagnostician_min_impressions', v)} min={100} max={10000} />
+                  <SettingsRow label="Hook Diagnostician Min Impresi" hint="Batas impresi sebelum performa video dianalisis">
+                    <NumInput value={moduleConfig.module_7_4?.hook_diagnostician_min_impressions ?? 1000} onChange={v => updateConfigField('module_7_4', 'hook_diagnostician_min_impressions', v)} min={100} max={10000} suffix="impresi" />
                   </SettingsRow>
-                  <SettingsRow label="Hook Diagnostician CTR Threshold" hint="CTR di bawah N% dianggap hook lemah">
+                  <SettingsRow label="Hook Diagnostician CTR Threshold" hint="CTR di bawah ambang ini memicu saran angle baru">
                     <NumInput value={parseFloat(((moduleConfig.module_7_4?.hook_diagnostician_ctr_threshold ?? 0.006) * 100).toFixed(2))} onChange={v => updateConfigField('module_7_4', 'hook_diagnostician_ctr_threshold', v / 100)} min={0.01} max={5} step={0.01} suffix="%" />
                   </SettingsRow>
-                  <SettingsRow label="LP Message-Match CVR Threshold" hint="CVR di bawah N% trigger saran rewrite LP">
+                  <SettingsRow label="LP Message-Match CVR Threshold" hint="CVR di bawah ambang ini memicu saran rewrite landing page">
                     <NumInput value={parseFloat(((moduleConfig.module_7_4?.lp_message_match_cvr_threshold ?? 0.008) * 100).toFixed(2))} onChange={v => updateConfigField('module_7_4', 'lp_message_match_cvr_threshold', v / 100)} min={0.01} max={10} step={0.01} suffix="%" />
                   </SettingsRow>
                 </SettingsSection>
@@ -835,17 +920,17 @@ export default function AiAdsCommandCenter() {
                 <SettingsSection title="Modul 7.5 — Budget Waste & CAPI EMQ" emoji="🛡️"
                   enabled={moduleConfig.module_7_5?.enabled ?? true}
                   onToggle={v => updateConfigField('module_7_5', 'enabled', v)}>
-                  <SettingsRow label="Waste Threshold % Spend 7d" hint="Anggap waste kalau > N% dari total spend 7 hari">
+                  <SettingsRow label="Waste Threshold % Spend 7d" hint="Kategori pemborosan jika spend > N% dari total spend 7 hari">
                     <NumInput value={Math.round((moduleConfig.module_7_5?.waste_threshold_pct_spend7d ?? 0.10) * 100)} onChange={v => updateConfigField('module_7_5', 'waste_threshold_pct_spend7d', v / 100)} min={1} max={100} suffix="%" />
                   </SettingsRow>
-                  <SettingsRow label="Target EMQ Purchase" hint="Skor EMQ minimum untuk event Purchase">
-                    <NumInput value={moduleConfig.module_7_5?.emq_target_purchase ?? 9.3} onChange={v => updateConfigField('module_7_5', 'emq_target_purchase', v)} min={1} max={10} step={0.1} />
+                  <SettingsRow label="Target EMQ Purchase" hint="Skor kualitas kecocokan data minimum untuk Purchase">
+                    <NumInput value={moduleConfig.module_7_5?.emq_target_purchase ?? 9.3} onChange={v => updateConfigField('module_7_5', 'emq_target_purchase', v)} min={1} max={10} step={0.1} suffix="/10" />
                   </SettingsRow>
-                  <SettingsRow label="Target EMQ Lead" hint="Skor EMQ minimum untuk event Lead">
-                    <NumInput value={moduleConfig.module_7_5?.emq_target_lead ?? 8.0} onChange={v => updateConfigField('module_7_5', 'emq_target_lead', v)} min={1} max={10} step={0.1} />
+                  <SettingsRow label="Target EMQ Lead" hint="Skor kualitas kecocokan data minimum untuk Lead">
+                    <NumInput value={moduleConfig.module_7_5?.emq_target_lead ?? 8.0} onChange={v => updateConfigField('module_7_5', 'emq_target_lead', v)} min={1} max={10} step={0.1} suffix="/10" />
                   </SettingsRow>
-                  <SettingsRow label="Window Exclude Pembeli (hari)" hint="Exclude pembeli dalam N hari terakhir dari audience">
-                    <NumInput value={moduleConfig.module_7_5?.exclude_window_days ?? 180} onChange={v => updateConfigField('module_7_5', 'exclude_window_days', v)} min={7} max={365} />
+                  <SettingsRow label="Window Exclude Pembeli" hint="Keluarkan pembeli dalam N hari terakhir dari audiens">
+                    <NumInput value={moduleConfig.module_7_5?.exclude_window_days ?? 180} onChange={v => updateConfigField('module_7_5', 'exclude_window_days', v)} min={7} max={365} suffix="hari" />
                   </SettingsRow>
                 </SettingsSection>
 
@@ -853,14 +938,26 @@ export default function AiAdsCommandCenter() {
                 <SettingsSection title="Modul 7.6 — A/B Test Significance Engine" emoji="🧪"
                   enabled={moduleConfig.module_7_6?.enabled ?? true}
                   onToggle={v => updateConfigField('module_7_6', 'enabled', v)}>
-                  <SettingsRow label="Min Trials per Variant" hint="Jumlah klik minimum per variant sebelum analisis">
-                    <NumInput value={moduleConfig.module_7_6?.min_trials_per_variant ?? 20} onChange={v => updateConfigField('module_7_6', 'min_trials_per_variant', v)} min={5} max={500} />
+                  <SettingsRow label="Min Klik per Varian" hint="Jumlah klik minimum per varian sebelum pengujian Z-Test">
+                    <NumInput value={moduleConfig.module_7_6?.min_trials_per_variant ?? 20} onChange={v => updateConfigField('module_7_6', 'min_trials_per_variant', v)} min={5} max={500} suffix="klik" />
                   </SettingsRow>
-                  <SettingsRow label="Max Test Days" hint="Hari maksimum sebelum test dihentikan otomatis">
-                    <NumInput value={moduleConfig.module_7_6?.max_test_days ?? 14} onChange={v => updateConfigField('module_7_6', 'max_test_days', v)} min={3} max={90} />
+                  <SettingsRow label="Maksimal Durasi Tes" hint="Batas hari sebelum pengujian dinyatakan selesai">
+                    <NumInput value={moduleConfig.module_7_6?.max_test_days ?? 14} onChange={v => updateConfigField('module_7_6', 'max_test_days', v)} min={3} max={90} suffix="hari" />
                   </SettingsRow>
-                  <SettingsRow label="Early Loser Kill CPA Multiplier" hint="Kill loser kalau CPA > N× dan 0 konversi">
+                  <SettingsRow label="Early Loser Kill CPA Multiplier" hint="Hentikan varian kalah jika spend > N × CPA tanpa konversi">
                     <NumInput value={moduleConfig.module_7_6?.early_loser_kill_cpa_multiplier ?? 2.0} onChange={v => updateConfigField('module_7_6', 'early_loser_kill_cpa_multiplier', v)} min={1} max={5} step={0.1} suffix="×" />
+                  </SettingsRow>
+                </SettingsSection>
+
+                {/* ── Modul 7.7 ─────────────────────────────────────────── */}
+                <SettingsSection title="Modul 7.7 — Kuota Meta API Rate Limit Guard" emoji="⚡"
+                  enabled={moduleConfig.module_7_7?.enabled ?? true}
+                  onToggle={v => updateConfigField('module_7_7', 'enabled', v)}>
+                  <SettingsRow label="Maksimal Call per Jam" hint="Kapasitas kuota token bucket per akun Meta Ads">
+                    <NumInput value={moduleConfig.module_7_7?.max_calls_per_hour ?? 180} onChange={v => updateConfigField('module_7_7', 'max_calls_per_hour', v)} min={50} max={1000} suffix="calls/jam" />
+                  </SettingsRow>
+                  <SettingsRow label="Cooldown Penurunan Kuota" hint="Waktu jeda pemulihan kuota panggilan API">
+                    <NumInput value={moduleConfig.module_7_7?.rate_limit_cooldown_minutes ?? 15} onChange={v => updateConfigField('module_7_7', 'rate_limit_cooldown_minutes', v)} min={1} max={60} suffix="menit" />
                   </SettingsRow>
                 </SettingsSection>
 
@@ -875,8 +972,7 @@ export default function AiAdsCommandCenter() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// HELPER KOMPONEN SETTINGS (internal, tidak diekspor)
-// Ditulis oleh: Antigravity (Gemini), 2026-08-29 — Fase 7D
+// HELPER KOMPONEN SETTINGS
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface SettingsSectionProps {
@@ -890,14 +986,13 @@ interface SettingsSectionProps {
 function SettingsSection({ title, emoji, enabled, onToggle, children }: SettingsSectionProps) {
   const [open, setOpen] = useState(true);
   return (
-    <div className={`border rounded-xl overflow-hidden ${enabled ? 'border-gray-200' : 'border-gray-200 opacity-60'}`}>
+    <div className={`border rounded-xl overflow-hidden bg-white ${enabled ? 'border-gray-200 shadow-sm' : 'border-gray-200 opacity-60'}`}>
       <div className="flex items-center justify-between px-4 py-3 bg-gray-50 border-b border-gray-200">
         <button onClick={() => setOpen(o => !o)} className="flex items-center gap-2 flex-1 text-left">
           <span className="text-base">{emoji}</span>
-          <span className="text-sm font-semibold text-gray-800">{title}</span>
+          <span className="text-sm font-bold text-gray-800">{title}</span>
           {open ? <ChevronUp size={14} className="text-gray-400 ml-auto" /> : <ChevronDown size={14} className="text-gray-400 ml-auto" />}
         </button>
-        {/* Toggle aktif/nonaktif */}
         <button
           onClick={() => onToggle(!enabled)}
           className={`ml-4 relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${enabled ? 'bg-blue-600' : 'bg-gray-300'}`}
@@ -925,8 +1020,8 @@ function SettingsRow({ label, hint, children }: SettingsRowProps) {
   return (
     <div className="flex items-center justify-between px-4 py-3 gap-4">
       <div className="flex-1 min-w-0">
-        <p className="text-sm text-gray-700">{label}</p>
-        {hint && <p className="text-xs text-gray-400 mt-0.5">{hint}</p>}
+        <p className="text-xs font-semibold text-gray-800">{label}</p>
+        {hint && <p className="text-[11px] text-gray-400 mt-0.5">{hint}</p>}
       </div>
       <div className="flex-shrink-0">{children}</div>
     </div>
@@ -944,7 +1039,7 @@ interface NumInputProps {
 
 function NumInput({ value, onChange, min, max, step = 1, suffix }: NumInputProps) {
   return (
-    <div className="flex items-center gap-1">
+    <div className="flex items-center gap-1.5">
       <input
         type="number"
         value={value}
@@ -953,10 +1048,9 @@ function NumInput({ value, onChange, min, max, step = 1, suffix }: NumInputProps
           if (!isNaN(n)) onChange(n);
         }}
         min={min} max={max} step={step}
-        className="w-24 border border-gray-200 rounded-lg px-2 py-1.5 text-sm text-right focus:outline-none focus:ring-2 focus:ring-blue-200"
+        className="w-24 border border-gray-200 rounded-lg px-2.5 py-1.5 text-xs text-right font-medium text-gray-800 focus:outline-none focus:ring-2 focus:ring-blue-200"
       />
-      {suffix && <span className="text-xs text-gray-500">{suffix}</span>}
+      {suffix && <span className="text-xs text-gray-500 font-medium">{suffix}</span>}
     </div>
   );
 }
-
