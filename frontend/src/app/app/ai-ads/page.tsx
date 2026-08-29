@@ -1,11 +1,11 @@
 'use client';
 
 // === KETERANGAN PENGERJAAN ===
-// File ini ditulis ulang (ROMBAK TOTAL & UI/UX ENHANCEMENT) oleh: Antigravity (Gemini), 2026-08-29
+// File ini ditulis ulang (UI/UX ENHANCEMENT: JADWAL PATROLI & TOGGLE ON/OFF INTERAKTIF) oleh: Antigravity (Gemini), 2026-08-29
 // Penyelarasan Presisi Blueprint Bagian 9 (UI/UX AI Command Center):
 //   1. Tab Dashboard (Urutan Atas ke Bawah):
 //      - 1. Kartu Antrian Approval (PALING ATAS)
-//      - 2. Kartu Status Modul (Tabel bersih + Popup Modal Aturan Detail Interaktif)
+//      - 2. Kartu Status Modul (Tabel bersih + Toggle ON/OFF cepat + Popup Modal Aturan Detail)
 //      - 3. 7 Kartu per Modul (Grid 7.1 s/d 7.7 + Scan Sekarang inline)
 //   2. Tab Pengaturan: Parameter Bagian 8 untuk 7 modul + toggle switch per modul
 // ============================
@@ -31,7 +31,8 @@ import {
   Sliders,
   ShieldCheck,
   Target,
-  FileCode2,
+  Timer,
+  Power,
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -70,6 +71,8 @@ interface ModuleDetailRule {
   moduleId: string;
   title: string;
   tagline: string;
+  schedule: string;
+  scheduleBadge: string;
   layers: string[];
   triggers: string[];
   parameters: Array<{ label: string; value: string; desc: string }>;
@@ -106,6 +109,8 @@ const MODULE_RULES_DETAIL: Record<string, ModuleDetailRule> = {
     moduleId: '7.1',
     title: 'Tiga Aturan Budget & Badging',
     tagline: 'Manajemen alokasi budget otomatis, mitigasi penurunan performa, dan proteksi kelelahan audiens.',
+    schedule: 'Tiap 1 Jam Sekali (60 Menit) — Patroli 24/7',
+    scheduleBadge: 'Tiap 1 Jam',
     layers: ['Layer 01 (Scale Up)', 'Layer 02 (Reduce Soft & Hard)', 'Layer 03 (Hard Kill)', 'Layer 10 (Ad Fatigue)'],
     triggers: ['Evaluasi rasio ROAS harian/mingguan terhadap Target ROAS', 'Kenaikan frekuensi tayang iklan per user'],
     parameters: [
@@ -122,6 +127,8 @@ const MODULE_RULES_DETAIL: Record<string, ModuleDetailRule> = {
     moduleId: '7.2',
     title: 'Shift Automation & Morning Briefing',
     tagline: 'Siklus otomatisasi patroli 3 shift harian dan pengiriman laporan eksekutif pagi.',
+    schedule: 'Terjadwal 4 Titik Waktu WIB: 07:30 (Briefing), 09:00 (Early Kill), 13:00 (Mid-Day Pacing), 16:00 (Golden Hour Scaling)',
+    scheduleBadge: '4 Shift Harian',
     layers: ['Layer 04 (Shift Evaluator)', 'Layer 10 (Pacing Sentinel)', 'Morning Briefing Engine'],
     triggers: ['Trigger berbasis jadwal waktu WIB (Pagi, Siang, Sore, dan Subuh)'],
     parameters: [
@@ -137,6 +144,8 @@ const MODULE_RULES_DETAIL: Record<string, ModuleDetailRule> = {
     moduleId: '7.3',
     title: 'Spend Anomaly & Circuit Breaker',
     tagline: 'Sistem rem darurat untuk menghentikan pembakaran uang tak wajar & link rusak.',
+    schedule: 'Patroli Darurat Cepat — Tiap 15–30 Menit Sekali (24/7)',
+    scheduleBadge: 'Tiap 15-30 Menit',
     layers: ['Layer 06 (LP Check)', 'Layer 07 (Velocity Spike)', 'Layer 08 (Zero-Conv Emergency Stop)'],
     triggers: ['Lonjakan kecepatan spend abnormal dalam window 2 jam', 'Spend tinggi tanpa satupun konversi', 'Halaman LP tidak bisa diakses'],
     parameters: [
@@ -153,6 +162,8 @@ const MODULE_RULES_DETAIL: Record<string, ModuleDetailRule> = {
     moduleId: '7.4',
     title: 'Tiga Bot Otonom Spesialis',
     tagline: 'Spesialis deteksi dinamika lelang, audit hook video iklan, dan penyelarasan landing page.',
+    schedule: 'Evaluasi Berkala — Tiap 6 Jam Sekali',
+    scheduleBadge: 'Tiap 6 Jam',
     layers: ['Layer 09 (Auction CPC Surge)', 'Layer 11 (CTR Hook Diagnostician)', 'Layer 12 (LP Dead Link)', 'Layer 13 (LP Message-Match)'],
     triggers: ['Lonjakan biaya lelang (CPC/CPM)', 'CTR video rendah (<0.60%)', 'CVR landing page drop (<0.80%)'],
     parameters: [
@@ -168,6 +179,8 @@ const MODULE_RULES_DETAIL: Record<string, ModuleDetailRule> = {
     moduleId: '7.5',
     title: 'Budget Waste & CAPI EMQ Defense',
     tagline: 'Pencegahan kebocoran audiens pembeli lama dan penjaga kualitas data Conversions API.',
+    schedule: 'Batch Audit Harian — Tiap 24 Jam Sekali (Pukul 02:00 WIB Dini Hari)',
+    scheduleBadge: 'Tiap 24 Jam (02:00 WIB)',
     layers: ['Layer 16 (CAPI Audience Exclusion Leakage)', 'Layer 17 (Event Match Quality EMQ Score)'],
     triggers: ['Pembeli 180 hari terakhir tidak tereksklusi dari campaign prospek', 'Skor EMQ CAPI di bawah target'],
     parameters: [
@@ -183,6 +196,8 @@ const MODULE_RULES_DETAIL: Record<string, ModuleDetailRule> = {
     moduleId: '7.6',
     title: 'A/B Test Significance Engine',
     tagline: 'Kalkulasi saintifik pengujian kreatif dan copy iklan berbasis Two-Proportion Z-Test.',
+    schedule: 'Evaluasi Siklus Test — Tiap 6 Jam Sekali',
+    scheduleBadge: 'Tiap 6 Jam',
     layers: ['Layer 14 (Early Loser Kill)', 'Layer 15 (Winner Declaration Z-Test)'],
     triggers: ['Pengujian adset dalam campaign A/B testing aktif'],
     parameters: [
@@ -198,6 +213,8 @@ const MODULE_RULES_DETAIL: Record<string, ModuleDetailRule> = {
     moduleId: '7.7',
     title: 'Kuota Meta API Rate Limit Guard',
     tagline: 'Pelindung kuota panggilan API Meta Graph agar sistem tidak terkena blokir sementara.',
+    schedule: 'Real-Time Inline — Berjalan Setiap Kali Ada Panggilan API Meta',
+    scheduleBadge: 'Real-Time Inline',
     layers: ['Layer 17B (Token Bucket & Adaptive Backoff)'],
     triggers: ['Panggilan Meta Graph API harian oleh bot'],
     parameters: [
@@ -250,48 +267,84 @@ function UrgentBadge() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// POPUP MODAL ATURAN DETAIL MODUL (UI/UX BARU)
+// POPUP MODAL ATURAN DETAIL MODUL (UI/UX DENGAN JADWAL & TOGGLE ON/OFF)
 // ─────────────────────────────────────────────────────────────────────────────
 
 interface ModuleRulesModalProps {
   rule: ModuleDetailRule | null;
+  isEnabled: boolean;
+  onToggle: (enabled: boolean) => void;
   onClose: () => void;
   onGoToSettings?: () => void;
 }
 
-function ModuleRulesModal({ rule, onClose, onGoToSettings }: ModuleRulesModalProps) {
+function ModuleRulesModal({ rule, isEnabled, onToggle, onClose, onGoToSettings }: ModuleRulesModalProps) {
   if (!rule) return null;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-fadeIn">
-      <div className="bg-white rounded-2xl shadow-2xl border border-gray-200 w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden animate-scaleUp">
+      <div className="bg-white rounded-2xl shadow-2xl border border-gray-200 w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden">
         
         {/* Header Modal */}
-        <div className="px-6 py-4 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <span className="text-3xl">{MODULE_ICONS[rule.moduleId] ?? '⚙️'}</span>
-            <div>
-              <div className="flex items-center gap-2">
+        <div className="px-6 py-4 bg-gray-50 border-b border-gray-200 flex items-center justify-between gap-4">
+          <div className="flex items-center gap-3 min-w-0">
+            <span className="text-3xl flex-shrink-0">{MODULE_ICONS[rule.moduleId] ?? '⚙️'}</span>
+            <div className="min-w-0">
+              <div className="flex items-center gap-2 flex-wrap">
                 <span className="px-2 py-0.5 rounded-md bg-blue-100 text-blue-800 font-bold text-xs">
                   Modul {rule.moduleId}
                 </span>
-                <h3 className="font-bold text-gray-900 text-base">{rule.title}</h3>
+                <h3 className="font-bold text-gray-900 text-base leading-tight truncate">{rule.title}</h3>
               </div>
-              <p className="text-xs text-gray-500 mt-0.5">{rule.tagline}</p>
+              <p className="text-xs text-gray-500 mt-0.5 line-clamp-1">{rule.tagline}</p>
             </div>
           </div>
-          <button
-            onClick={onClose}
-            className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
-          >
-            <X size={18} />
-          </button>
+
+          <div className="flex items-center gap-3 flex-shrink-0">
+            {/* Switch Toggle ON/OFF di Header Modal */}
+            <div className="flex items-center gap-2 bg-white px-3 py-1.5 rounded-xl border border-gray-200 shadow-2xs">
+              <span className={`text-xs font-semibold ${isEnabled ? 'text-emerald-700' : 'text-gray-400'}`}>
+                {isEnabled ? '🟢 AKTIF' : '⏸️ OFF'}
+              </span>
+              <button
+                onClick={() => onToggle(!isEnabled)}
+                className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${isEnabled ? 'bg-emerald-600' : 'bg-gray-300'}`}
+                role="switch"
+                aria-checked={isEnabled}
+              >
+                <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${isEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
+              </button>
+            </div>
+
+            <button
+              onClick={onClose}
+              className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
+            >
+              <X size={18} />
+            </button>
+          </div>
         </div>
 
         {/* Isi Body Modal */}
         <div className="p-6 overflow-y-auto space-y-5 text-xs text-gray-700">
           
-          {/* Lapisan / Layer Terkait */}
+          {/* Section: Jadwal & Waktu Pengecekan Patroli */}
+          <div className="p-3.5 bg-gradient-to-r from-blue-50/80 to-indigo-50/80 border border-blue-200 rounded-xl">
+            <div className="flex items-start gap-2.5">
+              <Timer className="text-blue-600 flex-shrink-0 mt-0.5" size={16} />
+              <div className="space-y-0.5">
+                <div className="flex items-center gap-2">
+                  <span className="font-bold text-gray-900 text-xs">Jadwal & Waktu Patroli Pengecekan</span>
+                  <span className="px-2 py-0.5 bg-blue-600 text-white font-semibold text-[10px] rounded-full">
+                    {rule.scheduleBadge}
+                  </span>
+                </div>
+                <p className="text-[11px] text-gray-700 font-medium">{rule.schedule}</p>
+              </div>
+            </div>
+          </div>
+
+          {/* Section: Lapisan / Layer Terkait */}
           <div>
             <h4 className="font-bold text-gray-800 mb-2 flex items-center gap-1.5">
               <Layers size={14} className="text-blue-600" />
@@ -306,7 +359,7 @@ function ModuleRulesModal({ rule, onClose, onGoToSettings }: ModuleRulesModalPro
             </div>
           </div>
 
-          {/* Ambang Batas & Aturan Kunci (Bagian 8) */}
+          {/* Section: Ambang Batas & Aturan Kunci (Bagian 8) */}
           <div>
             <h4 className="font-bold text-gray-800 mb-2.5 flex items-center gap-1.5">
               <Target size={14} className="text-blue-600" />
@@ -327,7 +380,7 @@ function ModuleRulesModal({ rule, onClose, onGoToSettings }: ModuleRulesModalPro
             </div>
           </div>
 
-          {/* Kondisi Trigger & Aksi */}
+          {/* Section: Kondisi Trigger & Aksi */}
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-gray-100">
             <div>
               <h4 className="font-bold text-gray-800 mb-2 flex items-center gap-1.5">
@@ -358,7 +411,7 @@ function ModuleRulesModal({ rule, onClose, onGoToSettings }: ModuleRulesModalPro
 
         {/* Footer Modal */}
         <div className="px-6 py-3 bg-gray-50 border-t border-gray-200 flex items-center justify-between">
-          <span className="text-[11px] text-gray-400">Parameter dapat diubah di Tab Pengaturan</span>
+          <span className="text-[11px] text-gray-400">Parameter detail dapat disetel di Tab Pengaturan</span>
           <div className="flex items-center gap-2">
             {onGoToSettings && (
               <button
@@ -400,7 +453,7 @@ function MutationCard({ item, onApprove, onReject, processing }: MutationCardPro
   const summary = item.planSummary as any;
 
   return (
-    <div className={`border rounded-xl overflow-hidden ${item.isUrgent ? 'border-red-300 shadow-red-100 shadow-sm' : 'border-gray-200'}`}>
+    <div className={`border rounded-xl overflow-hidden ${item.isUrgent ? 'border-red-300 shadow-red-100 shadow-md' : 'border-gray-200'}`}>
       <div className={`px-4 py-3 flex items-start justify-between gap-3 ${item.isUrgent ? 'bg-red-50' : 'bg-gray-50'}`}>
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 flex-wrap">
@@ -557,18 +610,19 @@ interface ModuleStatusSummaryProps {
   modules: ModuleStatus[];
   moduleConfig: Record<string, any> | null;
   onSelectModuleRule: (rule: ModuleDetailRule) => void;
+  onToggleModule: (moduleId: string, enabled: boolean) => void;
 }
 
-function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule }: ModuleStatusSummaryProps) {
+function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule, onToggleModule }: ModuleStatusSummaryProps) {
   return (
     <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
-      <div className="px-5 py-4 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+      <div className="px-5 py-4 bg-gray-50 border-b border-gray-200 flex items-center justify-between flex-wrap gap-2">
         <div>
           <h2 className="text-sm font-bold text-gray-800 flex items-center gap-2">
             <Activity size={16} className="text-blue-600" />
             Kartu Status Modul Automasi (7 Modul)
           </h2>
-          <p className="text-xs text-gray-500 mt-0.5">Klik pada nama modul untuk melihat penjelasan aturan detail & parameter aktif</p>
+          <p className="text-xs text-gray-500 mt-0.5">Pantau status, ubah toggle aktif/nonaktif, dan klik nama modul untuk rincian aturan</p>
         </div>
         <span className="px-2.5 py-1 bg-blue-50 text-blue-700 border border-blue-200 rounded-full text-xs font-semibold">
           7 Modul Terdaftar
@@ -579,11 +633,12 @@ function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule }: Modu
         <table className="w-full text-left text-xs">
           <thead className="bg-gray-50/50 text-gray-500 border-b border-gray-200">
             <tr>
-              <th className="px-4 py-3 font-semibold">Modul (Klik untuk Aturan Detail)</th>
+              <th className="px-4 py-3 font-semibold">Modul (Klik untuk Aturan)</th>
+              <th className="px-4 py-3 font-semibold">Jadwal Patroli</th>
               <th className="px-4 py-3 font-semibold">Status Operasional</th>
               <th className="px-4 py-3 font-semibold text-center">Menunggu Approval</th>
               <th className="px-4 py-3 font-semibold text-right">Terakhir Jalan</th>
-              <th className="px-4 py-3 font-semibold text-center">Aturan</th>
+              <th className="px-4 py-3 font-semibold text-center">Aksi</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
@@ -596,7 +651,7 @@ function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule }: Modu
                 <tr
                   key={m.moduleId}
                   onClick={() => ruleDetail && onSelectModuleRule(ruleDetail)}
-                  className="hover:bg-blue-50/50 transition-colors cursor-pointer group"
+                  className="hover:bg-blue-50/40 transition-colors cursor-pointer group"
                 >
                   <td className="px-4 py-3.5 font-medium text-gray-900 flex items-center gap-2.5">
                     <span className="text-lg flex-shrink-0">{MODULE_ICONS[m.moduleId] ?? '⚙️'}</span>
@@ -611,21 +666,33 @@ function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule }: Modu
                       </span>
                     </div>
                   </td>
+                  
+                  {/* Kolom Jadwal Patroli */}
                   <td className="px-4 py-3.5 whitespace-nowrap">
-                    {m.hasUrgent ? (
-                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-red-100 text-red-700 border border-red-200">
-                        🚨 Darurat
-                      </span>
-                    ) : isEnabled ? (
-                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
-                        🟢 Aktif Memantau
-                      </span>
-                    ) : (
-                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-gray-100 text-gray-600 border border-gray-200">
-                        ⏸️ Dinonaktifkan
-                      </span>
-                    )}
+                    <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-lg bg-gray-100 text-gray-700 font-medium text-[11px]">
+                      <Clock size={11} className="text-gray-400" />
+                      {ruleDetail?.scheduleBadge ?? 'Terjadwal'}
+                    </span>
                   </td>
+
+                  {/* Kolom Status dengan Toggle Interaktif */}
+                  <td className="px-4 py-3.5 whitespace-nowrap" onClick={(e) => e.stopPropagation()}>
+                    <div className="flex items-center gap-2">
+                      <button
+                        onClick={() => onToggleModule(m.moduleId, !isEnabled)}
+                        className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${isEnabled ? 'bg-emerald-600' : 'bg-gray-300'}`}
+                        role="switch"
+                        aria-checked={isEnabled}
+                        title={isEnabled ? 'Klik untuk nonaktifkan modul' : 'Klik untuk aktifkan modul'}
+                      >
+                        <span className={`inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${isEnabled ? 'translate-x-4' : 'translate-x-0'}`} />
+                      </button>
+                      <span className={`text-[11px] font-semibold ${isEnabled ? 'text-emerald-700' : 'text-gray-400'}`}>
+                        {isEnabled ? 'Aktif' : 'Off'}
+                      </span>
+                    </div>
+                  </td>
+
                   <td className="px-4 py-3.5 text-center">
                     {m.pendingApprovalCount > 0 ? (
                       <span className="inline-flex items-center justify-center px-2.5 py-0.5 rounded-full bg-amber-500 text-white font-bold text-[11px]">
@@ -638,12 +705,9 @@ function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule }: Modu
                   <td className="px-4 py-3.5 text-right text-gray-500 whitespace-nowrap">
                     {m.lastRunAt ? formatWaktu(m.lastRunAt) : 'Belum pernah'}
                   </td>
-                  <td className="px-4 py-3.5 text-center">
+                  <td className="px-4 py-3.5 text-center" onClick={(e) => e.stopPropagation()}>
                     <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        if (ruleDetail) onSelectModuleRule(ruleDetail);
-                      }}
+                      onClick={() => ruleDetail && onSelectModuleRule(ruleDetail)}
                       className="px-2.5 py-1 bg-white border border-gray-300 hover:border-blue-400 hover:bg-blue-50 text-gray-700 hover:text-blue-700 rounded-lg text-xs font-medium transition-all shadow-2xs inline-flex items-center gap-1"
                     >
                       <Info size={12} className="text-blue-500" /> Detail
@@ -665,40 +729,48 @@ function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule }: Modu
 
 interface ModuleCardProps {
   module: ModuleStatus;
+  isEnabled: boolean;
+  onToggle: (enabled: boolean) => void;
   onScan: (prefix: string) => Promise<void>;
   scanning: boolean;
   findings: AiAdsRecommendation[] | null;
   onViewRule: () => void;
 }
 
-function ModuleCard({ module, onScan, scanning, findings, onViewRule }: ModuleCardProps) {
+function ModuleCard({ module, isEnabled, onToggle, onScan, scanning, findings, onViewRule }: ModuleCardProps) {
   const [showFindings, setShowFindings] = useState(false);
   const colorClass = MODULE_COLOR[module.moduleId] ?? 'from-gray-50 to-gray-100 border-gray-200';
+  const ruleDetail = MODULE_RULES_DETAIL[module.moduleId];
 
   return (
-    <div className={`border rounded-xl overflow-hidden bg-gradient-to-br ${colorClass} shadow-sm`}>
+    <div className={`border rounded-xl overflow-hidden bg-gradient-to-br ${colorClass} shadow-sm ${isEnabled ? '' : 'opacity-60'}`}>
       <div className="px-4 py-3 flex items-start justify-between gap-3">
         <div className="flex items-center gap-2.5 flex-1 min-w-0">
           <span className="text-xl flex-shrink-0">{MODULE_ICONS[module.moduleId] ?? '⚙️'}</span>
           <div className="min-w-0">
             <p className="text-xs font-semibold text-gray-500 uppercase tracking-wide">Modul {module.moduleId}</p>
-            <p className="text-sm font-semibold text-gray-800 leading-tight">{module.label}</p>
+            <p className="text-sm font-semibold text-gray-800 leading-tight truncate">{module.label}</p>
           </div>
         </div>
-        <div className="flex-shrink-0 flex flex-col items-end gap-1">
-          {module.hasUrgent && <UrgentBadge />}
-          {module.pendingApprovalCount > 0 && (
-            <span className="inline-flex items-center justify-center w-6 h-6 rounded-full bg-amber-500 text-white text-xs font-bold">
-              {module.pendingApprovalCount}
-            </span>
-          )}
+        
+        {/* Toggle Switch Mini */}
+        <div className="flex-shrink-0 flex items-center gap-1.5">
+          <button
+            onClick={() => onToggle(!isEnabled)}
+            className={`relative inline-flex h-4 w-7 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors ${isEnabled ? 'bg-emerald-600' : 'bg-gray-300'}`}
+            role="switch"
+            aria-checked={isEnabled}
+            title={isEnabled ? 'Modul Aktif' : 'Modul Nonaktif'}
+          >
+            <span className={`inline-block h-3 w-3 transform rounded-full bg-white shadow transition-transform ${isEnabled ? 'translate-x-3' : 'translate-x-0'}`} />
+          </button>
         </div>
       </div>
 
-      <div className="px-4 pb-3 flex items-center justify-between text-xs text-gray-500 border-b border-black/5 pt-1">
-        <span className="flex items-center gap-1">
+      <div className="px-4 pb-2.5 flex items-center justify-between text-xs text-gray-500 border-b border-black/5 pt-0.5">
+        <span className="flex items-center gap-1 text-[11px]">
           <Clock size={11} />
-          {module.lastRunAt ? formatWaktu(module.lastRunAt) : 'Belum pernah'}
+          {ruleDetail?.scheduleBadge ?? 'Terjadwal'}
         </span>
         <button
           onClick={onViewRule}
@@ -709,7 +781,7 @@ function ModuleCard({ module, onScan, scanning, findings, onViewRule }: ModuleCa
       </div>
 
       <div className="px-4 py-3 flex items-center gap-2">
-        <button disabled={scanning} onClick={() => { onScan(module.layerPrefix); setShowFindings(true); }}
+        <button disabled={scanning || !isEnabled} onClick={() => { onScan(module.layerPrefix); setShowFindings(true); }}
           className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-gray-300 hover:bg-gray-50 rounded-lg text-sm font-medium text-gray-700 disabled:opacity-50 shadow-sm">
           {scanning ? <Loader2 size={13} className="animate-spin" /> : <Zap size={13} className="text-amber-500" />}
           Scan Sekarang
@@ -887,6 +959,12 @@ export default function AiAdsCommandCenter() {
     setConfigDirty(true);
   }, []);
 
+  const handleToggleModule = useCallback((moduleId: string, enabled: boolean) => {
+    const cfgKey = `module_${moduleId.replace('.', '_')}`;
+    updateConfigField(cfgKey, 'enabled', enabled);
+    showToast(`Modul ${moduleId} ${enabled ? 'Diaktifkan 🟢' : 'Dinonaktifkan ⏸️'}`, true);
+  }, [updateConfigField, showToast]);
+
   useEffect(() => {
     muatModules();
     muatConfig();
@@ -899,6 +977,9 @@ export default function AiAdsCommandCenter() {
   const totalUrgent = modules.filter(m => m.hasUrgent).length;
   const totalPending = modules.reduce((s, m) => s + m.pendingApprovalCount, 0);
 
+  const selectedModuleCfgKey = selectedModalRule ? `module_${selectedModalRule.moduleId.replace('.', '_')}` : '';
+  const isSelectedModuleEnabled = moduleConfig && selectedModuleCfgKey ? (moduleConfig[selectedModuleCfgKey]?.enabled ?? true) : true;
+
   return (
     <div className="min-h-screen bg-gray-50 pb-16">
       {toast && (
@@ -908,9 +989,11 @@ export default function AiAdsCommandCenter() {
         </div>
       )}
 
-      {/* Modal Popup Aturan Detail */}
+      {/* Modal Popup Aturan Detail dengan Toggle ON/OFF */}
       <ModuleRulesModal
         rule={selectedModalRule}
+        isEnabled={isSelectedModuleEnabled}
+        onToggle={(enabled) => selectedModalRule && handleToggleModule(selectedModalRule.moduleId, enabled)}
         onClose={() => setSelectedModalRule(null)}
         onGoToSettings={() => setActiveTab('settings')}
       />
@@ -1044,6 +1127,7 @@ export default function AiAdsCommandCenter() {
                   modules={modules}
                   moduleConfig={moduleConfig}
                   onSelectModuleRule={(rule) => setSelectedModalRule(rule)}
+                  onToggleModule={handleToggleModule}
                 />
               )}
             </section>
@@ -1066,16 +1150,23 @@ export default function AiAdsCommandCenter() {
                 </div>
               ) : (
                 <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                  {modules.map(m => (
-                    <ModuleCard key={m.moduleId} module={m} onScan={scanModul}
-                      scanning={scanningPrefix === m.layerPrefix}
-                      findings={scanResults[m.layerPrefix] ?? null}
-                      onViewRule={() => {
-                        const rule = MODULE_RULES_DETAIL[m.moduleId];
-                        if (rule) setSelectedModalRule(rule);
-                      }}
-                    />
-                  ))}
+                  {modules.map(m => {
+                    const cfgKey = `module_${m.moduleId.replace('.', '_')}`;
+                    const isEnabled = moduleConfig ? (moduleConfig[cfgKey]?.enabled ?? true) : true;
+                    return (
+                      <ModuleCard key={m.moduleId} module={m}
+                        isEnabled={isEnabled}
+                        onToggle={(enabled) => handleToggleModule(m.moduleId, enabled)}
+                        onScan={scanModul}
+                        scanning={scanningPrefix === m.layerPrefix}
+                        findings={scanResults[m.layerPrefix] ?? null}
+                        onViewRule={() => {
+                          const rule = MODULE_RULES_DETAIL[m.moduleId];
+                          if (rule) setSelectedModalRule(rule);
+                        }}
+                      />
+                    );
+                  })}
                 </div>
               )}
             </section>
