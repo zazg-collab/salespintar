@@ -1,11 +1,11 @@
 'use client';
 
 // === KETERANGAN PENGERJAAN ===
-// File ini ditulis ulang (ROMBAK TOTAL) oleh: Antigravity (Gemini), 2026-08-29
+// File ini ditulis ulang (ROMBAK TOTAL & UI/UX ENHANCEMENT) oleh: Antigravity (Gemini), 2026-08-29
 // Penyelarasan Presisi Blueprint Bagian 9 (UI/UX AI Command Center):
 //   1. Tab Dashboard (Urutan Atas ke Bawah):
 //      - 1. Kartu Antrian Approval (PALING ATAS)
-//      - 2. Kartu Status Modul (Ringkasan 7 Modul & Aturan Ringkas Bagian 8)
+//      - 2. Kartu Status Modul (Tabel bersih + Popup Modal Aturan Detail Interaktif)
 //      - 3. 7 Kartu per Modul (Grid 7.1 s/d 7.7 + Scan Sekarang inline)
 //   2. Tab Pengaturan: Parameter Bagian 8 untuk 7 modul + toggle switch per modul
 // ============================
@@ -26,6 +26,12 @@ import {
   ChevronUp,
   Zap,
   Layers,
+  Info,
+  X,
+  Sliders,
+  ShieldCheck,
+  Target,
+  FileCode2,
 } from 'lucide-react';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -60,8 +66,19 @@ interface ModuleStatus {
   lastRunAt: string | null;
 }
 
+interface ModuleDetailRule {
+  moduleId: string;
+  title: string;
+  tagline: string;
+  layers: string[];
+  triggers: string[];
+  parameters: Array<{ label: string; value: string; desc: string }>;
+  actions: string[];
+  theme: string;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
-// KONSTANTA & HELPER
+// KONSTANTA & DATA DETAIL ATURAN (UNTUK POPUP MODAL)
 // ─────────────────────────────────────────────────────────────────────────────
 
 const MODULE_ICONS: Record<string, string> = {
@@ -84,14 +101,113 @@ const MODULE_COLOR: Record<string, string> = {
   '7.7': 'from-indigo-50 to-indigo-100 border-indigo-200',
 };
 
-const MODULE_BRIEF_RULES: Record<string, string> = {
-  '7.1': 'Lock Period 48j · Soft -30% · Hard -50% · Hard Kill >3x CPA · Fatigue freq >3.5 / CTR -25%',
-  '7.2': 'Shift Pagi 09:00 WIB · Siang 13:00 WIB · Sore 16:00 WIB · Morning Briefing 07:30 WIB',
-  '7.3': 'Velocity Spike >50% (2j) · Zero-Conv Warning 1.5x / Stop 2.5x · Circuit Breaker >110% Plafon',
-  '7.4': 'CPC Surge >50%/100% · Hook Diagnostician CTR <0.60% · LP Message-Match CVR <0.80%',
-  '7.5': 'Waste Threshold >10% Spend 7d · EMQ Target Purchase 9.3+ / Lead 8.0+ · Exclude 180 Hari',
-  '7.6': 'Z-Test min 20 klik/varian · Max 14 hari · Early Loser Kill >2x CPA & 0 konversi',
-  '7.7': 'Token Bucket max 180 call/jam · Cooldown 15m · Auto Backoff Header Meta API',
+const MODULE_RULES_DETAIL: Record<string, ModuleDetailRule> = {
+  '7.1': {
+    moduleId: '7.1',
+    title: 'Tiga Aturan Budget & Badging',
+    tagline: 'Manajemen alokasi budget otomatis, mitigasi penurunan performa, dan proteksi kelelahan audiens.',
+    layers: ['Layer 01 (Scale Up)', 'Layer 02 (Reduce Soft & Hard)', 'Layer 03 (Hard Kill)', 'Layer 10 (Ad Fatigue)'],
+    triggers: ['Evaluasi rasio ROAS harian/mingguan terhadap Target ROAS', 'Kenaikan frekuensi tayang iklan per user'],
+    parameters: [
+      { label: 'Lock Period', value: '48 Jam', desc: 'Jeda waktu wajib setelah adset di-scale/reduce sebelum boleh diubah lagi.' },
+      { label: 'Reduce Soft', value: '-30% Budget', desc: 'Diterapkan jika ROAS berada di rentang 70% – 85% dari target.' },
+      { label: 'Reduce Hard', value: '-50% Budget', desc: 'Diterapkan jika ROAS berada di rentang 50% – 70% dari target.' },
+      { label: 'Hard Kill', value: '> 3.0× CPA', desc: 'Matikan adset jika CPA > 3× target selama 7 hari berturut-turut.' },
+      { label: 'Ad Fatigue Guard', value: 'Freq > 3.5 & CTR -25%', desc: 'Peringatan kelelahan kreatif iklan jika frekuensi naik dan CTR drop.' },
+    ],
+    actions: ['Draft Mutasi Budget (Scale Up / Scale Down)', 'Draft Matikan Adset (Hard Kill)', 'Notifikasi Fatigue ke media buyer'],
+    theme: 'border-blue-200 bg-blue-50 text-blue-800',
+  },
+  '7.2': {
+    moduleId: '7.2',
+    title: 'Shift Automation & Morning Briefing',
+    tagline: 'Siklus otomatisasi patroli 3 shift harian dan pengiriman laporan eksekutif pagi.',
+    layers: ['Layer 04 (Shift Evaluator)', 'Layer 10 (Pacing Sentinel)', 'Morning Briefing Engine'],
+    triggers: ['Trigger berbasis jadwal waktu WIB (Pagi, Siang, Sore, dan Subuh)'],
+    parameters: [
+      { label: 'Shift Pagi (Early-Kill)', value: '09:00 WIB', desc: 'Pembersihan adset yang bocor/underperforming sebelum spend membengkak.' },
+      { label: 'Shift Siang (Mid-Day)', value: '13:00 WIB', desc: 'Evaluasi kecepatan spend tengah hari dan perataan distribusi pacing.' },
+      { label: 'Shift Sore (Golden Hour)', value: '16:00 WIB', desc: 'Injeksi budget untuk adset pemenang menjelang prime time konversi malam.' },
+      { label: 'Morning Briefing', value: '07:30 WIB', desc: 'Rekap otomatis 5 Pertanyaan Harian dikirim langsung ke Telegram.' },
+    ],
+    actions: ['Eksekusi sinkronisasi shift terjadwal', 'Pengiriman laporan status akun & rekomendasi harian ke Telegram'],
+    theme: 'border-rose-200 bg-rose-50 text-rose-800',
+  },
+  '7.3': {
+    moduleId: '7.3',
+    title: 'Spend Anomaly & Circuit Breaker',
+    tagline: 'Sistem rem darurat untuk menghentikan pembakaran uang tak wajar & link rusak.',
+    layers: ['Layer 06 (LP Check)', 'Layer 07 (Velocity Spike)', 'Layer 08 (Zero-Conv Emergency Stop)'],
+    triggers: ['Lonjakan kecepatan spend abnormal dalam window 2 jam', 'Spend tinggi tanpa satupun konversi', 'Halaman LP tidak bisa diakses'],
+    parameters: [
+      { label: 'Velocity Spike', value: '> 50% Daily Budget / 2 Jam', desc: 'Alarm darurat saat algoritma Meta menghabiskan >50% budget dalam 2 jam.' },
+      { label: 'Zero-Conv Warning', value: '> 1.5× CPA', desc: 'Peringatan dini saat spend sudah melebihi 1.5× CPA tanpa konversi.' },
+      { label: 'Zero-Conv Hard Stop', value: '> 2.5× CPA', desc: 'Auto-pause adset jika spend mencapai 2.5× target CPA dan 0 konversi.' },
+      { label: 'Circuit Breaker Akun', value: '> 110% Plafon', desc: 'Rem darurat global: pause seluruh akun jika spend harian menembus 110% plafon.' },
+      { label: 'Dead-Link Timeout', value: '10 Detik / 2× Gagal', desc: 'Auto-pause iklan jika URL landing page gagal diakses (HTTP 5xx / 404).' },
+    ],
+    actions: ['Auto-Pause Adset Darurat (Prioritas Tinggi)', 'Notifikasi Darurat WhatsApp/Telegram', 'Proteksi Saldo Akun'],
+    theme: 'border-purple-200 bg-purple-50 text-purple-800',
+  },
+  '7.4': {
+    moduleId: '7.4',
+    title: 'Tiga Bot Otonom Spesialis',
+    tagline: 'Spesialis deteksi dinamika lelang, audit hook video iklan, dan penyelarasan landing page.',
+    layers: ['Layer 09 (Auction CPC Surge)', 'Layer 11 (CTR Hook Diagnostician)', 'Layer 12 (LP Dead Link)', 'Layer 13 (LP Message-Match)'],
+    triggers: ['Lonjakan biaya lelang (CPC/CPM)', 'CTR video rendah (<0.60%)', 'CVR landing page drop (<0.80%)'],
+    parameters: [
+      { label: 'CPC Surge Warning', value: '+50% dari 7d Avg', desc: 'Peringatan kenaikan biaya klik akibat persaingan lelang ketat.' },
+      { label: 'CPC Surge Critical', value: '+100% dari 7d Avg', desc: 'Status kritis saat CPC melonjak 2x lipat dari rata-rata 7 hari.' },
+      { label: 'Hook Diagnostician', value: 'Min 1.000 Impresi & CTR < 0.60%', desc: 'AI mendiagnosa 3 detik pertama video dan buatkan 3 sudut pandang hook baru.' },
+      { label: 'LP Message-Match', value: 'Min 50 Klik & CVR < 0.80%', desc: 'AI mendiagnosa keselarasan pesan iklan vs LP, buatkan rewrite H1, Subhead, CTA.' },
+    ],
+    actions: ['Rekomendasi Hook Baru (Review Konten)', 'Rekomendasi Rewrite Copy Landing Page', 'Peringatan Anomali Lelang'],
+    theme: 'border-amber-200 bg-amber-50 text-amber-800',
+  },
+  '7.5': {
+    moduleId: '7.5',
+    title: 'Budget Waste & CAPI EMQ Defense',
+    tagline: 'Pencegahan kebocoran audiens pembeli lama dan penjaga kualitas data Conversions API.',
+    layers: ['Layer 16 (CAPI Audience Exclusion Leakage)', 'Layer 17 (Event Match Quality EMQ Score)'],
+    triggers: ['Pembeli 180 hari terakhir tidak tereksklusi dari campaign prospek', 'Skor EMQ CAPI di bawah target'],
+    parameters: [
+      { label: 'Waste Threshold', value: '> 10% Spend 7 Hari', desc: 'Kategori pemborosan budget jika terbuang ke audiens pembeli lama.' },
+      { label: 'Exclude Window', value: '180 Hari', desc: 'Rentang waktu pembeli yang wajib dieksklusi dari kampanye akuisisi baru.' },
+      { label: 'EMQ Target Purchase', value: 'Min 9.3 / 10', desc: 'Standar emas kualitas pencocokan data server Meta untuk event Purchase.' },
+      { label: 'EMQ Target Lead', value: 'Min 8.0 / 10', desc: 'Standar minimum kualitas pencocokan data server Meta untuk event Lead.' },
+    ],
+    actions: ['Rekomendasi Perbaikan Custom Audience Exclusion', 'Audit & Notifikasi Perbaikan Sinyal CAPI Server'],
+    theme: 'border-emerald-200 bg-emerald-50 text-emerald-800',
+  },
+  '7.6': {
+    moduleId: '7.6',
+    title: 'A/B Test Significance Engine',
+    tagline: 'Kalkulasi saintifik pengujian kreatif dan copy iklan berbasis Two-Proportion Z-Test.',
+    layers: ['Layer 14 (Early Loser Kill)', 'Layer 15 (Winner Declaration Z-Test)'],
+    triggers: ['Pengujian adset dalam campaign A/B testing aktif'],
+    parameters: [
+      { label: 'Min Sampel Uji', value: '20 Klik per Varian', desc: 'Batas sampel data minimum sebelum uji statistik valid dihitung.' },
+      { label: 'Early Loser Kill', value: 'Spend > 2.0× CPA & 0 Conv', desc: 'Matikan varian yang kalah lebih cepat untuk menghemat anggaran tes.' },
+      { label: 'Confidence Level', value: '95% (p-value < 0.05)', desc: 'Tingkat keyakinan statistik sebelum varian resmi dideklarasikan sebagai pemenang.' },
+      { label: 'Maksimal Durasi', value: '14 Hari', desc: 'Batas waktu tes. Jika tidak ada pemenang signifikan, status jadi Inconclusive.' },
+    ],
+    actions: ['Draft Matikan Varian Kalah (Mutasi)', 'Laporan Deklarasi Varian Pemenang (Informatif)'],
+    theme: 'border-cyan-200 bg-cyan-50 text-cyan-800',
+  },
+  '7.7': {
+    moduleId: '7.7',
+    title: 'Kuota Meta API Rate Limit Guard',
+    tagline: 'Pelindung kuota panggilan API Meta Graph agar sistem tidak terkena blokir sementara.',
+    layers: ['Layer 17B (Token Bucket & Adaptive Backoff)'],
+    triggers: ['Panggilan Meta Graph API harian oleh bot'],
+    parameters: [
+      { label: 'Kapasitas Bucket', value: '180 Calls / Jam', desc: 'Batas kuota aman panggilan API per token Business Manager.' },
+      { label: 'Adaptive Backoff', value: 'Utilisasi > 80%', desc: 'Otomatis memperlambat request jika header Meta mendekati batas limit.' },
+      { label: 'Cooldown Throttle', value: '15 Menit', desc: 'Jeda wajib jika menerima response HTTP 429 sebelum request diulang.' },
+    ],
+    actions: ['Pengaturan antrian request API otomatis', 'Pencegahan error rate limit Meta Graph API'],
+    theme: 'border-indigo-200 bg-indigo-50 text-indigo-800',
+  },
 };
 
 const STATUS_BADGE: Record<RecStatus, string> = {
@@ -130,6 +246,139 @@ function UrgentBadge() {
     <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-semibold bg-red-100 text-red-700 border border-red-200 animate-pulse">
       ⚠️ PRIORITAS
     </span>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// POPUP MODAL ATURAN DETAIL MODUL (UI/UX BARU)
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ModuleRulesModalProps {
+  rule: ModuleDetailRule | null;
+  onClose: () => void;
+  onGoToSettings?: () => void;
+}
+
+function ModuleRulesModal({ rule, onClose, onGoToSettings }: ModuleRulesModalProps) {
+  if (!rule) return null;
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm animate-fadeIn">
+      <div className="bg-white rounded-2xl shadow-2xl border border-gray-200 w-full max-w-2xl max-h-[90vh] flex flex-col overflow-hidden animate-scaleUp">
+        
+        {/* Header Modal */}
+        <div className="px-6 py-4 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <span className="text-3xl">{MODULE_ICONS[rule.moduleId] ?? '⚙️'}</span>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="px-2 py-0.5 rounded-md bg-blue-100 text-blue-800 font-bold text-xs">
+                  Modul {rule.moduleId}
+                </span>
+                <h3 className="font-bold text-gray-900 text-base">{rule.title}</h3>
+              </div>
+              <p className="text-xs text-gray-500 mt-0.5">{rule.tagline}</p>
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            className="p-1.5 text-gray-400 hover:text-gray-700 hover:bg-gray-200 rounded-lg transition-colors"
+          >
+            <X size={18} />
+          </button>
+        </div>
+
+        {/* Isi Body Modal */}
+        <div className="p-6 overflow-y-auto space-y-5 text-xs text-gray-700">
+          
+          {/* Lapisan / Layer Terkait */}
+          <div>
+            <h4 className="font-bold text-gray-800 mb-2 flex items-center gap-1.5">
+              <Layers size={14} className="text-blue-600" />
+              Lapisan / Layer Terkait
+            </h4>
+            <div className="flex flex-wrap gap-1.5">
+              {rule.layers.map((l, idx) => (
+                <span key={idx} className="px-2.5 py-1 bg-gray-100 text-gray-700 rounded-md font-medium">
+                  {l}
+                </span>
+              ))}
+            </div>
+          </div>
+
+          {/* Ambang Batas & Aturan Kunci (Bagian 8) */}
+          <div>
+            <h4 className="font-bold text-gray-800 mb-2.5 flex items-center gap-1.5">
+              <Target size={14} className="text-blue-600" />
+              Ambang Batas & Parameter Aturan (Bagian 8 Blueprint)
+            </h4>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-2.5">
+              {rule.parameters.map((p, idx) => (
+                <div key={idx} className="p-3 bg-gray-50 border border-gray-200 rounded-xl space-y-1">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold text-gray-800">{p.label}</span>
+                    <span className="px-2 py-0.5 bg-blue-50 text-blue-700 border border-blue-200 rounded text-[11px] font-bold">
+                      {p.value}
+                    </span>
+                  </div>
+                  <p className="text-[11px] text-gray-500 leading-relaxed">{p.desc}</p>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {/* Kondisi Trigger & Aksi */}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 pt-2 border-t border-gray-100">
+            <div>
+              <h4 className="font-bold text-gray-800 mb-2 flex items-center gap-1.5">
+                <Zap size={14} className="text-amber-500" />
+                Pemicu / Trigger
+              </h4>
+              <ul className="space-y-1.5 list-disc list-inside text-gray-600 text-[11px]">
+                {rule.triggers.map((t, idx) => (
+                  <li key={idx}>{t}</li>
+                ))}
+              </ul>
+            </div>
+
+            <div>
+              <h4 className="font-bold text-gray-800 mb-2 flex items-center gap-1.5">
+                <ShieldCheck size={14} className="text-emerald-600" />
+                Bentuk Aksi Sistem
+              </h4>
+              <ul className="space-y-1.5 list-disc list-inside text-gray-600 text-[11px]">
+                {rule.actions.map((a, idx) => (
+                  <li key={idx}>{a}</li>
+                ))}
+              </ul>
+            </div>
+          </div>
+
+        </div>
+
+        {/* Footer Modal */}
+        <div className="px-6 py-3 bg-gray-50 border-t border-gray-200 flex items-center justify-between">
+          <span className="text-[11px] text-gray-400">Parameter dapat diubah di Tab Pengaturan</span>
+          <div className="flex items-center gap-2">
+            {onGoToSettings && (
+              <button
+                onClick={() => { onClose(); onGoToSettings(); }}
+                className="px-3 py-1.5 border border-gray-300 hover:bg-gray-100 text-gray-700 rounded-lg text-xs font-medium flex items-center gap-1"
+              >
+                <Sliders size={12} /> Buka Pengaturan
+              </button>
+            )}
+            <button
+              onClick={onClose}
+              className="px-4 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold"
+            >
+              Tutup
+            </button>
+          </div>
+        </div>
+
+      </div>
+    </div>
   );
 }
 
@@ -307,9 +556,10 @@ function ContentReviewCard({ item, onApprove, onReject, processing }: ContentRev
 interface ModuleStatusSummaryProps {
   modules: ModuleStatus[];
   moduleConfig: Record<string, any> | null;
+  onSelectModuleRule: (rule: ModuleDetailRule) => void;
 }
 
-function ModuleStatusSummary({ modules, moduleConfig }: ModuleStatusSummaryProps) {
+function ModuleStatusSummary({ modules, moduleConfig, onSelectModuleRule }: ModuleStatusSummaryProps) {
   return (
     <div className="bg-white border border-gray-200 rounded-xl overflow-hidden shadow-sm">
       <div className="px-5 py-4 bg-gray-50 border-b border-gray-200 flex items-center justify-between">
@@ -318,7 +568,7 @@ function ModuleStatusSummary({ modules, moduleConfig }: ModuleStatusSummaryProps
             <Activity size={16} className="text-blue-600" />
             Kartu Status Modul Automasi (7 Modul)
           </h2>
-          <p className="text-xs text-gray-500 mt-0.5">Status operasional dan ringkasan aturan aktif sistem Meta Bot 24/7</p>
+          <p className="text-xs text-gray-500 mt-0.5">Klik pada nama modul untuk melihat penjelasan aturan detail & parameter aktif</p>
         </div>
         <span className="px-2.5 py-1 bg-blue-50 text-blue-700 border border-blue-200 rounded-full text-xs font-semibold">
           7 Modul Terdaftar
@@ -329,54 +579,75 @@ function ModuleStatusSummary({ modules, moduleConfig }: ModuleStatusSummaryProps
         <table className="w-full text-left text-xs">
           <thead className="bg-gray-50/50 text-gray-500 border-b border-gray-200">
             <tr>
-              <th className="px-4 py-2.5 font-semibold">Modul</th>
-              <th className="px-4 py-2.5 font-semibold">Status</th>
-              <th className="px-4 py-2.5 font-semibold">Aturan Ringkas (Bagian 8)</th>
-              <th className="px-4 py-2.5 font-semibold text-center">Menunggu</th>
-              <th className="px-4 py-2.5 font-semibold text-right">Terakhir Jalan</th>
+              <th className="px-4 py-3 font-semibold">Modul (Klik untuk Aturan Detail)</th>
+              <th className="px-4 py-3 font-semibold">Status Operasional</th>
+              <th className="px-4 py-3 font-semibold text-center">Menunggu Approval</th>
+              <th className="px-4 py-3 font-semibold text-right">Terakhir Jalan</th>
+              <th className="px-4 py-3 font-semibold text-center">Aturan</th>
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
             {modules.map((m) => {
               const cfgKey = `module_${m.moduleId.replace('.', '_')}`;
               const isEnabled = moduleConfig ? (moduleConfig[cfgKey]?.enabled ?? true) : true;
+              const ruleDetail = MODULE_RULES_DETAIL[m.moduleId];
+
               return (
-                <tr key={m.moduleId} className="hover:bg-gray-50/80 transition-colors">
-                  <td className="px-4 py-3 font-medium text-gray-900 flex items-center gap-2">
-                    <span className="text-base">{MODULE_ICONS[m.moduleId] ?? '⚙️'}</span>
+                <tr
+                  key={m.moduleId}
+                  onClick={() => ruleDetail && onSelectModuleRule(ruleDetail)}
+                  className="hover:bg-blue-50/50 transition-colors cursor-pointer group"
+                >
+                  <td className="px-4 py-3.5 font-medium text-gray-900 flex items-center gap-2.5">
+                    <span className="text-lg flex-shrink-0">{MODULE_ICONS[m.moduleId] ?? '⚙️'}</span>
                     <div>
-                      <span className="font-semibold">{m.moduleId}</span> {m.label}
+                      <div className="flex items-center gap-1.5">
+                        <span className="font-bold text-gray-800 group-hover:text-blue-600 transition-colors">
+                          {m.moduleId} {m.label}
+                        </span>
+                      </div>
+                      <span className="text-[11px] text-gray-400 group-hover:text-blue-500 flex items-center gap-1 mt-0.5">
+                        <Info size={11} /> Klik untuk lihat detail aturan
+                      </span>
                     </div>
                   </td>
-                  <td className="px-4 py-3 whitespace-nowrap">
+                  <td className="px-4 py-3.5 whitespace-nowrap">
                     {m.hasUrgent ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-semibold bg-red-100 text-red-700 border border-red-200">
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-red-100 text-red-700 border border-red-200">
                         🚨 Darurat
                       </span>
                     ) : isEnabled ? (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
                         🟢 Aktif Memantau
                       </span>
                     ) : (
-                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[11px] font-medium bg-gray-100 text-gray-600 border border-gray-200">
+                      <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[11px] font-medium bg-gray-100 text-gray-600 border border-gray-200">
                         ⏸️ Dinonaktifkan
                       </span>
                     )}
                   </td>
-                  <td className="px-4 py-3 text-gray-600 max-w-md">
-                    <span className="line-clamp-1">{MODULE_BRIEF_RULES[m.moduleId] ?? '-'}</span>
-                  </td>
-                  <td className="px-4 py-3 text-center">
+                  <td className="px-4 py-3.5 text-center">
                     {m.pendingApprovalCount > 0 ? (
-                      <span className="inline-flex items-center justify-center px-2 py-0.5 rounded-full bg-amber-500 text-white font-bold text-[11px]">
-                        {m.pendingApprovalCount}
+                      <span className="inline-flex items-center justify-center px-2.5 py-0.5 rounded-full bg-amber-500 text-white font-bold text-[11px]">
+                        {m.pendingApprovalCount} item
                       </span>
                     ) : (
                       <span className="text-gray-400">0</span>
                     )}
                   </td>
-                  <td className="px-4 py-3 text-right text-gray-500 whitespace-nowrap">
+                  <td className="px-4 py-3.5 text-right text-gray-500 whitespace-nowrap">
                     {m.lastRunAt ? formatWaktu(m.lastRunAt) : 'Belum pernah'}
+                  </td>
+                  <td className="px-4 py-3.5 text-center">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        if (ruleDetail) onSelectModuleRule(ruleDetail);
+                      }}
+                      className="px-2.5 py-1 bg-white border border-gray-300 hover:border-blue-400 hover:bg-blue-50 text-gray-700 hover:text-blue-700 rounded-lg text-xs font-medium transition-all shadow-2xs inline-flex items-center gap-1"
+                    >
+                      <Info size={12} className="text-blue-500" /> Detail
+                    </button>
                   </td>
                 </tr>
               );
@@ -397,9 +668,10 @@ interface ModuleCardProps {
   onScan: (prefix: string) => Promise<void>;
   scanning: boolean;
   findings: AiAdsRecommendation[] | null;
+  onViewRule: () => void;
 }
 
-function ModuleCard({ module, onScan, scanning, findings }: ModuleCardProps) {
+function ModuleCard({ module, onScan, scanning, findings, onViewRule }: ModuleCardProps) {
   const [showFindings, setShowFindings] = useState(false);
   const colorClass = MODULE_COLOR[module.moduleId] ?? 'from-gray-50 to-gray-100 border-gray-200';
 
@@ -423,17 +695,20 @@ function ModuleCard({ module, onScan, scanning, findings }: ModuleCardProps) {
         </div>
       </div>
 
-      <div className="px-4 pb-3 flex items-center gap-4 text-xs text-gray-500">
+      <div className="px-4 pb-3 flex items-center justify-between text-xs text-gray-500 border-b border-black/5 pt-1">
         <span className="flex items-center gap-1">
           <Clock size={11} />
           {module.lastRunAt ? formatWaktu(module.lastRunAt) : 'Belum pernah'}
         </span>
-        {module.pendingApprovalCount > 0 && (
-          <span className="text-amber-600 font-medium">{module.pendingApprovalCount} menunggu</span>
-        )}
+        <button
+          onClick={onViewRule}
+          className="text-blue-600 hover:text-blue-800 hover:underline flex items-center gap-0.5 text-[11px] font-medium"
+        >
+          <Info size={11} /> Aturan Detail
+        </button>
       </div>
 
-      <div className="px-4 pb-3 flex items-center gap-2">
+      <div className="px-4 py-3 flex items-center gap-2">
         <button disabled={scanning} onClick={() => { onScan(module.layerPrefix); setShowFindings(true); }}
           className="flex items-center gap-1.5 px-3 py-1.5 bg-white border border-gray-300 hover:bg-gray-50 rounded-lg text-sm font-medium text-gray-700 disabled:opacity-50 shadow-sm">
           {scanning ? <Loader2 size={13} className="animate-spin" /> : <Zap size={13} className="text-amber-500" />}
@@ -487,6 +762,9 @@ export default function AiAdsCommandCenter() {
   const [queueFilter, setQueueFilter] = useState<'all' | 'mutation' | 'content_review'>('all');
   const [processingId, setProcessingId] = useState<string | null>(null);
   const [toast, setToast] = useState<{ msg: string; ok: boolean } | null>(null);
+
+  // State Modal Detail Aturan
+  const [selectedModalRule, setSelectedModalRule] = useState<ModuleDetailRule | null>(null);
 
   // State Tab Pengaturan
   const [moduleConfig, setModuleConfig] = useState<Record<string, any> | null>(null);
@@ -630,6 +908,13 @@ export default function AiAdsCommandCenter() {
         </div>
       )}
 
+      {/* Modal Popup Aturan Detail */}
+      <ModuleRulesModal
+        rule={selectedModalRule}
+        onClose={() => setSelectedModalRule(null)}
+        onGoToSettings={() => setActiveTab('settings')}
+      />
+
       {/* Header Utama */}
       <div className="bg-white border-b border-gray-200 px-6 py-4">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
@@ -748,14 +1033,18 @@ export default function AiAdsCommandCenter() {
               )}
             </section>
 
-            {/* ── 2. KARTU STATUS MODUL (RINGKASAN SISTEM) ─────────────── */}
+            {/* ── 2. KARTU STATUS MODUL (RINGKASAN SISTEM DENGAN POPUP) ── */}
             <section>
               {modulesLoading ? (
                 <div className="flex items-center justify-center py-10 text-gray-400">
                   <Loader2 size={24} className="animate-spin mr-2" /> Memuat status modul...
                 </div>
               ) : (
-                <ModuleStatusSummary modules={modules} moduleConfig={moduleConfig} />
+                <ModuleStatusSummary
+                  modules={modules}
+                  moduleConfig={moduleConfig}
+                  onSelectModuleRule={(rule) => setSelectedModalRule(rule)}
+                />
               )}
             </section>
 
@@ -780,7 +1069,12 @@ export default function AiAdsCommandCenter() {
                   {modules.map(m => (
                     <ModuleCard key={m.moduleId} module={m} onScan={scanModul}
                       scanning={scanningPrefix === m.layerPrefix}
-                      findings={scanResults[m.layerPrefix] ?? null} />
+                      findings={scanResults[m.layerPrefix] ?? null}
+                      onViewRule={() => {
+                        const rule = MODULE_RULES_DETAIL[m.moduleId];
+                        if (rule) setSelectedModalRule(rule);
+                      }}
+                    />
                   ))}
                 </div>
               )}
