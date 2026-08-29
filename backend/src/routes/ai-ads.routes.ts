@@ -1,0 +1,2985 @@
+import { Router, Request, Response, NextFunction } from 'express';
+import { Readable } from 'stream';
+import { z } from 'zod';
+import { prisma } from '../config/prisma';
+import { env } from '../config/env';
+import { authenticate, authorize } from '../middleware/auth';
+import { logger } from '../utils/logger';
+import { decrypt } from '../services/crypto.service';
+import { hashPassword, comparePassword } from '../utils/crypto';
+import { toJakartaDateStr, getRecentJakartaDateList, getWibDateRange } from '../utils/timezone';
+import { resolveMatchedType, getResultLabels, computeResultValue } from '../services/meta-result-resolver.service';
+import { sendTelegram } from '../services/telegram.service';
+
+/**
+ * Pengaturan AI Media Buyer — Threshold Shift, Spend Anomaly (override),
+ * dan Landing Page (daftar global) — Fase 3, redesign UX 2026-08-24.
+ *
+ * Latar belakang redesign: versi awal minta user mengetik manual Object ID
+ * campaign & Ad Account ID buat tiap target — ruwet, gampang salah ketik.
+ * Sekarang dipecah 2 lapis:
+ *
+ *   1. LAPISAN UMUM (default per BM) — diaktifkan & diisi di modal "Kelola
+ *      Aset BM" (business.routes.ts: GET/PUT /business/meta-bms/:id/automation-defaults).
+ *      Kalau aktif, berlaku otomatis ke SEMUA campaign di akun-akun iklan BM
+ *      itu — tidak perlu isi Object ID apa pun.
+ *   2. LAPISAN OVERRIDE (endpoint di file ini) — buat campaign yang butuh
+ *      angka beda dari default BM-nya. objectId/adAccountId diisi otomatis
+ *      dari dropdown campaign LIVE (lihat GET /business/meta-bms/:id/campaigns),
+ *      bukan diketik manual.
+ *
+ * Landing Page beda pola lagi: daftar URL globalnya TIDAK terikat BM/akun/
+ * campaign sama sekali (lihat /ai-ads/landing-pages) — cuma Label + URL.
+ * Aktivasi cek-nya per BM (toggle di modal BM), dan campaign yang dipause
+ * saat URL down ditentukan otomatis lewat pencocokan destination URL
+ * (menyusul di Fase 3 Langkah 2, sama seperti wiring run_shift.py di bawah).
+ *
+ * `run_shift.py` & `emergency_brake.py` (cron di VPS Antigravity
+ * 45.77.247.72) BELUM baca dari endpoint-endpoint ini — masih baca file JSON
+ * lokal (`config/shift_targets.json`, `config/emergency_brake_targets.json`).
+ * Wiring-nya (termasuk logika "expand default BM -> daftar campaign live" +
+ * "cocokin URL landing page -> campaign") menyusul di Fase 3 Langkah 2.
+ */
+
+
+
+
+import * as client_1 from "@prisma/client";
+
+
+
+
+
+
+const router = Router();
+router.use(authenticate);
+// ── Skema bersama ───────────────────────────────────────────────────────
+const shiftMorningEarlyKillSchema = z.object({
+    costThreshold: z.number().positive(),
+    cpcKillMultiplier: z.number().positive(),
+});
+const shiftMiddayPacingSchema = z.object({
+    dailyBudget: z.number().positive(),
+    dailyLeadsTarget: z.number().nonnegative(),
+    spendPaceThreshold: z.number().min(0).max(1),
+    leadsPaceThreshold: z.number().min(0).max(1),
+    reducePct: z.number().min(0).max(1),
+});
+const shiftGoldenHourScalingSchema = z.object({
+    roasTarget: z.number().positive(),
+    scalePct: z.number().min(0).max(1),
+    maxDailyBudgetCeiling: z.number().positive(),
+});
+// Override Threshold Shift per-campaign. objectId/objectName/adAccountId*
+// dimaksudkan diisi frontend dari dropdown campaign live (bukan diketik).
+const thresholdShiftOverrideSchema = z.object({
+    objectId: z.string().min(1),
+    objectName: z.string().optional().default(''),
+    adAccountId: z.string().min(1),
+    adAccountName: z.string().optional().default(''),
+    leadActionType: z.string().nullable().default(null),
+    revenueActionType: z.string().nullable().default(null),
+    historicalDays: z.number().int().positive().max(90).default(7),
+    morningEarlyKill: shiftMorningEarlyKillSchema,
+    middayPacing: shiftMiddayPacingSchema,
+    goldenHourScaling: shiftGoldenHourScalingSchema,
+});
+const bmScopedOverridesPayloadSchema = z.object({
+    bmId: z.string().min(1),
+    overrides: z.array(thresholdShiftOverrideSchema).max(50),
+});
+function ambilSettings(businessSettings: any) {
+    return (businessSettings ?? {});
+}
+// ── GET /ai-ads/settings?bmId=xxx — override Threshold Shift 1 BM ─────────
+router.get('/settings', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const bmId = typeof req.query.bmId === 'string' ? req.query.bmId : '';
+        if (!bmId) {
+            res.status(400).json({ error: { message: 'Parameter bmId wajib diisi' } });
+            return;
+        }
+        const b = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+        const settings = ambilSettings(b?.settings);
+        const shiftTargets = (settings['aiAdsShiftTargets'] ?? {});
+        const overrides = Array.isArray(shiftTargets.byBm?.[bmId]) ? shiftTargets.byBm[bmId] : [];
+        res.json({ bmId, overrides });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// ── PUT /ai-ads/settings — simpan override Threshold Shift 1 BM (ADMIN) ────
+router.put('/settings', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = bmScopedOverridesPayloadSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const b = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+        const settingsLama = ambilSettings(b?.settings);
+        const shiftTargetsLama = (settingsLama['aiAdsShiftTargets'] ?? {});
+        const byBmLama = shiftTargetsLama.byBm ?? {};
+        await prisma.business.update({
+            where: { id: businessId },
+            data: {
+                settings: {
+                    ...settingsLama,
+                    aiAdsShiftTargets: { byBm: { ...byBmLama, [parsed.data.bmId]: parsed.data.overrides } },
+                },
+            },
+        });
+        logger.info(`[AiAds] Override Threshold Shift BM ${parsed.data.bmId} (bisnis ${businessId}) disimpan: ${parsed.data.overrides.length} campaign`);
+        res.json({ ok: true, ...parsed.data, message: 'Override Threshold Shift disimpan.' });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// ── Spend Anomaly — override per-campaign (default-nya di modal BM) ────────
+const spendAnomalyOverrideSchema = z.object({
+    objectId: z.string().min(1),
+    objectName: z.string().optional().default(''),
+    adAccountId: z.string().min(1),
+    adAccountName: z.string().optional().default(''),
+    leadActionType: z.string().nullable().default('lead'),
+    revenueActionType: z.string().nullable().default(null),
+    spendIncreasePctThreshold: z.number().positive().max(1000),
+});
+const spendAnomalyOverridesPayloadSchema = z.object({
+    bmId: z.string().min(1),
+    overrides: z.array(spendAnomalyOverrideSchema).max(50),
+});
+router.get('/spend-anomaly-settings', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const bmId = typeof req.query.bmId === 'string' ? req.query.bmId : '';
+        if (!bmId) {
+            res.status(400).json({ error: { message: 'Parameter bmId wajib diisi' } });
+            return;
+        }
+        const b = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+        const settings = ambilSettings(b?.settings);
+        const eb = (settings['emergencyBrakeSettings'] ?? {});
+        const overrides = Array.isArray(eb.spendAnomalyOverrides?.byBm?.[bmId]) ? eb.spendAnomalyOverrides.byBm[bmId] : [];
+        res.json({ bmId, overrides });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+router.put('/spend-anomaly-settings', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = spendAnomalyOverridesPayloadSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const b = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+        const settingsLama = ambilSettings(b?.settings);
+        const ebLama = (settingsLama['emergencyBrakeSettings'] ?? {});
+        const byBmLama = ebLama.spendAnomalyOverrides?.byBm ?? {};
+        await prisma.business.update({
+            where: { id: businessId },
+            data: {
+                settings: {
+                    ...settingsLama,
+                    emergencyBrakeSettings: {
+                        landingPages: Array.isArray(ebLama.landingPages) ? ebLama.landingPages : [],
+                        spendAnomalyOverrides: { byBm: { ...byBmLama, [parsed.data.bmId]: parsed.data.overrides } },
+                    },
+                },
+            },
+        });
+        logger.info(`[AiAds] Override Spend Anomaly BM ${parsed.data.bmId} (bisnis ${businessId}) disimpan: ${parsed.data.overrides.length} campaign`);
+        res.json({ ok: true, ...parsed.data, message: 'Override Spend Anomaly disimpan.' });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// ── Landing Page — daftar global (Label + URL doang, tanpa akun/campaign) ──
+// Aktivasi cek per BM diatur di modal BM (business.routes.ts
+// /meta-bms/:id/automation-defaults -> landingPageCheck.enabled). Campaign
+// yang dipause saat URL down dicari otomatis lewat pencocokan destination
+// URL di akun-akun BM yang aktif (menyusul di Fase 3 Langkah 2).
+const landingPageSchema = z.object({
+    label: z.string().optional().default(''),
+    url: z.string().min(1),
+});
+const landingPagesPayloadSchema = z.object({
+    pages: z.array(landingPageSchema).max(200),
+});
+router.get('/landing-pages', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const b = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+        const settings = ambilSettings(b?.settings);
+        const eb = (settings['emergencyBrakeSettings'] ?? {});
+        const pages = Array.isArray(eb.landingPages) ? eb.landingPages : [];
+        res.json({ pages });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+router.put('/landing-pages', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = landingPagesPayloadSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const b = await prisma.business.findUnique({ where: { id: businessId }, select: { settings: true } });
+        const settingsLama = ambilSettings(b?.settings);
+        const ebLama = (settingsLama['emergencyBrakeSettings'] ?? {});
+        await prisma.business.update({
+            where: { id: businessId },
+            data: {
+                settings: {
+                    ...settingsLama,
+                    emergencyBrakeSettings: {
+                        landingPages: parsed.data.pages,
+                        spendAnomalyOverrides: ebLama.spendAnomalyOverrides ?? { byBm: {} },
+                    },
+                },
+            },
+        });
+        logger.info(`[AiAds] Daftar landing page bisnis ${businessId} disimpan: ${parsed.data.pages.length} URL`);
+        res.json({ ok: true, pages: parsed.data.pages, message: 'Daftar landing page disimpan.' });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// ══════════════════════════════════════════════════════════════════════════
+// FASE 3 (2026-08-24): AI Ads Action Center — relay ke API Bridge VPS
+// Antigravity (45.77.247.72). Enam endpoint baru di bawah ini adalah
+// SATU-SATUNYA yang boleh memanggil API Bridge dari backend Sales Pintar.
+//
+// Backend ini TIDAK PERNAH menyentuh `agy`, `execute_mutation.py`, atau
+// skill Python manapun secara langsung — semua lewat HTTP ke API Bridge,
+// diamankan header X-API-Key (env.AI_ADS_BRIDGE_API_KEY).
+//
+// Dua endpoint bridge yang sudah ada dari Fase 2 (TIDAK diubah di sini):
+//   POST /v1/run     — fase REKOMENDASI (ada LLM, agy nulis draft plan ke
+//                       PLANS_DIR di VPS 45, balikin stdout mentah).
+//   POST /v1/execute — fase EKSEKUSI (TANPA LLM, panggil Meta API sungguhan).
+// Satu endpoint bridge BARU, ditambahkan atas persetujuan eksplisit Bossfren
+// 2026-08-24 (lihat projek-ceo/20260824-fase3-langkah1-vps45-approve-endpoint.md):
+//   POST /v1/approve — tandai draft plan jadi "approved" (gerbang wajib
+//                       sebelum /v1/execute mau jalan), TIDAK menyentuh
+//                       agy/execute_mutation.py/skill Python manapun.
+// Plus SATU endpoint baca-saja tambahan (state Sentinel/Emergency Brake,
+// juga disetujui, risiko minimal karena murni fs.readFileSync):
+//   GET  /v1/sentinel-status
+// ══════════════════════════════════════════════════════════════════════════
+/** Lolos-kan karakter khusus HTML sebelum ditempel ke pesan Telegram (parse_mode HTML). */
+function escapeForTelegramLog(text: string) {
+    return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').slice(0, 500);
+}
+// ── Fase 3 Langkah 4 (2026-08-25): busy-tracker global API Bridge VPS45 ──────────────────
+// VPS45 cuma proses SATU agy per satu waktu (concurrency=1, GLOBAL lintas semua caller -- lihat
+// investigasi root-cause ledger 2026-08-25 soal timeout browser 320 detik vs durasi agy nyata yang
+// bisa 10-15 menit). Backend Sales Pintar ini SATU-SATUNYA pemanggil API Bridge (nol caller lain),
+// jadi flag in-process sederhana ini akurat merefleksikan status sungguhan tanpa perlu nanya balik
+// ke VPS45. Dibungkus DI DALAM callBridgeRun() supaya SEMUA caller (health-score,
+// campaign-audit-insight, trigger, global-chat) otomatis kebagian proteksi ini. (copilot-chat
+// dihapus 2026-08-25 -- endpoint yatim, UI-nya sudah diganti Global Agent Workspace sejak Langkah C.)
+// [2026-08-25, Cowork lanjutan] Multi-pool per-feature di sisi Node -- meniru pola yang SUDAH
+// terbukti jalan nyata di VPS45 (api-bridge/server.js, field `pool` di body /v1/run, dipisahkan utk
+// Video Guard dan diverifikasi lewat tes konkuren nyata, lihat ledger). Backend Node ini SEBELUMNYA
+// justru punya guard LEBIH KETAT dari VPS45 sendiri: satu boolean global `agyBusy` yang MENOLAK
+// KERAS (bukan antre) SEMUA caller callBridgeRun -- trigger, health-score, campaign-audit-insight
+// saling mengunci di sini walau VPS45 sudah siap memisahkan mereka ke kolam berbeda. Diganti Map
+// per-nama-kolam (agyBusyByPool) -- pemanggil callBridgeRun sekarang wajib sebut poolName-nya
+// sendiri (lihat masing-masing pemanggil di bawah), dan cuma pool YANG SAMA yang saling menahan.
+const agyBusyByPool = new Map<string, { label: string; since: number }>();
+function getAgyBusyInfo(poolName: string = 'default') {
+    const entry = agyBusyByPool.get(poolName);
+    if (!entry)
+        return { busy: false as const };
+    return { busy: true as const, label: entry.label, sinceMs: Date.now() - entry.since };
+}
+// Jeda minimum sebelum tombol Refresh manual (Health Score & Audit AI Lapis 2) boleh dipakai lagi --
+// Bossfren: "jeda 10-15 menit kali ya baru bsa refresh lg?".
+const REFRESH_COOLDOWN_MS = 12 * 60 * 1000;
+// [2026-08-25] Self-heal utk job background yang macet permanen di RUNNING -- KETEMU NYATA sesi
+// ini: redeploy container (fitur lain) memutus job in-process yang lagi jalan sebelum sempat nulis
+// balik status, baris cache-nya stuck RUNNING selamanya (nol job queue durable, murni Promise
+// in-process). Tombol Refresh frontend ke-disable permanen krn nganggep RUNNING = beneran masih
+// jalan. INVARIAN (nol asumsi soal SEBAB -- RUNNING yang lewat batas waktu maksimum yang legal itu
+// SELALU stale, apapun penyebabnya: restart, VPS45 hang, dll), aman ditinggal permanen. Batas 20
+// menit sengaja lebih longgar dari budget job (15 menit) + margin antrean VPS45.
+const STALE_RUNNING_MS = 20 * 60 * 1000;
+// [2026-08-25 follow-up] Bossfren nanya: kalau popup ditutup, proses tetap jalan & begitu dibuka
+// lagi langsung keisi? Jawabannya YA dari sisi HTTP lifecycle (job background TIDAK terikat ke
+// koneksi browser) -- TAPI ketauan saat dicek ulang bahwa callBridgeRun sendiri masih motong di
+// 320 detik (5.3 menit), padahal popup sudah janji "bisa sampai ~15 menit" dan run nyata
+// sebelumnya pernah makan ~8.7 menit (durationMs 521828, ledger 2026-08-25) -- job background bisa
+// ke-mark ERROR duluan sebelum VPS45 sempat selesai. timeoutMs sekarang bisa di-override PER
+// PANGGILAN: default 320_000 dipertahankan (browser-blocking callers /trigger, /global-chat
+// TETAP gagal cepat, bukan bikin browser nunggu 15 menit), job background pakai
+// budget lebih panjang (lihat pemanggilnya).
+async function callBridgeRun(prompt: string, conversationId?: string, busyLabel: string = 'proses AI', timeoutMs: number = 320_000, poolName: string = 'default') {
+    if (!env.AI_ADS_BRIDGE_URL || !env.AI_ADS_BRIDGE_API_KEY) {
+        return { ok: false, text: '', error: 'AI_ADS_BRIDGE_URL / AI_ADS_BRIDGE_API_KEY belum dikonfigurasi di backend.' };
+    }
+    agyBusyByPool.set(poolName, { label: busyLabel, since: Date.now() });
+    try {
+        const res = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/run`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': env.AI_ADS_BRIDGE_API_KEY },
+            body: JSON.stringify({ prompt, conversationId, pool: poolName }),
+            // agy bisa sampai 5 menit (AGY_TIMEOUT_MS di API Bridge) — beri jeda ekstra. Nilai
+            // aktualnya sekarang datang dari parameter timeoutMs (lihat komentar di atas fungsi).
+            // `pool` diteruskan ke VPS45 supaya kolam antrean per-fitur (lihat komentar di atas
+            // agyBusyByPool) beneran dipakai VPS45, bukan cuma di sisi Node.
+            signal: AbortSignal.timeout(timeoutMs),
+        });
+        const text = await res.text();
+        if (!res.ok) {
+            return { ok: false, text, error: `API Bridge /v1/run balas HTTP ${res.status}` };
+        }
+        return { ok: true, text };
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, text: '', error: `Gagal menghubungi API Bridge: ${msg}` };
+    }
+    finally {
+        agyBusyByPool.delete(poolName);
+    }
+}
+async function callBridgeApprove(planPath: string, approverId: string) {
+    if (!env.AI_ADS_BRIDGE_URL || !env.AI_ADS_BRIDGE_API_KEY) {
+        return { ok: false, error: 'AI_ADS_BRIDGE_URL / AI_ADS_BRIDGE_API_KEY belum dikonfigurasi di backend.' };
+    }
+    try {
+        const res = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/approve`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': env.AI_ADS_BRIDGE_API_KEY },
+            body: JSON.stringify({ planPath, approverId }),
+            signal: AbortSignal.timeout(15_000),
+        });
+        const body: any = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            return { ok: false, error: typeof body.error === 'string' ? body.error : `API Bridge /v1/approve balas HTTP ${res.status}` };
+        }
+        return { ok: true, plan: body.plan };
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: `Gagal menghubungi API Bridge: ${msg}` };
+    }
+}
+async function callBridgeExecute(planPath: string, rollback: boolean = false) {
+    if (!env.AI_ADS_BRIDGE_URL || !env.AI_ADS_BRIDGE_API_KEY) {
+        return { ok: false, error: 'AI_ADS_BRIDGE_URL / AI_ADS_BRIDGE_API_KEY belum dikonfigurasi di backend.' };
+    }
+    try {
+        const res = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/execute`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': env.AI_ADS_BRIDGE_API_KEY },
+            body: JSON.stringify({ planPath, rollback }),
+            signal: AbortSignal.timeout(70_000),
+        });
+        const body: any = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            return { ok: false, error: typeof body.error === 'string' ? body.error : `API Bridge /v1/execute balas HTTP ${res.status}` };
+        }
+        return { ok: true, exitCode: body.exitCode, result: body.result, stderr: body.stderr };
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: `Gagal menghubungi API Bridge: ${msg}` };
+    }
+}
+async function callBridgeListPlans() {
+    if (!env.AI_ADS_BRIDGE_URL || !env.AI_ADS_BRIDGE_API_KEY) {
+        return { ok: false, plans: [], error: 'AI_ADS_BRIDGE_URL / AI_ADS_BRIDGE_API_KEY belum dikonfigurasi di backend.' };
+    }
+    try {
+        const res = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/plans`, {
+            method: 'GET',
+            headers: { 'X-API-Key': env.AI_ADS_BRIDGE_API_KEY },
+            signal: AbortSignal.timeout(15_000),
+        });
+        const body: any = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            return { ok: false, plans: [], error: typeof body.error === 'string' ? body.error : `API Bridge /v1/plans balas HTTP ${res.status}` };
+        }
+        return { ok: true, plans: body.plans ?? [] };
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, plans: [], error: `Gagal menghubungi API Bridge: ${msg}` };
+    }
+}
+/** operation ditulis run_shift.py selalu berakhiran nama shift persis (lihat run_shift.py::_build_plan_skeleton),
+ * mis. "pause_campaign_morning_early_kill" -- jauh lebih tegas daripada nebak dari teks "reason". */
+// [2026-08-25] Tahap 2 (blueprint "Ekstensi Fase 3: Global Agent Workspace & Multi-BM Token
+// Vault" v1.3) -- forward pesan Agent Workspace ke bridge /v1/global-run. businessId WAJIB
+// dipatok dari sesi login backend (req.user!.businessId di route POST /global-chat di bawah,
+// BUKAN dari body request) sesuai Sec2.G blueprint -- parameter di sini cuma meneruskan nilai
+// yang backend sendiri sudah tentukan, bukan sumber kepercayaan baru. Endpoint /v1/global-run
+// di VPS 45 saat ini masih PLACEHOLDER (belum spawn agy) -- lihat komentar di server.js.
+// [2026-08-25] Langkah A (redesign UX Global Agent Workspace) -- ganti dari callBridgeGlobalRun
+// (nunggu 1 blok JSON di akhir) jadi versi streaming: pipe SSE dari /v1/global-run VPS 45 APA
+// ADANYA ke response Express di sini (layer ini TIDAK parse ulang event-nya, cukup teruskan byte
+// demi byte -- kontrak event {type: "conversation_id"|"delta"|"done"|"error", ...} didefinisikan &
+// didokumentasikan di server.js VPS 45). conversation_id yang dikembalikan lewat event SSE itu ASLI
+// dari agy (lewat --conversation), BUKAN label buatan backend lagi seperti sebelumnya.
+//
+// Kalau ada error SEBELUM/DI LUAR proses bridge (env belum dikonfigurasi, fetch gagal, HTTP
+// non-200), errornya ditulis sbg SATU event SSE {type:"error",...} lalu stream ditutup -- TIDAK
+// bisa lagi res.status().json() di titik ini karena header sudah keburu dikirim duluan oleh caller
+// (res.flushHeaders() di route handler /global-chat, SEBELUM function ini dipanggil).
+async function callBridgeGlobalRunStream(
+    businessId: string,
+    message: string,
+    conversationId: string | undefined,
+    res: Response
+): Promise<{ ok: boolean; conversationId?: string; reply?: string; active?: boolean }> {
+    const sendEvent = (obj: Record<string, unknown>) => { res.write(`data: ${JSON.stringify(obj)}\n\n`); };
+    if (!env.AI_ADS_BRIDGE_URL || !env.AI_ADS_BRIDGE_API_KEY) {
+        sendEvent({ type: 'error', message: 'AI_ADS_BRIDGE_URL / AI_ADS_BRIDGE_API_KEY belum dikonfigurasi di backend.' });
+        res.end();
+        return { ok: false };
+    }
+    try {
+        const bridgeRes = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/global-run`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-API-Key': env.AI_ADS_BRIDGE_API_KEY },
+            body: JSON.stringify({ businessId, message, conversationId }),
+            signal: AbortSignal.timeout(320_000),
+        });
+        if (!bridgeRes.ok || !bridgeRes.body) {
+            const bodyText = await bridgeRes.text().catch(() => '');
+            let parsedErr = '';
+            try { parsedErr = JSON.parse(bodyText).error || ''; } catch { /* bodyText bukan JSON, biarkan kosong */ }
+            sendEvent({ type: 'error', message: parsedErr || `API Bridge /v1/global-run balas HTTP ${bridgeRes.status}` });
+            res.end();
+            return { ok: false };
+        }
+
+        // [2026-08-25] Langkah B -- dulu (Langkah A) fungsi ini cuma pipe byte apa adanya tanpa
+        // parse. Sekarang IKUT parse event `conversation_id`/`done` yang lewat (SAMBIL tetap
+        // meneruskan byte mentahnya ke browser real-time lewat res.write() -- bukan nunggu
+        // selesai baru forward) supaya caller bisa PERSIST hasil akhirnya (reply + conversationId)
+        // ke tabel AiAdsGlobalChatSession setelah stream ini kelar.
+        let finalConversationId: string | undefined = conversationId;
+        let finalReply: string | undefined;
+        let finalActive: boolean | undefined;
+        let buf = '';
+
+        await new Promise<void>((resolve, reject) => {
+            const nodeStream = Readable.fromWeb(bridgeRes.body as any);
+            nodeStream.on('data', (chunk: Buffer) => {
+                res.write(chunk);
+                buf += chunk.toString('utf8');
+                let idx: number;
+                while ((idx = buf.indexOf('\n\n')) !== -1) {
+                    const rawEvent = buf.slice(0, idx);
+                    buf = buf.slice(idx + 2);
+                    const dataLine = rawEvent.split('\n').find((l) => l.startsWith('data: '));
+                    if (!dataLine) continue;
+                    try {
+                        const evt = JSON.parse(dataLine.slice(6));
+                        if (evt.type === 'conversation_id' && typeof evt.conversationId === 'string') {
+                            finalConversationId = evt.conversationId;
+                        } else if (evt.type === 'done') {
+                            if (typeof evt.conversationId === 'string') finalConversationId = evt.conversationId;
+                            if (typeof evt.reply === 'string') finalReply = evt.reply;
+                            finalActive = !!evt.active;
+                        }
+                    } catch { /* baris non-JSON (noise) diabaikan */ }
+                }
+            });
+            nodeStream.on('end', () => resolve());
+            nodeStream.on('error', (err: Error) => reject(err));
+        });
+        res.end();
+        return { ok: true, conversationId: finalConversationId, reply: finalReply, active: finalActive };
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        sendEvent({ type: 'error', message: `Gagal menghubungi API Bridge: ${msg}` });
+        res.end();
+        return { ok: false };
+    }
+}
+function shiftTypeFromOperation(operation: any) {
+    if (!operation)
+        return 'MANUAL_TRIGGER';
+    if (operation.endsWith('morning_early_kill'))
+        return 'MORNING_EARLY_KILL';
+    if (operation.endsWith('midday_pacing'))
+        return 'MID_DAY_PACING';
+    if (operation.endsWith('golden_hour_scaling'))
+        return 'GOLDEN_HOUR_SCALING';
+    return 'MANUAL_TRIGGER';
+}
+/**
+ * Lapis 1 (Fase 3 Langkah 3 redesign, 2026-08-24): fakta audit satu campaign,
+ * DIHITUNG LANGSUNG di backend Node -- TIDAK lewat agy/API Bridge VPS 45 sama
+ * sekali -- supaya popup "Audit AI" muncul dalam hitungan detik, bukan menit.
+ * Data: Meta Insights (spend/clicks/ctr/frequency, time_increment=1 7 hari
+ * terakhir) + funnel leads->closing->omset dari database Sales Pintar sendiri
+ * (keunggulan kita dibanding tools lain -- funnel sampai closing CS, bukan
+ * cuma sampai leads). Angka di sini adalah SUMBER KEBENARAN -- Lapis 2 (LLM)
+ * TIDAK boleh menghitung ulang, cuma menafsirkan angka yang sudah pasti benar
+ * di sini (mencegah LLM salah hitung/mengarang angka).
+ */
+async function computeCampaignAuditFacts(businessId: string, objectId: string, campaignNameHint?: string) {
+    const warnings = [];
+    const todayStr = toJakartaDateStr(new Date());
+    const last7 = getRecentJakartaDateList(7);
+    const sinceStr = last7[0];
+    const bms = await prisma.metaBusinessManager.findMany({ where: { businessId, isActive: true } });
+    let campaignName = campaignNameHint || objectId;
+    let status = 'UNKNOWN';
+    let dailyBudget = null;
+    let learningPhase = 'UNKNOWN';
+    let auditOptimizationGoal: string | undefined;
+    let auditCustomEventType: string | undefined;
+    let todaySpend = 0;
+    let todayClicks = 0;
+    let todayImpressions = 0;
+    let todayCtr = 0;
+    let todayFrequency = 0;
+    let sumSpend7d = 0;
+    let sumClicks7d = 0;
+    let sumImpressions7d = 0;
+    const ctr7dList = [];
+    const freq7dList = [];
+    let foundInsights = false;
+    let objective = 'UNKNOWN';
+    let todayActions: { action_type: string; value: string }[] = [];
+    let todayCostPerAction: { action_type: string; value: string }[] = [];
+    // Fix 2026-08-25 (lapor Bossfren): SEBELUMNYA "7 hari" dihitung dengan MENJUMLAHKAN actions
+    // tiap hari lintas SEMUA action_type yang cocok predicate (mis. "purchase") -- padahal Meta
+    // sering nyatet SATU konversi yang sama di banyak action_type sekaligus (omni_purchase,
+    // onsite_web_purchase, offsite_conversion.fb_pixel_purchase, dll, semua nilainya SAMA).
+    // Hasilnya Result kehitung 5-7x lipat dan CPR jadi jauh lebih murah dari kenyataan (beda
+    // sama tabel drill-down & Meta Ads Manager asli). Sekarang: (1) ambil SATU aggregate row
+    // Meta buat 7 hari penuh (bukan dijumlah manual per hari) supaya "Result" 7 hari = angka
+    // asli dari Meta, bukan hasil re-hitung kita: (2) pas nyari actions/cost_per_action_type,
+    // pakai .find() (match PERTAMA saja, persis kayak getMetaResultAndCpr() di frontend), BUKAN
+    // dijumlah semua yang cocok.
+    let aggActions: { action_type: string; value: string }[] = [];
+    let aggCostPerAction: { action_type: string; value: string }[] = [];
+    for (const bm of bms) {
+        const token = decrypt(bm.accessToken);
+        if (!token)
+            continue;
+        try {
+            const query = new URLSearchParams({
+                fields: 'spend,clicks,ctr,frequency,impressions,campaign_name,actions,cost_per_action_type',
+                time_range: JSON.stringify({ since: sinceStr, until: todayStr }),
+                time_increment: '1',
+                access_token: token,
+            });
+            const insResp = await fetch(`https://graph.facebook.com/v21.0/${objectId}/insights?${query}`);
+            if (!insResp.ok)
+                continue;
+            const insData: any = await insResp.json();
+            const rows = insData.data || [];
+            if (rows.length === 0)
+                continue;
+            foundInsights = true;
+            for (const row of rows) {
+                const rowDate = row.date_start;
+                const spend = parseFloat(row.spend || '0');
+                const clicks = parseInt(row.clicks || '0', 10);
+                const impressions = parseInt(row.impressions || '0', 10);
+                const ctr = parseFloat(row.ctr || '0');
+                const frequency = parseFloat(row.frequency || '0');
+                if (row.campaign_name)
+                    campaignName = row.campaign_name;
+                sumSpend7d += spend;
+                sumClicks7d += clicks;
+                sumImpressions7d += impressions;
+                ctr7dList.push(ctr);
+                freq7dList.push(frequency);
+                if (rowDate === todayStr) {
+                    todaySpend = spend;
+                    todayClicks = clicks;
+                    todayImpressions = impressions;
+                    todayCtr = ctr;
+                    todayFrequency = frequency;
+                    todayActions = Array.isArray(row.actions) ? row.actions : [];
+                    todayCostPerAction = Array.isArray(row.cost_per_action_type) ? row.cost_per_action_type : [];
+                }
+            }
+            // Aggregate 1 baris buat 7 hari penuh (TANPA time_increment) -- ini sumber Result/CPR
+            // 7-hari yang otoritatif dari Meta sendiri, bukan hasil jumlah manual per hari.
+            try {
+                const aggQuery = new URLSearchParams({
+                    fields: 'spend,actions,cost_per_action_type',
+                    time_range: JSON.stringify({ since: sinceStr, until: todayStr }),
+                    access_token: token,
+                });
+                const aggResp = await fetch(`https://graph.facebook.com/v21.0/${objectId}/insights?${aggQuery}`);
+                if (aggResp.ok) {
+                    const aggData: any = await aggResp.json();
+                    const aggRow = (aggData.data || [])[0];
+                    if (aggRow) {
+                        aggActions = Array.isArray(aggRow.actions) ? aggRow.actions : [];
+                        aggCostPerAction = Array.isArray(aggRow.cost_per_action_type) ? aggRow.cost_per_action_type : [];
+                    }
+                }
+            }
+            catch (aggErr) {
+                warnings.push(`Gagal fetch aggregate insight 7 hari: ${aggErr instanceof Error ? aggErr.message : String(aggErr)}`);
+            }
+            break;
+        }
+        catch (err) {
+            warnings.push(`Gagal fetch insight Meta: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    if (!foundInsights) {
+        warnings.push('Tidak ada data insight Meta ditemukan untuk campaign ini pada 7 hari terakhir (mungkin campaign baru/belum ada spend, atau token BM tidak punya akses ke campaign ini).');
+    }
+    for (const bm of bms) {
+        const token = decrypt(bm.accessToken);
+        if (!token)
+            continue;
+        try {
+            const campResp = await fetch(`https://graph.facebook.com/v21.0/${objectId}?fields=name,effective_status,daily_budget,objective&access_token=${token}`);
+            if (campResp.ok) {
+                const campData: any = await campResp.json();
+                if (campData.name)
+                    campaignName = campData.name;
+                if (campData.effective_status)
+                    status = campData.effective_status;
+                if (campData.daily_budget)
+                    dailyBudget = parseFloat(campData.daily_budget);
+                if (campData.objective)
+                    objective = campData.objective;
+            }
+            // Fix 2026-08-25 (lapor Bossfren): field learning_stage_info Meta cuma punya 3 nilai resmi
+            // -- LEARNING / SUCCESS / FAIL (BUKAN "LEARNING_LIMITED", itu istilah lama yang gak pernah
+            // benar-benar dibalikin API). Field ini juga sifatnya TRANSIENT -- ad set yang udah lama
+            // stabil (exit learning berbulan-bulan lalu) sering kali TIDAK dibalikin sama sekali oleh
+            // Meta (bukan berarti statusnya "tidak diketahui"), jadi kalau ada adset AKTIF tapi field-nya
+            // kosong, anggap "Sudah Keluar Learning" -- bukan UNKNOWN.
+            const adsetResp = await fetch(`https://graph.facebook.com/v21.0/${objectId}/adsets?fields=name,effective_status,learning_stage_info,optimization_goal,promoted_object&limit=50&access_token=${token}`);
+            if (adsetResp.ok) {
+                const adsetData = (await adsetResp.json());
+                const allFetchedAdsets = ((adsetData as any)?.data || []);
+                const activeAdsets = allFetchedAdsets.filter((a: any) => a.effective_status === 'ACTIVE');
+                const stages = activeAdsets.map((a: any) => a.learning_stage_info?.status).filter(Boolean);
+                if (stages.includes('LEARNING'))
+                    learningPhase = 'LEARNING';
+                else if (stages.includes('FAIL'))
+                    learningPhase = 'FAIL';
+                else if (activeAdsets.length > 0)
+                    learningPhase = 'ACTIVE';
+                // [2026-08-26] Ground truth optimization_goal/custom_event_type (Opsi 2) --
+                // mixed-detection: kalau semua ad set sepakat, pakai itu; kalau ada yg beda,
+                // undefined (ambigu, biar resolver jatuh ke heuristik objective lama).
+                let firstSeen = true;
+                for (const as of allFetchedAdsets) {
+                    const og = (as as any).optimization_goal;
+                    const cet = (as as any).promoted_object?.custom_event_type;
+                    if (firstSeen) {
+                        auditOptimizationGoal = og;
+                        auditCustomEventType = cet;
+                        firstSeen = false;
+                    } else if (auditOptimizationGoal !== og || auditCustomEventType !== cet) {
+                        auditOptimizationGoal = undefined;
+                        auditCustomEventType = undefined;
+                    }
+                }
+            }
+            // Fix 2026-08-25 (lapor Bossfren): SEBELUMNYA loop ini "break" tanpa syarat setelah BM
+            // PERTAMA dicoba -- kalau BM pertama di daftar businessId TERNYATA bukan pemilik campaign
+            // ini (fetch gagal/403, token gak punya akses), status/budget/objective/learning phase
+            // ketinggalan default (UNKNOWN/null) SELAMANYA, walau BM lain di daftar sebenarnya punya
+            // akses. Sekarang: cuma berhenti begitu BENERAN dapat data (campResp.ok) dari salah satu
+            // BM -- BM yang gagal akses akan dilewati, lanjut coba BM berikutnya.
+            if (campResp.ok) {
+                break;
+            }
+        }
+        catch (err) {
+            warnings.push(`Gagal fetch status/budget/learning phase: ${err instanceof Error ? err.message : String(err)}`);
+        }
+    }
+    const avgCtr7d = ctr7dList.length > 0 ? ctr7dList.reduce((a, b) => a + b, 0) / ctr7dList.length : 0;
+    const avgFreq7d = freq7dList.length > 0 ? freq7dList.reduce((a, b) => a + b, 0) / freq7dList.length : 0;
+    const dateFilter7d = getWibDateRange(sinceStr, todayStr);
+    const leadsRows = await prisma.lead.findMany({
+        where: { businessId, metaCampaignId: objectId, ...(dateFilter7d ? { createdAt: dateFilter7d } : {}) },
+        select: { createdAt: true, confirmedCodAmount: true, capiEventsSent: true },
+    });
+    let todayLeads = 0;
+    let todayClosing = 0;
+    let todayOmset = 0;
+    let sumLeads7d = 0;
+    let sumClosing7d = 0;
+    let sumOmset7d = 0;
+    for (const lead of leadsRows) {
+        const leadDateStr = toJakartaDateStr(lead.createdAt);
+        const isCapiPurchase = Array.isArray(lead.capiEventsSent) && lead.capiEventsSent.includes('Purchase');
+        const amount = isCapiPurchase ? Number(lead.confirmedCodAmount) || 0 : 0;
+        sumLeads7d += 1;
+        if (isCapiPurchase) {
+            sumClosing7d += 1;
+            sumOmset7d += amount;
+        }
+        if (leadDateStr === todayStr) {
+            todayLeads += 1;
+            if (isCapiPurchase) {
+                todayClosing += 1;
+                todayOmset += amount;
+            }
+        }
+    }
+    // Result & CPR HARUS identik logikanya sama getMetaResultAndCpr() di
+    // frontend/src/app/app/meta-capi-dashboard/page.tsx -- kalau salah satu
+    // diubah, WAJIB diubah bareng, supaya angka Result/CPR di popup Audit AI
+    // dan tabel drill-down tidak beda definisi. Fix 2026-08-24 (lapor Bossfren):
+    // SEBELUMNYA CPR di sini dihitung dari Leads WA internal (cost per lead),
+    // BUKAN dari Result Meta (cost per hasil sesuai objective campaign) --
+    // beda konsep total dari yang ditampilkan Meta Ads Manager/tabel drill-down.
+    // [2026-08-26] Ground-truth resolver (Opsi 1+2+3) -- konsolidasi dgn business.routes.ts,
+    // ganti heuristik lokal duplikat (predicate cascade lama sudah pindah SATU implementasi ke
+    // meta-result-resolver.service.ts, semantik dipertahankan persis + ground truth kalau ada).
+    const { matchedType, source: resultSource } = resolveMatchedType({
+        objective,
+        actions: aggActions,
+        costPerActionType: aggCostPerAction,
+        spend: sumSpend7d,
+        optimizationGoal: auditOptimizationGoal,
+        customEventType: auditCustomEventType,
+        campaignId: objectId,
+        campaignName
+    });
+    const { resultLabel, badgeLabel: resultBadgeLabel } = getResultLabels(matchedType);
+    const { resultValue: todayResult, cprValue: todayCprMeta } = computeResultValue(matchedType, todayActions, todayCostPerAction, todaySpend);
+    const todayRoas = todaySpend > 0 ? todayOmset / todaySpend : 0;
+    const avgRoas7d = sumSpend7d > 0 ? sumOmset7d / sumSpend7d : 0;
+    const todayCpr = todayCprMeta > 0 ? todayCprMeta : (todayResult > 0 ? todaySpend / todayResult : 0);
+    const todayCpp = todayClosing > 0 ? todaySpend / todayClosing : 0;
+    const { resultValue: sumResult7d, cprValue: avgCprMeta } = computeResultValue(matchedType, aggActions, aggCostPerAction, sumSpend7d);
+    const avgCpr7d = avgCprMeta > 0 ? avgCprMeta : (sumResult7d > 0 ? sumSpend7d / sumResult7d : 0);
+    const avgCpp7d = sumClosing7d > 0 ? sumSpend7d / sumClosing7d : 0;
+    const todayClickToLeadRatePct = todayClicks > 0 ? (todayLeads / todayClicks) * 100 : 0;
+    const avgClickToLeadRatePct = sumClicks7d > 0 ? (sumLeads7d / sumClicks7d) * 100 : 0;
+    const todayLeadToCloseRatePct = todayLeads > 0 ? (todayClosing / todayLeads) * 100 : 0;
+    const avgLeadToCloseRatePct = sumLeads7d > 0 ? (sumClosing7d / sumLeads7d) * 100 : 0;
+    let weakestStage = 'none';
+    const ctrDropPct = avgCtr7d > 0 ? ((avgCtr7d - todayCtr) / avgCtr7d) * 100 : 0;
+    const clickToLeadDropPct = avgClickToLeadRatePct > 0 ? ((avgClickToLeadRatePct - todayClickToLeadRatePct) / avgClickToLeadRatePct) * 100 : 0;
+    const leadToCloseDropPct = avgLeadToCloseRatePct > 0 ? ((avgLeadToCloseRatePct - todayLeadToCloseRatePct) / avgLeadToCloseRatePct) * 100 : 0;
+    if (leadToCloseDropPct >= 30 && leadToCloseDropPct >= clickToLeadDropPct && leadToCloseDropPct >= ctrDropPct) {
+        weakestStage = 'cs_closing';
+    }
+    else if (clickToLeadDropPct >= 30 && clickToLeadDropPct >= ctrDropPct) {
+        weakestStage = 'landing_lead';
+    }
+    else if (ctrDropPct >= 30) {
+        weakestStage = 'ads';
+    }
+    // Fix 2026-08-25 (lapor Bossfren): verdict SEBELUMNYA wajib "todayLeads > 0" (leads WA internal)
+    // buat lolos dari "Data Belum Cukup" -- padahal banyak campaign (kayak GSM | ID | Win, optimasi
+    // Pembelian Situs Web) TIDAK PERNAH lewat WA/CS sama sekali, jadi verdict permanen macet di
+    // "Data Belum Cukup" walau histori 7 harinya jelas ada & sehat. Sekarang: (1) sufficiency dicek
+    // dari ADA/TIDAKNYA aktivitas iklan Meta hari ini (spend/impresi), bukan leads WA; (2) kalau
+    // campaign ini gak pernah closing lewat WA sama sekali (omset WA 0 baik hari ini maupun 7 hari),
+    // verdict SCALE/MAINTAIN/ATTENTION dinilai dari tren CPR hari ini vs rata-rata 7 hari (bukan
+    // ROAS WA yang emang gak relevan buat campaign begini); campaign yang beneran ada closing WA
+    // tetap pakai ROAS seperti sebelumnya.
+    const rpVerdict = (n: number) => `Rp${Math.round(n).toLocaleString('id-ID')}`;
+    const hasWaFunnelData = sumOmset7d > 0 || todayOmset > 0;
+    let verdict;
+    let verdictReason;
+    if (!foundInsights || (todaySpend <= 0 && todayImpressions <= 0)) {
+        verdict = 'BELUM_CUKUP_DATA';
+        verdictReason = 'Belum ada aktivitas iklan (spend/impresi) dari Meta hari ini, tunggu data lebih banyak sebelum bikin keputusan.';
+    }
+    else if (hasWaFunnelData) {
+        if (todayRoas >= 3.5) {
+            verdict = 'SCALE';
+            verdictReason = `ROAS hari ini ${todayRoas.toFixed(2)}x, di atas ambang scale (3.5x).`;
+        }
+        else if (todayRoas >= 2.5) {
+            verdict = 'MAINTAIN';
+            verdictReason = `ROAS hari ini ${todayRoas.toFixed(2)}x, masih sehat tapi belum di ambang scale.`;
+        }
+        else {
+            verdict = 'ATTENTION';
+            verdictReason = `ROAS hari ini ${todayRoas.toFixed(2)}x, di bawah ambang aman (2.5x).`;
+        }
+    }
+    else if (todayResult > 0 && avgCpr7d > 0) {
+        const cprDeltaPct = ((todayCpr - avgCpr7d) / avgCpr7d) * 100;
+        if (cprDeltaPct <= -15) {
+            verdict = 'SCALE';
+            verdictReason = `CPR (${resultBadgeLabel}) hari ini ${rpVerdict(todayCpr)}, ${Math.abs(cprDeltaPct).toFixed(0)}% lebih murah dari rata-rata 7 hari (${rpVerdict(avgCpr7d)}).`;
+        }
+        else if (cprDeltaPct <= 15) {
+            verdict = 'MAINTAIN';
+            verdictReason = `CPR (${resultBadgeLabel}) hari ini ${rpVerdict(todayCpr)}, masih sepadan dengan rata-rata 7 hari (${rpVerdict(avgCpr7d)}).`;
+        }
+        else {
+            verdict = 'ATTENTION';
+            verdictReason = `CPR (${resultBadgeLabel}) hari ini ${rpVerdict(todayCpr)}, ${cprDeltaPct.toFixed(0)}% lebih mahal dari rata-rata 7 hari (${rpVerdict(avgCpr7d)}).`;
+        }
+    }
+    else {
+        verdict = 'BELUM_CUKUP_DATA';
+        verdictReason = `Sudah ada spend ${rpVerdict(todaySpend)} & ${todayImpressions} impresi hari ini, tapi belum ada Result (${resultLabel !== '-' ? resultLabel : 'hasil'}) -- tunggu beberapa jam lagi sebelum bikin keputusan.`;
+    }
+    const spendTodayPct = dailyBudget && dailyBudget > 0 ? (todaySpend / dailyBudget) * 100 : null;
+    const n = last7.length || 1;
+    return {
+        campaignName,
+        status,
+        matchedType,
+        resultSource,
+        today: {
+            date: todayStr,
+            spend: todaySpend,
+            clicks: todayClicks,
+            impressions: todayImpressions,
+            ctr: todayCtr,
+            frequency: todayFrequency,
+            leads: todayLeads,
+            closing: todayClosing,
+            omset: todayOmset,
+            roas: todayRoas,
+            cpr: todayCpr,
+            cpp: todayCpp,
+            result: todayResult,
+            resultLabel,
+            badgeLabel: resultBadgeLabel,
+        },
+        avg7d: {
+            date: `rata-rata ${n} hari terakhir`,
+            spend: sumSpend7d / n,
+            clicks: Math.round(sumClicks7d / n),
+            impressions: Math.round(sumImpressions7d / n),
+            ctr: avgCtr7d,
+            frequency: avgFreq7d,
+            leads: sumLeads7d / n,
+            closing: sumClosing7d / n,
+            omset: sumOmset7d / n,
+            roas: avgRoas7d,
+            cpr: avgCpr7d,
+            cpp: avgCpp7d,
+            result: sumResult7d / n,
+            resultLabel,
+            badgeLabel: resultBadgeLabel,
+        },
+        funnel: {
+            todayClickToLeadRatePct,
+            avg7dClickToLeadRatePct: avgClickToLeadRatePct,
+            todayLeadToCloseRatePct,
+            avg7dLeadToCloseRatePct: avgLeadToCloseRatePct,
+            weakestStage,
+        },
+        delivery: { dailyBudget, spendTodayPct, learningPhase, frequencyFlag: todayFrequency > 2.5 },
+        verdict,
+        verdictReason,
+        fetchedAt: new Date().toISOString(),
+        warnings,
+    };
+}
+/** Lapis 2: susun prompt buat agy menafsirkan fakta Lapis 1 gaya senior media buyer. */
+function buildCampaignAuditPrompt(campaignName: string, f: any) {
+    const pct = (n: number) => `${n.toFixed(1)}%`;
+    const rp = (n: number) => `Rp${Math.round(n).toLocaleString('id-ID')}`;
+    const weakestLabel: Record<string, string> = {
+        ads: 'kualitas iklan/audiens (CTR turun)',
+        landing_lead: 'landing page / form (klik tidak jadi leads)',
+        cs_closing: 'follow-up CS (leads tidak jadi closing)',
+        none: 'tidak ada tahap yang menonjol turun signifikan',
+    };
+    return (`Kamu berperan sebagai senior media buyer berpengalaman. Berikut data TERVERIFIKASI (sudah dihitung dari Meta Insights + database internal, JANGAN diragukan atau dihitung ulang, JANGAN mengarang angka lain) untuk campaign "${campaignName}" (status: ${f.status}) per ${f.today.date}:\n\n` +
+        `RINGKASAN HARI INI vs RATA-RATA 7 HARI TERAKHIR:\n` +
+        `- Spend: ${rp(f.today.spend)} vs rata-rata ${rp(f.avg7d.spend)}/hari\n` +
+        `- CTR: ${pct(f.today.ctr)} vs rata-rata ${pct(f.avg7d.ctr)}\n` +
+        `- Frequency: ${f.today.frequency.toFixed(2)}x${f.delivery.frequencyFlag ? ' (peringatan: tinggi, indikasi ad fatigue)' : ''}\n` +
+        `- Klik -> Leads: ${pct(f.funnel.todayClickToLeadRatePct)} vs rata-rata ${pct(f.funnel.avg7dClickToLeadRatePct)}\n` +
+        `- Leads -> Closing (CS): ${pct(f.funnel.todayLeadToCloseRatePct)} vs rata-rata ${pct(f.funnel.avg7dLeadToCloseRatePct)}\n` +
+        `- Result Meta (${f.today.resultLabel}): ${f.today.result} unit hari ini, CPR (${f.today.badgeLabel}): ${rp(f.today.cpr)}, CPP (cost per closing CS/WA nyata): ${rp(f.today.cpp)}\n` +
+        `- ROAS: ${f.today.roas.toFixed(2)}x vs rata-rata ${f.avg7d.roas.toFixed(2)}x\n` +
+        `- Learning phase: ${f.delivery.learningPhase}\n` +
+        `- Pacing budget hari ini: ${f.delivery.spendTodayPct !== null ? pct(f.delivery.spendTodayPct) : 'tidak diketahui'} dari daily budget${f.delivery.dailyBudget ? ` ${rp(f.delivery.dailyBudget)}` : ''}\n` +
+        `- Diagnosis awal otomatis (boleh kamu koreksi kalau kamu lihat pola lain yang lebih tepat): tahap paling melemah = ${weakestLabel[f.funnel.weakestStage] || f.funnel.weakestStage}\n` +
+        (f.warnings.length > 0 ? `- Catatan data: ${f.warnings.join('; ')}\n` : '') +
+        `\nTUGAS: berikan analisis SINGKAT gaya senior media buyer (maksimal sekitar 200 kata, bahasa Indonesia santai tapi tegas), mencakup:\n` +
+        `1. Diagnosis akar masalah -- bukan cuma mengulang angka di atas, tapi JELASKAN kenapa itu terjadi & apa artinya buat campaign ini.\n` +
+        `2. 1-3 rekomendasi tindakan konkret & spesifik, urut prioritas.\n` +
+        `3. Kalau campaign ini memang sehat, bilang jelas "lanjutkan, jangan diutak-atik dulu" dan alasannya.\n\n` +
+        `Boleh manggil skill ads-next kalau perlu cross-check quick wins tambahan. JANGAN mengeksekusi perubahan apa pun ke Meta API -- ini murni analisis baca-saja.`);
+}
+/**
+ * Best-effort: agy (LLM CLI) BELUM PERNAH menghasilkan plan sungguhan di
+ * produksi saat kode ini ditulis (PLANS_DIR/meta/ di VPS 45 masih kosong),
+ * jadi bentuk pasti stdout-nya belum terverifikasi dengan data nyata.
+ * Dua heuristik dicoba berurutan:
+ *   1. Cari objek JSON tertanam dengan "artifact_type":"mutation-plan" di
+ *      stdout, ambil plan_id + created_at → susun planPath standar
+ *      `meta/<YYYY-MM-DD dari created_at>/<plan_id>.json` (pola dari
+ *      contoh di README API Bridge: "meta/2026-08-23/plan-xxx.json").
+ *   2. Kalau gagal, cari token path relatif berakhiran .json di teks.
+ * Kalau keduanya gagal, planPath null — rekomendasi tetap disimpan (supaya
+ * tidak hilang) tapi ditandai perlu pengecekan manual sebelum bisa di-approve.
+ */
+function extractPlanPathFromAgyOutput(text: string) {
+    const jsonObjectMatches = text.match(/\{[\s\S]*?"artifact_type"\s*:\s*"mutation-plan"[\s\S]*?\n\}/);
+    if (jsonObjectMatches) {
+        try {
+            const candidate = JSON.parse(jsonObjectMatches[0]);
+            const planId = typeof candidate.plan_id === 'string' ? candidate.plan_id : null;
+            const createdAt = typeof candidate.created_at === 'string' ? candidate.created_at : null;
+            if (planId && createdAt) {
+                const datePart = createdAt.slice10;
+                return { planPath: `meta/${datePart}/${planId}.json`, planSummary: candidate };
+            }
+            return { planPath: null, planSummary: candidate };
+        }
+        catch {
+            // lanjut ke heuristik 2
+        }
+    }
+    const pathMatch = text.match(/\bmeta\/[\w.\-\/]+\.json\b/);
+    if (pathMatch) {
+        return { planPath: pathMatch[0], planSummary: null };
+    }
+    return { planPath: null, planSummary: null };
+}
+function ringkasShiftType(shiftType: any) {
+    const label: Record<string, string> = {
+        MORNING_EARLY_KILL: 'Morning Early-Kill (09:00 WIB)',
+        MID_DAY_PACING: 'Mid-Day Pacing (13:00 WIB)',
+        GOLDEN_HOUR_SCALING: 'Golden Hour Scaling (16:00 WIB)',
+        ADHOC_COPILOT: 'Konsultasi Copilot',
+        MANUAL_TRIGGER: 'Trigger Manual',
+    };
+    return label[shiftType] || shiftType;
+}
+const triggerSchema = z.object({
+    bmId: z.string().min(1),
+    shiftType: z.enum(['MORNING_EARLY_KILL', 'MID_DAY_PACING', 'GOLDEN_HOUR_SCALING', 'MANUAL_TRIGGER']),
+    objectId: z.string().min(1),
+    objectName: z.string().optional().default(''),
+    adAccountId: z.string().min(1),
+    promptTambahan: z.string().max(2000).optional().default(''),
+});
+// ── POST /ai-ads/trigger — mulai FASE ANALISA (panggil agy lewat /v1/run) ──
+router.post('/trigger', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = triggerSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { bmId, shiftType, objectId, objectName, adAccountId, promptTambahan } = parsed.data;
+        const prompt = `Jalankan evaluasi shift "${ringkasShiftType(shiftType)}" untuk campaign ${objectName || objectId} ` +
+            `(object_id=${objectId}, ad_account_id=${adAccountId}) memakai skill ads-shift. Ambil data spend/klik/konversi/` +
+            `revenue terbaru dari Meta Insights, hitung metrik dasar, evaluasi gate yang sesuai, dan kalau triggered=true ` +
+            `susun MutationPlan v1 berstatus "draft" mengikuti mutation-plan.schema.json + Mutation Gate (ads/SKILL.md), ` +
+            `simpan ke PLANS_DIR. Jangan pernah mengeksekusi apa pun ke Meta API — hanya siapkan draft plan untuk ditinjau ` +
+            `manusia.${promptTambahan ? `\n\nKonteks tambahan dari Bossfren: ${promptTambahan}` : ''}`;
+        const conversationId = `ai-ads-${businessId}-${Date.now()}`;
+        const bridgeResult = await callBridgeRun(prompt, conversationId, 'Trigger evaluasi shift (Sentinel/Emergency Radar)', 320_000, 'ai-ads-shift');
+        if (!bridgeResult.ok) {
+            logger.error(`[AiAds] /trigger gagal panggil API Bridge: ${bridgeResult.error}`);
+            res.status(502).json({ error: { message: bridgeResult.error || 'API Bridge gagal dipanggil.' } });
+            return;
+        }
+        const { planPath, planSummary } = extractPlanPathFromAgyOutput(bridgeResult.text);
+        const rec = await (prisma as any).aiAdsRecommendation.create({
+            data: {
+                businessId,
+                bmId,
+                shiftType,
+                status: 'PENDING_APPROVAL',
+                conversationId,
+                planPath,
+                planSummary: planSummary ?? client_1.Prisma.JsonNull,
+                rawAgyOutput: bridgeResult.text.slice(0, 50000),
+                requestedBy: req.user!.userId,
+            },
+        });
+        if (!planPath) {
+            logger.warn(`[AiAds] /trigger: planPath tidak terdeteksi otomatis dari output agy (recommendation ${rec.id}) — perlu cek manual sebelum approve.`);
+            void sendTelegram(`⚠️ <b>AI Ads — planPath tidak terdeteksi</b>\nRekomendasi ${ringkasShiftType(shiftType)} untuk ${objectName || objectId} tersimpan (id ${rec.id}), tapi lokasi file plan tidak ketemu otomatis dari output agy. Cek manual di /app/ai-ads sebelum approve.`);
+        }
+        else {
+            void sendTelegram(`🤖 <b>AI Ads — rekomendasi baru</b>\n${ringkasShiftType(shiftType)} — ${objectName || objectId}\nMenunggu approval Bossfren di /app/ai-ads.`);
+        }
+        res.status(201).json({ recommendation: rec });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// ── GET /ai-ads/plans — daftar rekomendasi (Action Center) ────────────────
+router.get('/plans', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const status = typeof req.query.status === 'string' ? req.query.status : undefined;
+        const bmId = typeof req.query.bmId === 'string' ? req.query.bmId : undefined;
+        const plans = await (prisma as any).aiAdsRecommendation.findMany({
+            where: {
+                businessId,
+                ...(status ? { status: status } : {}),
+                ...(bmId ? { bmId } : {}),
+            },
+            orderBy: { createdAt: 'desc' },
+            take: 100,
+        });
+        res.json({ plans });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+const syncCronPlansSchema = z.object({ bmId: z.string().min(1) });
+// ── POST /ai-ads/sync-cron-plans — tarik draft plan hasil cron run_shift.py ──
+// run_shift.py (VPS Antigravity) nulis MutationPlan LANGSUNG ke PLANS_DIR,
+// TIDAK lewat /trigger, jadi tidak otomatis masuk DB. Endpoint ini AKSI
+// EKSPLISIT (tombol "Sinkronkan dari Cron" di /app/ai-ads), BUKAN polling --
+// dia manggil Meta API sekali (token BM yang dipilih) buat dapat daftar
+// ad_account_id BM itu, cocokkan ke account_id tiap plan draft di VPS 45
+// (via GET /v1/plans, baca-saja), lalu upsert baris AiAdsRecommendation baru
+// (skip yang sudah pernah masuk, dicek dari planPath) supaya lanjut approve/
+// reject/execute lewat jalur yang SAMA PERSIS dengan trigger manual.
+router.post('/sync-cron-plans', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = syncCronPlansSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { bmId } = parsed.data;
+        const bm = await prisma.metaBusinessManager.findFirst({ where: { id: bmId, businessId } });
+        if (!bm) {
+            res.status(404).json({ error: { message: 'BM tidak ditemukan' } });
+            return;
+        }
+        const token = decrypt(bm.accessToken);
+        if (!token) {
+            res.status(422).json({ error: { message: 'Token BM tidak valid, tidak bisa cocokkan akun iklan.' } });
+            return;
+        }
+        let adAccountIds = [];
+        try {
+            const adAccResp = await fetch(`https://graph.facebook.com/v21.0/me/adaccounts?fields=id&access_token=${token}`);
+            if (adAccResp.ok) {
+                const adAccData: any = await adAccResp.json();
+                adAccountIds = (adAccData.data || []).map((a: any) => a.id);
+            }
+        }
+        catch (err) {
+            logger.warn(`[AiAds] /sync-cron-plans gagal fetch ad accounts BM ${bmId}: ${err}`);
+        }
+        if (adAccountIds.length === 0) {
+            res.status(502).json({ error: { message: 'Gagal ambil daftar akun iklan BM ini dari Meta -- coba lagi sebentar.' } });
+            return;
+        }
+        const bridgeResult = await callBridgeListPlans();
+        if (!bridgeResult.ok) {
+            res.status(502).json({ error: { message: bridgeResult.error || 'API Bridge /v1/plans gagal dipanggil.' } });
+            return;
+        }
+        const kandidat = bridgeResult.plans.filter((p: any) => p.status === 'draft' && !!p.accountId && adAccountIds.includes(p.accountId));
+        let masuk = 0;
+        let dilewati = 0;
+        for (const p of kandidat) {
+            if (!p.planPath)
+                continue;
+            const sudahAda = await (prisma as any).aiAdsRecommendation.findFirst({ where: { businessId: req.user!.businessId, planPath: p.planPath } });
+            if (sudahAda) {
+                dilewati++;
+                continue;
+            }
+            await (prisma as any).aiAdsRecommendation.create({
+                data: {
+                    businessId,
+                    bmId,
+                    shiftType: shiftTypeFromOperation(p.operation),
+                    status: 'PENDING_APPROVAL',
+                    planPath: p.planPath,
+                    planSummary: {
+                        reason: p.reason ?? null,
+                        blast_radius: p.blastRadius ?? null,
+                        operation: p.operation ?? null,
+                        account_id: p.accountId ?? null,
+                        object_id: p.objectId ?? null,
+                    },
+                    requestedBy: 'cron:run_shift.py',
+                },
+            });
+            masuk++;
+        }
+        if (masuk > 0) {
+            void sendTelegram(`🤖 <b>AI Ads — ${masuk} rekomendasi baru dari cron 3-Shift</b>\nBM: ${bm.name}. Menunggu approval Bossfren di /app/ai-ads.`);
+        }
+        res.json({ ok: true, masuk, dilewati, totalDitemukanDiVps45: bridgeResult.plans.length });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// === KETERANGAN PENGERJAAN ===
+// File ini dimodifikasi oleh: Antigravity (Gemini), 2026-08-29
+// Fase: 7A (Backend Endpoints — POST /approve extend content_review)
+// Claude dapat trackback ke sesi Antigravity 2026-08-29 siang (konv ID: 26b52cab)
+// ============================
+const approveSchema = z.object({
+    id: z.string().min(1),
+    // [Fase 7A] selected_option: untuk content_review yang punya beberapa opsi (mis. Layer 11 hooks),
+    // tim kreatif bisa pilih opsi mana yang di-approve sebelum eksekusi manual.
+    // Null/undefined = approve semua / opsi default.
+    selected_option: z.number().int().nonnegative().optional(),
+});
+// ── POST /ai-ads/approve — approve rekomendasi (perilaku beda per routingType) ─
+// - routingType = "mutation" (atau shiftType lama): approve + langsung eksekusi ke Meta API via Bridge
+// - routingType = "content_review": hanya mark APPROVED di DB (eksekusi manual oleh tim kreatif)
+//   [ITEM TERBUKA: full execution via API Bridge untuk Layer 11/13 ditunda — keputusan 2026-08-29]
+router.post('/approve', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = approveSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const rec = await (prisma as any).aiAdsRecommendation.findFirst({ where: { id: parsed.data.id, businessId } });
+        if (!rec) {
+            res.status(404).json({ error: { message: 'Rekomendasi tidak ditemukan' } });
+            return;
+        }
+        // [Fase 7A] content_review: bypass validasi planPath — hanya mark APPROVED, tidak eksekusi
+        if (rec.routingType === 'content_review') {
+            if (rec.status !== 'PENDING_APPROVAL') {
+                res.status(409).json({ error: { message: `Rekomendasi berstatus '${rec.status}', tidak bisa di-approve.` } });
+                return;
+            }
+            const updateData: any = {
+                status: 'APPROVED',
+                approvedBy: req.user!.userId,
+                approvedAt: new Date(),
+            };
+            // Simpan opsi yang dipilih tim kreatif ke executionResult (bukan eksekusi ke Meta)
+            if (parsed.data.selected_option !== undefined) {
+                updateData.executionResult = { selectedOption: parsed.data.selected_option, approvedAt: new Date().toISOString(), note: 'Eksekusi manual oleh tim kreatif' };
+            }
+            const updated = await (prisma as any).aiAdsRecommendation.update({
+                where: { id: rec.id },
+                data: updateData,
+            });
+            logger.info(`[AiAds] /approve content_review: rec ${rec.id} (${rec.layerKey}) di-approve untuk eksekusi manual tim kreatif.`);
+            void sendTelegram(`✅ <b>AI Ads — Content Review Disetujui</b>\nLayer: ${rec.layerKey ?? '-'}\nDisetujui oleh admin untuk eksekusi manual tim kreatif.\nID: ${rec.id}`);
+            res.json({ recommendation: updated, note: 'content_review: APPROVED di DB. Eksekusi dilakukan manual oleh tim kreatif.' });
+            return;
+        }
+        // ── Jalur mutation (lama + layer_mutation baru) ──────────────────────
+        if (!rec.planPath) {
+            res.status(422).json({ error: { message: 'Rekomendasi ini tidak punya planPath terdeteksi — tidak bisa di-approve otomatis, perlu cek manual.' } });
+            return;
+        }
+        // EXECUTION_FAILED diizinkan lewat sini juga -- retry eksekusi ulang tanpa approve ulang
+        // (file plan di VPS 45 sudah kadung berstatus approved dari percobaan pertama).
+        if (rec.status !== 'PENDING_APPROVAL' && rec.status !== 'APPROVED' && rec.status !== 'EXECUTION_FAILED') {
+            res.status(409).json({ error: { message: `Rekomendasi berstatus '${rec.status}', tidak bisa di-approve.` } });
+            return;
+        }
+        let current = rec;
+        // Kalau sebelumnya sudah APPROVED tapi eksekusi gagal, langsung coba
+        // eksekusi ulang tanpa approve ulang (file plan di VPS 45 sudah approved).
+        if (current.status === 'PENDING_APPROVAL') {
+            const approveResult = await callBridgeApprove(current.planPath, req.user!.userId);
+            if (!approveResult.ok) {
+                logger.error(`[AiAds] /approve gagal di gerbang approve (rec ${current.id}): ${approveResult.error}`);
+                res.status(502).json({ error: { message: approveResult.error || 'Gagal menandai plan sebagai approved di API Bridge.' } });
+                return;
+            }
+            current = await (prisma as any).aiAdsRecommendation.update({
+                where: { id: current.id },
+                data: { status: 'APPROVED', approvedBy: req.user!.userId, approvedAt: new Date() },
+            });
+        }
+        const executeResult = await callBridgeExecute(current.planPath);
+        if (!executeResult.ok || executeResult.exitCode !== 0) {
+            const errMsg = executeResult.error || `execute_mutation.py exitCode=${executeResult.exitCode}, stderr: ${executeResult.stderr?.slice(0, 500) || '(kosong)'}`;
+            logger.error(`[AiAds] /approve: eksekusi gagal (rec ${current.id}): ${errMsg}`);
+            current = await (prisma as any).aiAdsRecommendation.update({
+                where: { id: current.id },
+                data: { status: 'EXECUTION_FAILED', executionResult: executeResult },
+            });
+            void sendTelegram(`❌ <b>AI Ads — eksekusi gagal</b>\nRekomendasi ${current.id} (${ringkasShiftType(current.shiftType)}) sudah di-approve tapi eksekusi ke Meta API gagal: ${escapeForTelegramLog(errMsg)}\nBisa dicoba lagi lewat tombol Approve di /app/ai-ads.`);
+            res.status(502).json({ error: { message: errMsg }, recommendation: current });
+            return;
+        }
+        current = await (prisma as any).aiAdsRecommendation.update({
+            where: { id: current.id },
+            data: {
+                status: 'EXECUTED',
+                executionResult: executeResult,
+                executedAt: new Date(),
+            },
+        });
+        void sendTelegram(`✅ <b>AI Ads — eksekusi berhasil</b>\n${ringkasShiftType(current.shiftType)} sudah diterapkan ke Meta Ads. (rekomendasi ${current.id})`);
+        res.json({ recommendation: current });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+const rejectSchema = z.object({ id: z.string().min(1), reason: z.string().max(500).optional().default('') });
+// ── POST /ai-ads/reject — tolak rekomendasi (TIDAK menyentuh VPS 45) ──────
+router.post('/reject', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = rejectSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const rec = await (prisma as any).aiAdsRecommendation.findFirst({ where: { id: parsed.data.id, businessId } });
+        if (!rec) {
+            res.status(404).json({ error: { message: 'Rekomendasi tidak ditemukan' } });
+            return;
+        }
+        if (rec.status !== 'PENDING_APPROVAL') {
+            res.status(409).json({ error: { message: `Rekomendasi berstatus '${rec.status}', tidak bisa ditolak.` } });
+            return;
+        }
+        const updated = await (prisma as any).aiAdsRecommendation.update({
+            where: { id: rec.id },
+            data: { status: 'REJECTED', rejectedBy: req.user!.userId, rejectedAt: new Date(), rejectionReason: parsed.data.reason },
+        });
+        res.json({ recommendation: updated });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// ── GET /ai-ads/sentinel-status — status Emergency Brake (relay baca-saja) ─
+router.get('/sentinel-status', async (_req, res, next) => {
+    try {
+        if (!env.AI_ADS_BRIDGE_URL || !env.AI_ADS_BRIDGE_API_KEY) {
+            res.json({ available: false, message: 'API Bridge belum dikonfigurasi di backend.' });
+            return;
+        }
+        const r = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/sentinel-status`, {
+            headers: { 'X-API-Key': env.AI_ADS_BRIDGE_API_KEY },
+            signal: AbortSignal.timeout(10_000),
+        });
+        const body = await r.json().catch(() => ({}));
+        if (!r.ok) {
+            res.json({ available: false, message: `API Bridge balas HTTP ${r.status}` });
+            return;
+        }
+        res.json({ available: true, ...(body as any) });
+    }
+    catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logger.warn(`[AiAds] /sentinel-status gagal menghubungi API Bridge: ${msg}`);
+        res.json({ available: false, message: 'Tidak bisa menghubungi API Bridge saat ini.' });
+    }
+});
+const campaignAuditSchema = z.object({
+    objectId: z.string().min(1),
+    objectName: z.string().optional().default(''),
+});
+// ── POST /ai-ads/campaign-audit-facts — Lapis 1: fakta instan per campaign ──
+// (Fase 3 Langkah 3 redesign 2026-08-24) Murni Node + Meta API + DB sendiri,
+// TIDAK lewat agy/API Bridge VPS 45 -- respons dalam hitungan detik, dipakai
+// popup "Audit AI" di /app/meta-capi-dashboard supaya klik = langsung ada
+// angka, bukan nunggu LLM buat data yang sebenarnya murni aritmatika.
+router.post('/campaign-audit-facts', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = campaignAuditSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const facts = await computeCampaignAuditFacts(businessId, parsed.data.objectId, parsed.data.objectName);
+        res.json({ facts });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+const campaignAuditInsightSchema = z.object({
+    objectId: z.string().min(1),
+    objectName: z.string().optional().default(''),
+    facts: z.record(z.any()),
+});
+// ── POST /ai-ads/campaign-audit-insight — Lapis 2: analisa senior media buyer ──
+// Terima fakta yang SAMA PERSIS dengan yang sudah ditampilkan di popup dari
+// /campaign-audit-facts (dikirim balik oleh frontend, bukan dihitung ulang di
+// sini) supaya LLM menafsirkan angka yang identik dengan yang dilihat user --
+// lewat agy/API Bridge VPS 45, bisa 1-5 menit, dipanggil terpisah dari Lapis 1
+// biar popup gak nge-block nunggu LLM buat nampilin fakta duluan.
+// [2026-08-25] Redesign Bossfren: Lapis 2 (butuh agy, bisa 1-5 menit) sekarang NON-BLOCKING --
+// endpoint ini cuma TRIGGER (validasi + cek busy/cooldown + upsert baris cache RUNNING + balas
+// langsung), job agy sungguhan jalan di background lewat runAuditInsightJob() dan nulis hasilnya ke
+// baris cache yang sama begitu selesai. Popup baca hasilnya lewat GET /campaign-audit-insight/cache
+// (di bawah), termasuk polling selagi status RUNNING. Lapis 1 (campaign-audit-facts) TIDAK diubah
+// sama sekali -- tetap live/sync setiap dibuka sesuai instruksi eksplisit Bossfren.
+router.post('/campaign-audit-insight', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = campaignAuditInsightSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { objectId, objectName, facts } = parsed.data;
+        const busyInfo = getAgyBusyInfo('ai-ads-audit');
+        if (busyInfo.busy) {
+            res.json({ queued: false, busy: true, message: `Masih ada proses lain sedang jalan di server (${busyInfo.label}) -- tunggu dulu, coba refresh lagi dalam beberapa menit.` });
+            return;
+        }
+        const existing = await prisma.aiAdsAuditInsightCache.findUnique({
+            where: { businessId_campaignId: { businessId, campaignId: objectId } },
+        });
+        if (existing?.lastRequestedAt) {
+            const elapsedMs = Date.now() - existing.lastRequestedAt.getTime();
+            if (elapsedMs < REFRESH_COOLDOWN_MS && existing.status !== 'ERROR') {
+                const retryAfterSec = Math.ceil((REFRESH_COOLDOWN_MS - elapsedMs) / 1000);
+                res.json({ queued: false, cooldown: true, retryAfterSec, message: `Baru saja di-refresh. Coba lagi dalam ~${Math.ceil(retryAfterSec / 60)} menit.` });
+                return;
+            }
+        }
+        const cacheRow = await prisma.aiAdsAuditInsightCache.upsert({
+            where: { businessId_campaignId: { businessId, campaignId: objectId } },
+            create: { businessId, campaignId: objectId, status: 'RUNNING', lastRequestedAt: new Date() },
+            update: { status: 'RUNNING', lastRequestedAt: new Date(), errorMessage: null },
+        });
+        res.json({ queued: true, message: 'Analisa AI dimulai di server, hasil muncul otomatis di sini (bisa sampai beberapa menit).' });
+        // Fire-and-forget SENGAJA -- respons SUDAH dikirim di atas, ini fix struktural biar hasil
+        // telat gak hilang lagi kalau browser disconnect duluan (lihat catatan busy-tracker di atas).
+        runAuditInsightJob(cacheRow.id, businessId, objectId, objectName, facts).catch((err) => {
+            logger.error(`[AiAds/AuditInsight] Background job gagal total: ${err}`);
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+async function runAuditInsightJob(cacheId: string, businessId: string, objectId: string, objectName: string, facts: any) {
+    try {
+        const prompt = buildCampaignAuditPrompt(objectName || facts.campaignName || objectId, facts);
+        const conversationId = `ai-ads-copilot-${businessId}-${objectId}`;
+        const bridgeResult = await callBridgeRun(prompt, conversationId, `Audit AI campaign ${objectName || objectId}`, 900_000, 'ai-ads-audit');
+        if (!bridgeResult.ok) {
+            await prisma.aiAdsAuditInsightCache.update({
+                where: { id: cacheId },
+                data: { status: 'ERROR', errorMessage: (bridgeResult.error || 'API Bridge gagal dipanggil.').slice(0, 2000), lastCompletedAt: new Date() },
+            });
+            return;
+        }
+        await prisma.aiAdsAuditInsightCache.update({
+            where: { id: cacheId },
+            data: { status: 'DONE', insight: bridgeResult.text, errorMessage: null, lastCompletedAt: new Date(), conversationId },
+        });
+    }
+    catch (err) {
+        logger.error(`[AiAds/AuditInsight] runAuditInsightJob error: ${err}`);
+        await prisma.aiAdsAuditInsightCache.update({
+            where: { id: cacheId },
+            data: { status: 'ERROR', errorMessage: String(err).slice(0, 2000), lastCompletedAt: new Date() },
+        }).catch(() => {});
+    }
+}
+// ── GET /ai-ads/campaign-audit-insight/cache — baca cache Lapis 2 (popup langsung nongol + polling
+// selagi RUNNING) TANPA memicu job baru. ──────────────────────────────────────────────────────
+router.get('/campaign-audit-insight/cache', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const campaignId = String(req.query.campaignId || '');
+        if (!campaignId) {
+            res.status(400).json({ error: { message: 'campaignId wajib diisi.' } });
+            return;
+        }
+        let row = await prisma.aiAdsAuditInsightCache.findUnique({
+            where: { businessId_campaignId: { businessId, campaignId } },
+        });
+        if (row && row.status === 'RUNNING' && row.lastRequestedAt && Date.now() - row.lastRequestedAt.getTime() > STALE_RUNNING_MS) {
+            row = await prisma.aiAdsAuditInsightCache.update({
+                where: { id: row.id },
+                data: {
+                    status: 'ERROR',
+                    errorMessage: 'Proses sebelumnya sepertinya terhenti (lebih dari 20 menit tanpa update, kemungkinan server sempat restart). Klik Refresh untuk coba lagi.',
+                    lastCompletedAt: new Date(),
+                },
+            });
+        }
+        const busyInfo = getAgyBusyInfo('ai-ads-audit');
+        const cooldownRemainingSec = row?.lastRequestedAt
+            ? Math.max(0, Math.ceil((REFRESH_COOLDOWN_MS - (Date.now() - row.lastRequestedAt.getTime())) / 1000))
+            : 0;
+        res.json({
+            cache: row
+                ? {
+                    status: row.status,
+                    insight: row.insight,
+                    errorMessage: row.errorMessage,
+                    lastRequestedAt: row.lastRequestedAt,
+                    lastCompletedAt: row.lastCompletedAt,
+                    conversationId: row.conversationId,
+                }
+                : null,
+            agyBusy: busyInfo.busy,
+            cooldownRemainingSec,
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// [2026-08-26] Analisa AI Top Creatives (meta-capi-dashboard "Top Creatives by CTR" widget) --
+// gantikan template hardcoded "Analisis & Rekomendasi Senior Media Buyer" (dulu cuma if/else
+// berdasarkan qualityRanking+ctr, NOL panggilan LLM) jadi analisa copy sungguhan lewat agy.
+// Beda TOTAL dari campaign-audit-insight: yang dianalisa di sini adalah COPY iklan (headline +
+// body) satu ad spesifik, bukan performa campaign. Pola cache/refresh/cooldown/self-heal SAMA
+// PERSIS dgn health-score/campaign-audit-insight, kolam sendiri 'ai-ads-creative' (permintaan
+// Bossfren: agy CLI mendukung banyak proses paralel independen, jangan numpang di kolam lain).
+// Data ad (headline/body/ctr/ranking) dikirim balik oleh frontend dari yang sudah difetch
+// /business/meta-top-creatives -- NOL panggilan Meta API baru dari endpoint ini.
+function buildCreativeInsightPrompt(ad: {
+    adName: string;
+    campaignName: string;
+    adTitle: string;
+    adBody: string;
+    ctr: number;
+    spend: number;
+    impressions: number;
+    qualityRanking: string;
+    engagementRanking: string;
+    conversionRanking: string;
+}): string {
+    return `Analisa copy iklan Meta ini secara spesifik dan actionable -- INI ANALISA COPY SUNGGUHAN, bukan template generik/basa-basi.
+
+DATA IKLAN (real, dari akun produksi SalesPintar):
+- Nama ad: ${ad.adName}
+- Campaign: ${ad.campaignName}
+- Headline/Title: "${ad.adTitle || '(tidak ada / auto-generated Meta)'}"
+- Body copy: """
+${ad.adBody || '(tidak ada body text terpisah)'}
+"""
+- CTR: ${ad.ctr.toFixed(2)}%
+- Spend: Rp${Math.round(ad.spend)}
+- Impressions: ${ad.impressions}
+- Quality Ranking (Meta, relatif ke kompetitor objective+audiens serupa): ${ad.qualityRanking}
+- Engagement Ranking: ${ad.engagementRanking}
+- Conversion Ranking: ${ad.conversionRanking}
+
+ATURAN WAJIB:
+- JANGAN kasih verdict generik kayak "creative ini kuat" tanpa bukti. Setiap skor & alasan HARUS
+  menyebut kata/frasa SPESIFIK dari headline/body di atas, atau angka ranking/CTR asli. Dilarang:
+  "copy-nya lemah" tanpa nama frasa. Wajib gaya: 'Headline "..." pakai kata X yang generik, kehilangan peluang Y.'
+- Kalau Quality/Engagement/Conversion Ranking berstatus "UNKNOWN" atau tidak dievaluasi Meta,
+  JANGAN dianggap buruk -- itu cuma berarti objective campaign di luar cakupan ranking standar
+  Meta (misal Leads/WhatsApp/CPAS). Anchor verdict ke ranking yang TERSEDIA + CTR saja.
+- JANGAN mengarang statistik/lift persentase presisi -- pakai istilah terarah ("directional: +20-40%").
+
+FASE 1 -- VERDICT KESELURUHAN, anchor ke Quality Ranking + CTR asli (BUKAN benchmark generik,
+karena ranking Meta sendiri sudah peer-relative terhadap kompetitor serupa):
+- scale_up: Quality Ranking ABOVE_AVERAGE ATAU CTR jauh di atas rata-rata akun ini.
+- maintain_watch: ranking AVERAGE dan CTR wajar, tidak ada sinyal buruk mencolok.
+- needs_refresh: Quality/Engagement Ranking BELOW_AVERAGE tapi CTR masih ada traksi (jangan
+  langsung dimatikan, tapi copy perlu diperbaiki).
+- consider_kill: BELOW_AVERAGE di banyak ranking DAN CTR juga rendah -- sinyal ganda kelemahan.
+
+FASE 2 -- SKOR 5 LEVER COPY (0-10, alasan WAJIB sebut frasa spesifik dari headline/body):
+- emotional_trigger: apakah menyentuh perasaan (FOMO, kebanggaan, takut rugi, identitas)?
+- specificity: ada angka, nama spesifik, klaim konkret?
+- urgency: ada bahasa waktu-terbatas/kelangkaan?
+- power_words: kata kerja aksi yang menggerakkan (bukan filler kayak "dapatkan"/"temukan" doang)?
+- relevance: apakah copy relevan sama audiens/produk yang dijual?
+
+FASE 3 -- REWRITE (persis 3, prioritaskan 3 lever dengan skor TERENDAH):
+Tiap rewrite: { lever_targeted, before (frasa ASLI dari headline/body di atas), after (versi
+baru), expected_lift_directional (string terarah, BUKAN angka presisi dikarang) }.
+
+FASE 4 -- SATU versi rewrite holistik yang menggabungkan semua perbaikan di atas jadi satu
+headline+body baru yang koheren (bukan tempelan lepas-lepas).
+
+Return HANYA JSON valid:
+{
+  "verdict": "scale_up|maintain_watch|needs_refresh|consider_kill",
+  "verdict_reason": "string -- sebut angka CTR/ranking asli",
+  "lever_scores": {
+    "emotional_trigger": { "score": 0, "reason": "string -- sebut frasa spesifik" },
+    "specificity": { "score": 0, "reason": "string" },
+    "urgency": { "score": 0, "reason": "string" },
+    "power_words": { "score": 0, "reason": "string" },
+    "relevance": { "score": 0, "reason": "string" }
+  },
+  "rewrites": [
+    { "lever_targeted": "string", "before": "string", "after": "string", "expected_lift_directional": "string" }
+  ],
+  "full_rewritten_version": "string"
+}`;
+}
+function extractCreativeInsightFromAgyOutput(text: string) {
+    const match = text.match(/\{[\s\S]*?"verdict"\s*:\s*"[^"]*"[\s\S]*?\n\}/);
+    if (!match)
+        return null;
+    try {
+        return JSON.parse(match[0]);
+    }
+    catch {
+        return null;
+    }
+}
+const creativeInsightSchema = z.object({
+    adId: z.string().min(1),
+    adName: z.string().optional().default(''),
+    campaignName: z.string().optional().default(''),
+    adTitle: z.string().optional().default(''),
+    adBody: z.string().optional().default(''),
+    ctr: z.number(),
+    spend: z.number().optional().default(0),
+    impressions: z.number().optional().default(0),
+    qualityRanking: z.string().optional().default('UNKNOWN'),
+    engagementRanking: z.string().optional().default('UNKNOWN'),
+    conversionRanking: z.string().optional().default('UNKNOWN'),
+});
+// ── POST /ai-ads/creative-insight — analisa copy 1 ad spesifik (popup "Top Creatives") ──
+// Non-blocking dari awal (bukan retrofit kayak health-score) -- endpoint cuma trigger, agy
+// sungguhan jalan di background lewat runCreativeInsightJob(), hasil dibaca via GET
+// /creative-insight/cache (termasuk polling selagi RUNNING).
+router.post('/creative-insight', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = creativeInsightSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { adId } = parsed.data;
+        const busyInfo = getAgyBusyInfo('ai-ads-creative');
+        if (busyInfo.busy) {
+            res.json({ queued: false, busy: true, message: `Masih ada proses lain sedang jalan di server (${busyInfo.label}) -- tunggu dulu, coba refresh lagi dalam beberapa menit.` });
+            return;
+        }
+        const existing = await prisma.aiAdsCreativeInsightCache.findUnique({
+            where: { businessId_adId: { businessId, adId } },
+        });
+        if (existing?.lastRequestedAt) {
+            const elapsedMs = Date.now() - existing.lastRequestedAt.getTime();
+            if (elapsedMs < REFRESH_COOLDOWN_MS && existing.status !== 'ERROR') {
+                const retryAfterSec = Math.ceil((REFRESH_COOLDOWN_MS - elapsedMs) / 1000);
+                res.json({ queued: false, cooldown: true, retryAfterSec, message: `Baru saja di-refresh. Coba lagi dalam ~${Math.ceil(retryAfterSec / 60)} menit.` });
+                return;
+            }
+        }
+        const cacheRow = await prisma.aiAdsCreativeInsightCache.upsert({
+            where: { businessId_adId: { businessId, adId } },
+            create: { businessId, adId, status: 'RUNNING', lastRequestedAt: new Date() },
+            update: { status: 'RUNNING', lastRequestedAt: new Date(), errorMessage: null },
+        });
+        res.json({ queued: true, message: 'Analisa AI dimulai di server, hasil muncul otomatis di sini (bisa sampai beberapa menit).' });
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        runCreativeInsightJob(cacheRow.id, parsed.data).catch((err) => {
+            logger.error(`[AiAds/CreativeInsight] Background job gagal total: ${err}`);
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+async function runCreativeInsightJob(cacheId: string, ad: z.infer<typeof creativeInsightSchema>) {
+    try {
+        const prompt = buildCreativeInsightPrompt(ad);
+        const conversationId = `ai-ads-creative-${ad.adId}-${Date.now()}`;
+        const bridgeResult = await callBridgeRun(prompt, conversationId, `Analisa Creative ${ad.adName || ad.adId}`, 900_000, 'ai-ads-creative');
+        if (!bridgeResult.ok) {
+            await prisma.aiAdsCreativeInsightCache.update({
+                where: { id: cacheId },
+                data: { status: 'ERROR', errorMessage: (bridgeResult.error || 'API Bridge gagal dipanggil.').slice(0, 2000), lastCompletedAt: new Date() },
+            });
+            return;
+        }
+        const parsedInsight = extractCreativeInsightFromAgyOutput(bridgeResult.text);
+        const insightResult = parsedInsight ? { structured: true, ...parsedInsight } : { structured: false, rawText: bridgeResult.text.slice(0, 20000) };
+        await prisma.aiAdsCreativeInsightCache.update({
+            where: { id: cacheId },
+            data: { status: 'DONE', result: insightResult, errorMessage: null, lastCompletedAt: new Date(), conversationId },
+        });
+    }
+    catch (err) {
+        logger.error(`[AiAds/CreativeInsight] runCreativeInsightJob error: ${err}`);
+        await prisma.aiAdsCreativeInsightCache.update({
+            where: { id: cacheId },
+            data: { status: 'ERROR', errorMessage: String(err).slice(0, 2000), lastCompletedAt: new Date() },
+        }).catch(() => {});
+    }
+}
+// ── GET /ai-ads/creative-insight/cache — baca cache analisa creative (popup langsung nongol +
+// polling selagi RUNNING) TANPA memicu job baru. ──────────────────────────────────────────────
+router.get('/creative-insight/cache', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const adId = String(req.query.adId || '');
+        if (!adId) {
+            res.status(400).json({ error: { message: 'adId wajib diisi.' } });
+            return;
+        }
+        let row = await prisma.aiAdsCreativeInsightCache.findUnique({
+            where: { businessId_adId: { businessId, adId } },
+        });
+        if (row && row.status === 'RUNNING' && row.lastRequestedAt && Date.now() - row.lastRequestedAt.getTime() > STALE_RUNNING_MS) {
+            row = await prisma.aiAdsCreativeInsightCache.update({
+                where: { id: row.id },
+                data: {
+                    status: 'ERROR',
+                    errorMessage: 'Proses sebelumnya sepertinya terhenti (lebih dari 20 menit tanpa update, kemungkinan server sempat restart). Klik Refresh untuk coba lagi.',
+                    lastCompletedAt: new Date(),
+                },
+            });
+        }
+        const busyInfo = getAgyBusyInfo('ai-ads-creative');
+        const cooldownRemainingSec = row?.lastRequestedAt
+            ? Math.max(0, Math.ceil((REFRESH_COOLDOWN_MS - (Date.now() - row.lastRequestedAt.getTime())) / 1000))
+            : 0;
+        res.json({
+            cache: row
+                ? {
+                    status: row.status,
+                    result: row.result,
+                    errorMessage: row.errorMessage,
+                    lastRequestedAt: row.lastRequestedAt,
+                    lastCompletedAt: row.lastCompletedAt,
+                }
+                : null,
+            agyBusy: busyInfo.busy,
+            cooldownRemainingSec,
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// [2026-08-26] Layer 2 "Top Ad Fatigue" (meta-capi-dashboard, tombol kedua di kartu Top
+// Creatives) -- rumus decay%/severity/skor-sinyal SUDAH dihitung Node murni matematika di
+// GET /business/meta-ad-fatigue (Layer 1, DETERMINISTIK, nol agy). Endpoint ini (Layer 2) cuma
+// diminta bikinin bagian yang butuh bahasa/kreativitas: refresh_options (3 tier effort),
+// new_angles_to_test, kill_threshold -- diadaptasi dari OpenAdKit lib/prompts/ad-fatigue.ts
+// PHASE 4-6 (lokal, MIT), TAPI agy tidak diminta re-hitung decay/severity (sudah given, anggap
+// fakta) supaya angka yang tampil di popup selalu konsisten sama badge severity di grid card.
+// Pool sendiri 'ai-ads-fatigue' spy nggak antre sama fitur agy lain (trigger/health/audit/creative).
+function buildFatigueInsightPrompt(input: {
+    adName: string;
+    campaignName: string;
+    adTitle: string;
+    adBody: string;
+    platform: string;
+    daysRunning: number | string;
+    currentFrequency: number | string;
+    computedDecay: { reachDecay: string; ctrDecay: string; cpmCreep: string; notes: string };
+    severityOverall: string;
+    severityReason: string;
+    signals: Record<string, { score: number; reading: string; thresholdBreached: boolean }>;
+}): string {
+    return `Ad ini SUDAH terdiagnosis fatigue lewat perhitungan matematika (bukan tugasmu menghitung
+ulang) -- tugasmu HANYA meresepkan tindakan refresh yang konkret & bisa langsung dieksekusi.
+
+DATA IKLAN (real, dari akun produksi SalesPintar):
+- Nama ad: ${input.adName}
+- Campaign: ${input.campaignName}
+- Platform: ${input.platform}
+- Hari berjalan: ${input.daysRunning}
+- Headline/Title: "${input.adTitle || '(tidak ada / auto-generated Meta)'}"
+- Body copy: """
+${input.adBody || '(tidak ada body text terpisah)'}
+"""
+
+DIAGNOSA YANG SUDAH DIHITUNG (anggap FAKTA, jangan dipertanyakan/dihitung ulang):
+- Reach decay: ${input.computedDecay.reachDecay}
+- CTR decay: ${input.computedDecay.ctrDecay}
+- CPM creep: ${input.computedDecay.cpmCreep}
+- Catatan: ${input.computedDecay.notes || '-'}
+- Frekuensi saat ini: ${input.currentFrequency}
+- Severity keseluruhan: ${input.severityOverall} -- alasan: ${input.severityReason}
+- Sinyal per kategori: ${JSON.stringify(input.signals)}
+
+ATURAN WAJIB:
+- Setiap rekomendasi HARUS actionable & spesifik ke copy/creative di atas (bukan saran generik
+  "coba ganti kreatif"). Kalau menyebut ganti hook/headline, tunjukkan CONTOH kalimat barunya.
+- JANGAN mengarang angka lift presisi -- pakai istilah terarah ("directional: +20-40%").
+- new_angles_to_test HARUS beda dari angle yang sudah dipakai di copy saat ini di atas.
+
+FASE 1 -- PRESKRIPSI 3 OPSI REFRESH per tingkat effort:
+LOW EFFORT (1-2 jam): reorder hook, ganti visual/thumbnail pembuka, ganti kata CTA.
+MEDIUM EFFORT (setengah hari): angle baru dgn offer sama, varian native/UGC, B-roll/musik baru.
+HIGH EFFORT (1-2 hari): offer baru, positioning baru, ekspansi audiens baru.
+Tiap item: { action, specific_change (konkret, copy-paste actionable), expected_lift (directional) }.
+
+FASE 2 -- 5 ANGLE BARU UNTUK DITES, beda dari angle yang dipakai copy di atas.
+
+FASE 3 -- KILL THRESHOLD: satu aturan konkret yang bisa dipakai user tiap minggu (contoh: "kalau
+frekuensi > 4 dan CTR < 0.5% selama 3+ hari, matikan dan ganti").
+
+Return HANYA JSON valid:
+{
+  "refresh_options": {
+    "low_effort": [{ "action": "string", "specific_change": "string", "expected_lift": "string" }],
+    "medium_effort": [{ "action": "string", "specific_change": "string", "expected_lift": "string" }],
+    "high_effort": [{ "action": "string", "specific_change": "string", "expected_lift": "string" }]
+  },
+  "new_angles_to_test": [
+    { "angle": "string", "angle_label": "pain|outcome|social_proof|curiosity|comparison|urgency|identity|contrarian", "rationale": "string" }
+  ],
+  "kill_threshold": "string"
+}`;
+}
+function extractFatigueInsightFromAgyOutput(text: string) {
+    const match = text.match(/\{[\s\S]*?"kill_threshold"[\s\S]*?\}/);
+    if (!match)
+        return null;
+    try {
+        return JSON.parse(match[0]);
+    }
+    catch {
+        return null;
+    }
+}
+const fatigueInsightSchema = z.object({
+    adId: z.string().min(1),
+    adName: z.string().optional().default(''),
+    campaignName: z.string().optional().default(''),
+    adTitle: z.string().optional().default(''),
+    adBody: z.string().optional().default(''),
+    platform: z.string().optional().default('Meta Feed'),
+    daysRunning: z.union([z.number(), z.string()]).optional().default(0),
+    currentFrequency: z.union([z.number(), z.string()]).optional().default(0),
+    computedDecay: z.object({
+        reachDecay: z.string().optional().default('could not be computed'),
+        ctrDecay: z.string().optional().default('could not be computed'),
+        cpmCreep: z.string().optional().default('could not be computed'),
+        notes: z.string().optional().default(''),
+    }).optional().default({}),
+    severityOverall: z.string().optional().default('none'),
+    severityReason: z.string().optional().default(''),
+    signals: z.record(z.any()).optional().default({}),
+});
+// ── POST /ai-ads/fatigue-insight — resepkan refresh options utk 1 ad fatigue spesifik (popup
+// "Top Ad Fatigue") ── Non-blocking, pola sama persis dgn creative-insight/health-score.
+router.post('/fatigue-insight', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = fatigueInsightSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { adId } = parsed.data;
+        const busyInfo = getAgyBusyInfo('ai-ads-fatigue');
+        if (busyInfo.busy) {
+            res.json({ queued: false, busy: true, message: `Masih ada proses lain sedang jalan di server (${busyInfo.label}) -- tunggu dulu, coba refresh lagi dalam beberapa menit.` });
+            return;
+        }
+        const existing = await prisma.aiAdsFatigueInsightCache.findUnique({
+            where: { businessId_adId: { businessId, adId } },
+        });
+        if (existing?.lastRequestedAt) {
+            const elapsedMs = Date.now() - existing.lastRequestedAt.getTime();
+            if (elapsedMs < REFRESH_COOLDOWN_MS && existing.status !== 'ERROR') {
+                const retryAfterSec = Math.ceil((REFRESH_COOLDOWN_MS - elapsedMs) / 1000);
+                res.json({ queued: false, cooldown: true, retryAfterSec, message: `Baru saja di-refresh. Coba lagi dalam ~${Math.ceil(retryAfterSec / 60)} menit.` });
+                return;
+            }
+        }
+        const cacheRow = await prisma.aiAdsFatigueInsightCache.upsert({
+            where: { businessId_adId: { businessId, adId } },
+            create: { businessId, adId, status: 'RUNNING', lastRequestedAt: new Date() },
+            update: { status: 'RUNNING', lastRequestedAt: new Date(), errorMessage: null },
+        });
+        res.json({ queued: true, message: 'Analisa AI dimulai di server, hasil muncul otomatis di sini (bisa sampai beberapa menit).' });
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        runFatigueInsightJob(cacheRow.id, parsed.data).catch((err) => {
+            logger.error(`[AiAds/FatigueInsight] Background job gagal total: ${err}`);
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+async function runFatigueInsightJob(cacheId: string, ad: z.infer<typeof fatigueInsightSchema>) {
+    try {
+        const prompt = buildFatigueInsightPrompt(ad as any);
+        const conversationId = `ai-ads-fatigue-${ad.adId}-${Date.now()}`;
+        const bridgeResult = await callBridgeRun(prompt, conversationId, `Analisa Fatigue ${ad.adName || ad.adId}`, 900_000, 'ai-ads-fatigue');
+        if (!bridgeResult.ok) {
+            await prisma.aiAdsFatigueInsightCache.update({
+                where: { id: cacheId },
+                data: { status: 'ERROR', errorMessage: (bridgeResult.error || 'API Bridge gagal dipanggil.').slice(0, 2000), lastCompletedAt: new Date() },
+            });
+            return;
+        }
+        const parsedInsight = extractFatigueInsightFromAgyOutput(bridgeResult.text);
+        const insightResult = parsedInsight ? { structured: true, ...parsedInsight } : { structured: false, rawText: bridgeResult.text.slice(0, 20000) };
+        await prisma.aiAdsFatigueInsightCache.update({
+            where: { id: cacheId },
+            data: { status: 'DONE', result: insightResult, errorMessage: null, lastCompletedAt: new Date(), conversationId },
+        });
+    }
+    catch (err) {
+        logger.error(`[AiAds/FatigueInsight] runFatigueInsightJob error: ${err}`);
+        await prisma.aiAdsFatigueInsightCache.update({
+            where: { id: cacheId },
+            data: { status: 'ERROR', errorMessage: String(err).slice(0, 2000), lastCompletedAt: new Date() },
+        }).catch(() => {});
+    }
+}
+// ── GET /ai-ads/fatigue-insight/cache — baca cache rekomendasi fatigue TANPA memicu job baru. ──
+router.get('/fatigue-insight/cache', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const adId = String(req.query.adId || '');
+        if (!adId) {
+            res.status(400).json({ error: { message: 'adId wajib diisi.' } });
+            return;
+        }
+        let row = await prisma.aiAdsFatigueInsightCache.findUnique({
+            where: { businessId_adId: { businessId, adId } },
+        });
+        if (row && row.status === 'RUNNING' && row.lastRequestedAt && Date.now() - row.lastRequestedAt.getTime() > STALE_RUNNING_MS) {
+            row = await prisma.aiAdsFatigueInsightCache.update({
+                where: { id: row.id },
+                data: {
+                    status: 'ERROR',
+                    errorMessage: 'Proses sebelumnya sepertinya terhenti (lebih dari 20 menit tanpa update, kemungkinan server sempat restart). Klik Refresh untuk coba lagi.',
+                    lastCompletedAt: new Date(),
+                },
+            });
+        }
+        const busyInfo = getAgyBusyInfo('ai-ads-fatigue');
+        const cooldownRemainingSec = row?.lastRequestedAt
+            ? Math.max(0, Math.ceil((REFRESH_COOLDOWN_MS - (Date.now() - row.lastRequestedAt.getTime())) / 1000))
+            : 0;
+        res.json({
+            cache: row
+                ? {
+                    status: row.status,
+                    result: row.result,
+                    errorMessage: row.errorMessage,
+                    lastRequestedAt: row.lastRequestedAt,
+                    lastCompletedAt: row.lastCompletedAt,
+                }
+                : null,
+            agyBusy: busyInfo.busy,
+            cooldownRemainingSec,
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+const healthScoreSchema = z.object({
+    bmId: z.string().min(1),
+    platform: z.enum(['meta', 'google', 'tiktok']).default('meta'),
+    adAccountId: z.string().optional().default(''),
+});
+/**
+ * Best-effort: skills/ads-score + skills/ads-next SUDAH diverifikasi jalan
+ * lewat invoke_subagent di agy (per blueprint), tapi bentuk pasti JSON yang
+ * dicetak ke stdout untuk kasus ini belum pernah diobservasi langsung dari
+ * sesi ini. Coba ekstrak objek JSON yang punya field "score" (0-100) +
+ * "checks"/"checklist" -- kalau gagal, tetap tampilkan teks mentah dari agy
+ * supaya halaman tetap berguna (bukan kosong/error) sambil parsingnya
+ * disempurnakan setelah ada contoh output nyata.
+ */
+function extractHealthScoreFromAgyOutput(text: string) {
+    const match = text.match(/\{[\s\S]*?"score"\s*:\s*\d+(?:\.\d+)?[\s\S]*?\n\}/);
+    if (!match)
+        return null;
+    try {
+        return JSON.parse(match[0]);
+    }
+    catch {
+        return null;
+    }
+}
+// ── POST /ai-ads/health-score — Blok 3, Health Score & Quick Wins (Fitur D) ─
+router.post('/health-score', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const parsed = healthScoreSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { bmId, platform, adAccountId } = parsed.data;
+        if (platform === 'meta' && !adAccountId) {
+            res.status(400).json({ error: { message: 'adAccountId wajib diisi untuk platform Meta.' } });
+            return;
+        }
+        // [2026-08-25] Redesign Bossfren: sekarang NON-BLOCKING sama seperti campaign-audit-insight --
+        // trigger cuma validasi + cek busy/cooldown + upsert baris cache RUNNING + balas langsung,
+        // panggilan agy sungguhan (kode ASLI di bawah, TIDAK diubah) jalan di background IIFE dan
+        // nulis hasilnya ke cache row. Popup baca lewat GET /health-score/cache (termasuk polling).
+        const { businessId } = req.user!;
+        const busyInfo = getAgyBusyInfo('ai-ads-health');
+        if (busyInfo.busy) {
+            res.json({ queued: false, busy: true, message: `Masih ada proses lain sedang jalan di server (${busyInfo.label}) -- tunggu dulu, coba refresh lagi dalam beberapa menit.` });
+            return;
+        }
+        const existingHs = await prisma.aiAdsHealthScoreCache.findUnique({
+            where: { businessId_bmId_platform_adAccountId: { businessId, bmId, platform, adAccountId } },
+        });
+        if (existingHs?.lastRequestedAt) {
+            const elapsedMs = Date.now() - existingHs.lastRequestedAt.getTime();
+            if (elapsedMs < REFRESH_COOLDOWN_MS && existingHs.status !== 'ERROR') {
+                const retryAfterSec = Math.ceil((REFRESH_COOLDOWN_MS - elapsedMs) / 1000);
+                res.json({ queued: false, cooldown: true, retryAfterSec, message: `Baru saja di-refresh. Coba lagi dalam ~${Math.ceil(retryAfterSec / 60)} menit.` });
+                return;
+            }
+        }
+        const hsCacheRow = await prisma.aiAdsHealthScoreCache.upsert({
+            where: { businessId_bmId_platform_adAccountId: { businessId, bmId, platform, adAccountId } },
+            create: { businessId, bmId, platform, adAccountId, status: 'RUNNING', lastRequestedAt: new Date() },
+            update: { status: 'RUNNING', lastRequestedAt: new Date(), errorMessage: null },
+        });
+        res.json({ queued: true, message: 'Perhitungan Health Score dimulai di server, hasil muncul otomatis di sini (bisa sampai ~15 menit kalau lagi antre).' });
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        (async () => {
+        try {
+        // Fix 2026-08-25 (lapor Bossfren): prompt LAMA cuma bilang "Hitung Health Score akun iklan meta"
+        // TANPA ad_account_id konkret dan TANPA perintah eksplisit ambil evidence nyata dulu -- hasilnya
+        // (dibuktikan dari output mentah yang Bossfren tempel langsung) agy improvisasi pakai data DEMO
+        // bawaan skill (tests/fixtures/exports/meta.csv, akun "Sanitized Meta Demo") karena skill
+        // score_checklist.py MEMANG murni kalkulator -- dia butuh evidence per-check sebagai INPUT (lihat
+        // SKILL.md-nya), bukan fetcher data sendiri. Sekarang prompt WAJIB: (1) sebut ad_account_id
+        // spesifik, (2) perintah eksplisit kumpulkan evidence NYATA dulu (via /ads audit atau Meta MCP
+        // langsung) sebelum skor dihitung, (3) larangan eksplisit pakai fixture/demo/data akun lain, (4)
+        // instruksi anti-halusinasi resmi skill: check tanpa evidence dibiarkan kosong (jadi "unknown"),
+        // JANGAN ditebak apalagi diisi data fixture.
+        const prompt = `Audit Health Score akun iklan ${platform} ad_account_id=${adAccountId} (BM id=${bmId}) -- ` +
+            `INI AKUN PRODUKSI SUNGGUHAN milik SalesPintar, BUKAN akun demo/contoh/test. WAJIB kumpulkan ` +
+            `evidence NYATA dari akun ini dulu (pakai /ads audit ${platform} untuk ad_account_id di atas, ` +
+            `atau panggil langsung API/MCP ${platform} Ads buat data campaign/pixel-CAPI/creative/struktur ` +
+            `akun) SEBELUM menghitung skor apa pun. JANGAN PERNAH memakai data dari folder tests/fixtures, ` +
+            `data demo/sample/sanitized bawaan skill, atau data akun lain manapun -- kalau evidence untuk ` +
+            `sebagian atau semua cek tidak bisa didapat dari akun ini, BIARKAN cek itu tidak ada di objek ` +
+            `results (skorer akan otomatis menandainya "unknown"), JANGAN ditebak apalagi diisi data ` +
+            `fixture/demo cuma supaya ada angka. Setelah evidence asli terkumpul, hitung Health Score pakai ` +
+            `skills/ads-score/score_checklist.py (116 cek, skor 0-100), lalu rangking Quick Wins-nya (cek ` +
+            `Critical/High-severity yang FAIL) memakai skills/ads-next/next_actions.py. Cetak hasil sebagai ` +
+            `satu objek JSON dengan minimal field "score" (angka 0-100 atau null kalau evidence terlalu ` +
+            `sedikit), "checks" (array {name, severity, status, category}), "quickWins" (array ringkasan ` +
+            `tindakan prioritas), dan "coverageStatus"/"evidenceCoveragePct" apa adanya -- JANGAN sembunyikan ` +
+            `kalau statusnya provisional/insufficient_evidence, itu informasi penting buat Bossfren. Ini ` +
+            `murni laporan baca-saja -- jangan mengeksekusi perubahan apa pun ke akun iklan.`;
+        const bridgeResult = await callBridgeRun(prompt, `ai-ads-health-${bmId}-${Date.now()}`, `Health Score ${platform} ${adAccountId}`, 900_000, 'ai-ads-health');
+        if (!bridgeResult.ok) {
+            await prisma.aiAdsHealthScoreCache.update({
+                where: { id: hsCacheRow.id },
+                data: { status: 'ERROR', errorMessage: (bridgeResult.error || 'API Bridge gagal dipanggil.').slice(0, 2000), lastCompletedAt: new Date() },
+            });
+            return;
+        }
+        const parsedScore = extractHealthScoreFromAgyOutput(bridgeResult.text);
+        const hsResult = parsedScore ? { structured: true, ...parsedScore } : { structured: false, rawText: bridgeResult.text.slice(0, 20000) };
+        await prisma.aiAdsHealthScoreCache.update({
+            where: { id: hsCacheRow.id },
+            data: { status: 'DONE', result: hsResult, errorMessage: null, lastCompletedAt: new Date() },
+        });
+        }
+        catch (bgErr) {
+            logger.error(`[AiAds/HealthScore] Background job gagal total: ${bgErr}`);
+            await prisma.aiAdsHealthScoreCache.update({
+                where: { id: hsCacheRow.id },
+                data: { status: 'ERROR', errorMessage: String(bgErr).slice(0, 2000), lastCompletedAt: new Date() },
+            }).catch(() => {});
+        }
+        })();
+    }
+    catch (err) {
+        next(err);
+    }
+});
+// ── GET /ai-ads/health-score/cache — baca cache Health Score (popup langsung nongol + polling
+// selagi RUNNING) TANPA memicu job baru. ──────────────────────────────────────────────────────
+router.get('/health-score/cache', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const bmId = String(req.query.bmId || '');
+        const platform = String(req.query.platform || 'meta');
+        const adAccountId = String(req.query.adAccountId || '');
+        if (!bmId || !adAccountId) {
+            res.status(400).json({ error: { message: 'bmId & adAccountId wajib diisi.' } });
+            return;
+        }
+        let row = await prisma.aiAdsHealthScoreCache.findUnique({
+            where: { businessId_bmId_platform_adAccountId: { businessId, bmId, platform, adAccountId } },
+        });
+        if (row && row.status === 'RUNNING' && row.lastRequestedAt && Date.now() - row.lastRequestedAt.getTime() > STALE_RUNNING_MS) {
+            row = await prisma.aiAdsHealthScoreCache.update({
+                where: { id: row.id },
+                data: {
+                    status: 'ERROR',
+                    errorMessage: 'Proses sebelumnya sepertinya terhenti (lebih dari 20 menit tanpa update, kemungkinan server sempat restart). Klik Refresh untuk coba lagi.',
+                    lastCompletedAt: new Date(),
+                },
+            });
+        }
+        const busyInfo = getAgyBusyInfo('ai-ads-health');
+        const cooldownRemainingSec = row?.lastRequestedAt
+            ? Math.max(0, Math.ceil((REFRESH_COOLDOWN_MS - (Date.now() - row.lastRequestedAt.getTime())) / 1000))
+            : 0;
+        res.json({
+            cache: row
+                ? {
+                    status: row.status,
+                    result: row.result,
+                    errorMessage: row.errorMessage,
+                    lastRequestedAt: row.lastRequestedAt,
+                    lastCompletedAt: row.lastCompletedAt,
+                }
+                : null,
+            agyBusy: busyInfo.busy,
+            cooldownRemainingSec,
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+const globalChatSchema = z.object({
+    message: z.string().min(1),
+    picName: z.string().min(1).max(150),
+});
+
+// [2026-08-25] Langkah B -- daftar PIC di-derive OTOMATIS dari pic_name unik di
+// MetaBusinessManager AKTIF milik business ini -- BUKAN tabel/config PIC terpisah, TIDAK ada
+// tombol "tambah PIC" di widget chat. Nambah BM baru lewat modal "Kelola Aset BM" dengan nama
+// PIC baru otomatis bikin nama itu muncul di sini, tanpa langkah admin tambahan apa pun.
+router.get('/global-chat/pics', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const rows = await prisma.metaBusinessManager.findMany({
+            where: { businessId, isActive: true },
+            select: { picName: true },
+        });
+        const pics = Array.from(new Set(rows.map((r) => r.picName.trim()).filter(Boolean))).sort((a, b) =>
+            a.localeCompare(b, 'id')
+        );
+        res.json({ pics });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+const globalChatSessionQuerySchema = z.object({
+    picName: z.string().min(1).max(150),
+});
+
+// [2026-08-25] Langkah B -- muat histori tampilan + conversationId tersimpan utk 1 PIC, dipanggil
+// widget/halaman chat saat pertama kali PIC dipilih (atau saat widget dibuka ulang). Transcript
+// cuma utk TAMPILAN -- ingatan asli percakapan ada di sisi agy sendiri (lewat conversationId).
+router.get('/global-chat/session', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = globalChatSessionQuerySchema.safeParse(req.query);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Query tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { picName } = parsed.data;
+        const row = await prisma.aiAdsGlobalChatSession.findUnique({
+            where: { businessId_picName: { businessId, picName } },
+        });
+        res.json({
+            conversationId: row?.conversationId ?? null,
+            transcript: Array.isArray(row?.transcript) ? row!.transcript : [],
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+const pinPicNameSchema = z.object({ picName: z.string().min(1).max(150) });
+const pinSetVerifySchema = z.object({
+    picName: z.string().min(1).max(150),
+    pin: z.string().regex(/^\d{4}$/, 'PIN harus 4 digit angka'),
+});
+
+// [2026-08-27] PIN 4-digit per business+PIC -- lapisan konfidensialitas RINGAN (bukan auth
+// terpisah, cuma penghalang biar gak sembarang orang yg pegang browser/akun bisnis yg sama
+// bisa buka riwayat chat AI PIC lain). Disimpan di kolom `pinHash` (AiAdsGlobalChatSession),
+// di-hash bcrypt lewat hashPassword/comparePassword yg sama dgn password user -- TIDAK PERNAH
+// dikirim/diterima lewat query string (selalu POST body), sesuai aturan privasi.
+router.get('/global-chat/pin-status', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = pinPicNameSchema.safeParse(req.query);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Query tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { picName } = parsed.data;
+        const row = await prisma.aiAdsGlobalChatSession.findUnique({
+            where: { businessId_picName: { businessId, picName } },
+            select: { pinHash: true },
+        });
+        res.json({ hasPin: !!row?.pinHash });
+    }
+    catch (err) { next(err); }
+});
+
+router.post('/global-chat/pin/set', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = pinSetVerifySchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { picName, pin } = parsed.data;
+        const existing = await prisma.aiAdsGlobalChatSession.findUnique({
+            where: { businessId_picName: { businessId, picName } },
+            select: { pinHash: true },
+        });
+        if (existing?.pinHash) {
+            res.status(409).json({ error: { message: 'PIN untuk PIC ini sudah pernah di-set. Minta admin reset kalau lupa.' } });
+            return;
+        }
+        const pinHash = await hashPassword(pin);
+        await prisma.aiAdsGlobalChatSession.upsert({
+            where: { businessId_picName: { businessId, picName } },
+            create: { businessId, picName, pinHash },
+            update: { pinHash },
+        });
+        res.json({ ok: true });
+    }
+    catch (err) { next(err); }
+});
+
+router.post('/global-chat/pin/verify', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = pinSetVerifySchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { picName, pin } = parsed.data;
+        const existing = await prisma.aiAdsGlobalChatSession.findUnique({
+            where: { businessId_picName: { businessId, picName } },
+            select: { pinHash: true },
+        });
+        if (!existing?.pinHash) {
+            // Belum ada PIN ke-set -- jangan block (frontend seharusnya sudah cek pin-status
+            // duluan & arahkan ke alur "buat PIN", ini cuma jaga-jaga defensif).
+            res.json({ ok: true });
+            return;
+        }
+        const ok = await comparePassword(pin, existing.pinHash);
+        res.json({ ok });
+    }
+    catch (err) { next(err); }
+});
+
+// Reset PIN -- ADMIN only (kesepakatan Bossfren: kalau PIC lupa PIN, admin yg reset, bukan
+// jalan mundur otomatis/tanpa gate -- biar gak jadi celah balik yg sama).
+router.post('/global-chat/pin/reset', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = pinPicNameSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { picName } = parsed.data;
+        await prisma.aiAdsGlobalChatSession.updateMany({
+            where: { businessId, picName },
+            data: { pinHash: null },
+        });
+        res.json({ ok: true });
+    }
+    catch (err) { next(err); }
+});
+
+// -- POST /ai-ads/global-chat -- Global Agent Workspace, chat per-PIC --
+// businessId di-patok dari sesi login (req.user!.businessId), TIDAK PERNAH diambil dari body --
+// sesuai Sec2.G blueprint "Ekstensi Fase 3: Global Agent Workspace & Multi-BM Token Vault" v1.3.
+// [2026-08-25] Langkah B -- conversationId TIDAK lagi diterima dari body client sama sekali (dulu
+// opsional, sempat juga sempat di-generate sendiri di Langkah sebelum A). Sekarang backend jadi
+// SATU-SATUNYA sumber kebenaran: dimuat dari baris AiAdsGlobalChatSession (business+picName) yang
+// sudah tersimpan -- kalau belum ada baris, berarti percakapan baru utk PIC itu (conversationId
+// undefined -> agy mulai sesi baru). Setelah stream kelar SUKSES (bukan error), transkrip + id
+// percakapan baru di-upsert ke DB supaya kepersist walau halaman di-refresh/browser beda.
+router.post('/global-chat', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = globalChatSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { message, picName } = parsed.data;
+
+        const existing = await prisma.aiAdsGlobalChatSession.findUnique({
+            where: { businessId_picName: { businessId, picName } },
+        });
+        const existingConversationId = existing?.conversationId ?? undefined;
+
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.setHeader('X-Accel-Buffering', 'no');
+        res.flushHeaders?.();
+
+        const result = await callBridgeGlobalRunStream(businessId, message, existingConversationId, res);
+
+        if (result.ok && typeof result.reply === 'string') {
+            const nowIso = new Date().toISOString();
+            const priorTranscript = Array.isArray(existing?.transcript) ? (existing!.transcript as any[]) : [];
+            const newTranscript = [
+                ...priorTranscript,
+                { role: 'user', text: message, at: nowIso },
+                { role: result.active ? 'assistant' : 'system', text: result.reply, at: nowIso },
+            ];
+            await prisma.aiAdsGlobalChatSession.upsert({
+                where: { businessId_picName: { businessId, picName } },
+                create: { businessId, picName, conversationId: result.conversationId, transcript: newTranscript },
+                update: { conversationId: result.conversationId, transcript: newTranscript },
+            });
+        }
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+// ── Lapis 2 fitur "Rekomendasi Budget" (kolom Budget baru di drill-down Campaign) ──────────────
+// Lapis 1 (semua fakta: CPR/CTR/frekuensi/ROAS hari-ini-vs-rata7hari, budget level CBO/ABO, bid
+// strategy, verdict scale/maintain/attention/kill, saran angka budget baru) SUDAH DIHITUNG MURNI
+// NODE di GET /business/budget-facts (nol agy). Endpoint ini (Layer 2) CUMA diminta menulis narasi
+// kualitatif gaya senior media buyer + peringatan risiko + tingkat keyakinan -- agy TIDAK diminta
+// re-hitung angka apa pun (angka sudah given/fakta), persis pola fatigue-insight/creative-insight.
+// Pool sendiri 'ai-ads-budget' spy nggak antre sama fitur agy lain.
+function buildBudgetInsightPrompt(input: {
+    campaignName: string;
+    objective: string;
+    budgetLevel: string;
+    currentDailyBudget: number | null;
+    bidStrategyLabel: string;
+    verdict: string;
+    verdictReason: string;
+    suggestedDailyBudget: number | null;
+    today: Record<string, any>;
+    avg7d: Record<string, any>;
+    roas: Record<string, any> | null;
+    cprDeltaPct: number | null;
+    frequencyFlag: boolean;
+}): string {
+    const rp = (n: number | null) => (n == null ? '-' : `Rp${Math.round(n).toLocaleString('id-ID')}`);
+    return `Kamu berperan sebagai senior media buyer berpengalaman. Berikut data TERVERIFIKASI (sudah
+dihitung dari Meta Insights, JANGAN diragukan atau dihitung ulang, JANGAN mengarang angka lain)
+untuk campaign "${input.campaignName}" (objective: ${input.objective}):
+
+BUDGET & BID SAAT INI:
+- Level budget: ${input.budgetLevel} (CBO = 1 angka di level campaign, ABO = per ad set)
+- Budget harian saat ini: ${rp(input.currentDailyBudget)}
+- Status bid: ${input.bidStrategyLabel}
+
+RINGKASAN HARI INI vs RATA-RATA 7 HARI TERAKHIR:
+- CPR (${input.today.badgeLabel || 'Per Hasil'}) hari ini: ${rp(input.today.cpr)} | rata-rata 7 hari: ${rp(input.avg7d.cpr)} (delta: ${input.cprDeltaPct == null ? 'tidak ada baseline' : input.cprDeltaPct.toFixed(0) + '%'})
+- CTR hari ini: ${(input.today.ctr || 0).toFixed(2)}% | rata-rata 7 hari: ${(input.avg7d.ctr || 0).toFixed(2)}%
+- Frekuensi hari ini: ${(input.today.frequency || 0).toFixed(2)} ${input.frequencyFlag ? '(WASPADA, >2.5)' : '(aman)'}
+- Konversi 7 hari terakhir (total, bukan rata-rata): ${Math.round(input.avg7d.weeklyConversions || 0)}
+${input.roas ? `- ROAS (Meta-native, dari Pixel/CAPI) hari ini: ${input.roas.today.toFixed(2)}x | rata-rata 7 hari: ${input.roas.avg7d.toFixed(2)}x` : '- ROAS: tidak tersedia (bisnis ini belum setup value-tracking Pixel/CAPI) -- JANGAN sebut/asumsikan ROAS sama sekali di analisamu.'}
+
+VERDICT YANG SUDAH DIHITUNG (anggap FAKTA, jangan dipertanyakan): ${input.verdict}
+Alasan teknis: ${input.verdictReason}
+Saran angka budget baru (sudah dihitung dari 20% Rule / Kill Rule): ${rp(input.suggestedDailyBudget)}
+
+TUGASMU (HANYA narasi & penilaian kualitatif, JANGAN hitung ulang angka apa pun di atas):
+1. narrative: jelaskan dgn bahasa yang gampang dicerna pemilik toko (BUKAN jargon media buyer)
+   kenapa verdict ini masuk akal, kaitkan ke angka-angka di atas.
+2. risks: 1-3 peringatan konkret kalau user mengikuti saran ini (misal: risiko exit learning phase
+   lagi kalau naik >20%, risiko budget kepake gak efisien kalau tren cuma sementara, dst).
+3. confidence: "tinggi" | "sedang" | "rendah" -- berdasarkan seberapa lengkap datanya (misal ROAS
+   gak ada = confidence turun kalau objective-nya sales; volume konversi mepet 50 = confidence turun).
+4. alternative_consideration: satu opsi lain yang masuk akal dipikirkan user selain ikut saran verdict
+   mentah-mentah (misal: "naik cuma 10% dulu minggu ini kalau mau lebih hati-hati").
+
+Return HANYA JSON valid:
+{
+  "narrative": "string",
+  "risks": ["string"],
+  "confidence": "tinggi|sedang|rendah",
+  "alternative_consideration": "string"
+}`;
+}
+function extractBudgetInsightFromAgyOutput(text: string) {
+    const match = text.match(/\{[\s\S]*?"alternative_consideration"[\s\S]*?\}/);
+    if (!match)
+        return null;
+    try {
+        return JSON.parse(match[0]);
+    }
+    catch {
+        return null;
+    }
+}
+const budgetInsightSchema = z.object({
+    campaignId: z.string().min(1),
+    campaignName: z.string().optional().default(''),
+    objective: z.string().optional().default('UNKNOWN'),
+    budgetLevel: z.string().optional().default('UNKNOWN'),
+    currentDailyBudget: z.union([z.number(), z.null()]).optional().default(null),
+    bidStrategyLabel: z.string().optional().default('Tidak diketahui'),
+    verdict: z.string().min(1),
+    verdictReason: z.string().optional().default(''),
+    suggestedDailyBudget: z.union([z.number(), z.null()]).optional().default(null),
+    today: z.record(z.any()).optional().default({}),
+    avg7d: z.record(z.any()).optional().default({}),
+    roas: z.union([z.record(z.any()), z.null()]).optional().default(null),
+    cprDeltaPct: z.union([z.number(), z.null()]).optional().default(null),
+    frequencyFlag: z.boolean().optional().default(false),
+});
+// ── POST /ai-ads/budget-insight — narasi kualitatif utk 1 campaign spesifik (popup "Rekomendasi
+// Budget") ── Non-blocking, pola sama persis dgn fatigue-insight/creative-insight.
+router.post('/budget-insight', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = budgetInsightSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const { campaignId } = parsed.data;
+        const busyInfo = getAgyBusyInfo('ai-ads-budget');
+        if (busyInfo.busy) {
+            res.json({ queued: false, busy: true, message: `Masih ada proses lain sedang jalan di server (${busyInfo.label}) -- tunggu dulu, coba refresh lagi dalam beberapa menit.` });
+            return;
+        }
+        const existing = await prisma.aiAdsBudgetInsightCache.findUnique({
+            where: { businessId_campaignId: { businessId, campaignId } },
+        });
+        if (existing?.lastRequestedAt) {
+            const elapsedMs = Date.now() - existing.lastRequestedAt.getTime();
+            if (elapsedMs < REFRESH_COOLDOWN_MS && existing.status !== 'ERROR') {
+                const retryAfterSec = Math.ceil((REFRESH_COOLDOWN_MS - elapsedMs) / 1000);
+                res.json({ queued: false, cooldown: true, retryAfterSec, message: `Baru saja di-refresh. Coba lagi dalam ~${Math.ceil(retryAfterSec / 60)} menit.` });
+                return;
+            }
+        }
+        const cacheRow = await prisma.aiAdsBudgetInsightCache.upsert({
+            where: { businessId_campaignId: { businessId, campaignId } },
+            create: { businessId, campaignId, status: 'RUNNING', lastRequestedAt: new Date() },
+            update: { status: 'RUNNING', lastRequestedAt: new Date(), errorMessage: null },
+        });
+        res.json({ queued: true, message: 'Analisa AI dimulai di server, hasil muncul otomatis di sini (bisa sampai beberapa menit).' });
+        // eslint-disable-next-line @typescript-eslint/no-floating-promises
+        runBudgetInsightJob(cacheRow.id, parsed.data).catch((err) => {
+            logger.error(`[AiAds/BudgetInsight] Background job gagal total: ${err}`);
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+async function runBudgetInsightJob(cacheId: string, c: z.infer<typeof budgetInsightSchema>) {
+    try {
+        const prompt = buildBudgetInsightPrompt(c as any);
+        const conversationId = `ai-ads-budget-${c.campaignId}-${Date.now()}`;
+        const bridgeResult = await callBridgeRun(prompt, conversationId, `Rekomendasi Budget ${c.campaignName || c.campaignId}`, 900_000, 'ai-ads-budget');
+        if (!bridgeResult.ok) {
+            await prisma.aiAdsBudgetInsightCache.update({
+                where: { id: cacheId },
+                data: { status: 'ERROR', errorMessage: (bridgeResult.error || 'API Bridge gagal dipanggil.').slice(0, 2000), lastCompletedAt: new Date() },
+            });
+            return;
+        }
+        const parsedInsight = extractBudgetInsightFromAgyOutput(bridgeResult.text);
+        const insightResult = parsedInsight ? { structured: true, ...parsedInsight } : { structured: false, rawText: bridgeResult.text.slice(0, 20000) };
+        await prisma.aiAdsBudgetInsightCache.update({
+            where: { id: cacheId },
+            data: { status: 'DONE', result: insightResult, errorMessage: null, lastCompletedAt: new Date(), conversationId },
+        });
+    }
+    catch (err) {
+        logger.error(`[AiAds/BudgetInsight] runBudgetInsightJob error: ${err}`);
+        await prisma.aiAdsBudgetInsightCache.update({
+            where: { id: cacheId },
+            data: { status: 'ERROR', errorMessage: String(err).slice(0, 2000), lastCompletedAt: new Date() },
+        }).catch(() => {});
+    }
+}
+// ── GET /ai-ads/budget-insight/cache — baca cache narasi budget TANPA memicu job baru. ──────────
+router.get('/budget-insight/cache', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const campaignId = String(req.query.campaignId || '');
+        if (!campaignId) {
+            res.status(400).json({ error: { message: 'campaignId wajib diisi.' } });
+            return;
+        }
+        let row = await prisma.aiAdsBudgetInsightCache.findUnique({
+            where: { businessId_campaignId: { businessId, campaignId } },
+        });
+        if (row && row.status === 'RUNNING' && row.lastRequestedAt && Date.now() - row.lastRequestedAt.getTime() > STALE_RUNNING_MS) {
+            row = await prisma.aiAdsBudgetInsightCache.update({
+                where: { id: row.id },
+                data: {
+                    status: 'ERROR',
+                    errorMessage: 'Proses sebelumnya sepertinya terhenti (lebih dari 20 menit tanpa update, kemungkinan server sempat restart). Klik Refresh untuk coba lagi.',
+                    lastCompletedAt: new Date(),
+                },
+            });
+        }
+        const busyInfo = getAgyBusyInfo('ai-ads-budget');
+        const cooldownRemainingSec = row?.lastRequestedAt
+            ? Math.max(0, Math.ceil((REFRESH_COOLDOWN_MS - (Date.now() - row.lastRequestedAt.getTime())) / 1000))
+            : 0;
+        res.json({
+            cache: row
+                ? {
+                    status: row.status,
+                    result: row.result,
+                    errorMessage: row.errorMessage,
+                    lastRequestedAt: row.lastRequestedAt,
+                    lastCompletedAt: row.lastCompletedAt,
+                }
+                : null,
+            agyBusy: busyInfo.busy,
+            cooldownRemainingSec,
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// [2026-08-27] Fase 1 "Automation Meta Bot 24/7" (Blueprint v2.3, projek-ceo)
+// -- endpoint dasar utk config/queue/eksekusi Autopilot. LEGACY route di atas
+// (/settings, /spend-anomaly-settings, /landing-pages) SENGAJA belum dihapus
+// -- masih dipakai run_shift.py/emergency_brake.py di VPS45 (baca file JSON
+// lokal, belum baca dari sini). Penghapusan menyusul di Fase 4 setelah
+// wiring VPS45 pindah baca dari DB/endpoint ini.
+//
+// CATATAN: POST /automation/execute Fase 1 ini BARU menandai keputusan
+// approve/reject di tabel kita sendiri (AdBudgetActionHistory) -- panggilan
+// nyata ke Meta Graph API menyusul di Fase 2 begitu daemon VPS45
+// (budget_autopilot_daemon.py) jalan dan mengisi antrean tabel ini.
+//
+// Endpoint /automation/internal-sync (VPS45 -> Upcloud, digerbangi shared
+// secret bukan JWT user) SENGAJA BELUM dibuat di Fase 1 ini -- router file
+// ini di-gate `router.use(authenticate)` (JWT) di paling atas, jadi endpoint
+// machine-to-machine butuh mount terpisah di app.ts yang skip authenticate.
+// Dikerjakan bareng Fase 2 sekalian sama pemanggil aslinya (daemon VPS45)
+// biar bisa dites end-to-end, bukan endpoint nganggur yang belum ada
+// pemanggilnya.
+// ══════════════════════════════════════════════════════════════════════════
+
+const autopilotConfigSchema = z.object({
+    mode: z.enum(['SEMI_AUTO', 'FULL_AUTO']).default('SEMI_AUTO'),
+    maxDailySpendTotal: z.number().nonnegative(),
+    targetRoas: z.number().nonnegative(),
+    targetCpa: z.number().nonnegative(),
+    autoScaleEnabled: z.boolean().default(true),
+    autoReduceEnabled: z.boolean().default(true),
+    autoKillEnabled: z.boolean().default(true),
+});
+
+// ── GET /ai-ads/automation/status — ringkasan config + antrean Autopilot ──
+router.get('/automation/status', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const config = await prisma.metaAutopilotConfig.findUnique({ where: { businessId } });
+        const pendingCount = await prisma.adBudgetActionHistory.count({ where: { businessId, executedAt: null } });
+        const last24hActions = await prisma.adBudgetActionHistory.count({
+            where: { businessId, createdAt: { gte: new Date(Date.now() - 24 * 60 * 60 * 1000) } },
+        });
+        res.json({ configured: !!config, config: config ?? null, pendingCount, last24hActions });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+// ── PUT /ai-ads/automation/config — simpan config Autopilot (ADMIN) ───────
+router.put('/automation/config', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = autopilotConfigSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const config = await prisma.metaAutopilotConfig.upsert({
+            where: { businessId },
+            create: { businessId, ...parsed.data },
+            update: { ...parsed.data },
+        });
+        logger.info(`[AiAds] Autopilot config bisnis ${businessId} disimpan: mode=${config.mode}`);
+        res.json({ ok: true, config, message: 'Konfigurasi Autopilot disimpan.' });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+// ── GET /ai-ads/automation/queue — antrean aksi yang belum diputuskan ─────
+router.get('/automation/queue', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const limitParam = Number(req.query.limit);
+        const limit = Number.isFinite(limitParam) && limitParam > 0 ? Math.min(limitParam, 200) : 50;
+        const items = await prisma.adBudgetActionHistory.findMany({
+            where: { businessId, executedAt: null },
+            orderBy: { createdAt: 'desc' },
+            take: limit,
+        });
+        res.json({ items, count: items.length });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+const executeActionSchema = z.object({
+    id: z.string().uuid(),
+    decision: z.enum(['APPROVE', 'REJECT']),
+});
+
+// ── POST /ai-ads/automation/execute — approve/reject 1 antrean (ADMIN) ────
+router.post('/automation/execute', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = executeActionSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const row = await prisma.adBudgetActionHistory.findFirst({ where: { id: parsed.data.id, businessId } });
+        if (!row) {
+            res.status(404).json({ error: { message: 'Antrean aksi tidak ditemukan' } });
+            return;
+        }
+        if (row.executedAt) {
+            res.status(409).json({ error: { message: 'Aksi ini sudah diproses sebelumnya' } });
+            return;
+        }
+        const updated = await prisma.adBudgetActionHistory.update({
+            where: { id: row.id },
+            data: {
+                executionMode: parsed.data.decision === 'APPROVE' ? 'USER_APPROVED' : 'REJECTED',
+                executedAt: new Date(),
+            },
+        });
+        logger.info(`[AiAds] Autopilot action ${row.id} (bisnis ${businessId}) diputuskan: ${parsed.data.decision}`);
+        res.json({ ok: true, action: updated, message: 'Keputusan aksi disimpan.' });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+const emergencyBrakeToggleSchema = z.object({
+    active: z.boolean(),
+});
+
+// ── POST /ai-ads/automation/emergency-brake — kill switch Autopilot (ADMIN) ─
+router.post('/automation/emergency-brake', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const parsed = emergencyBrakeToggleSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+        const config = await prisma.metaAutopilotConfig.upsert({
+            where: { businessId },
+            create: {
+                businessId,
+                mode: 'SEMI_AUTO',
+                maxDailySpendTotal: 0,
+                targetRoas: 0,
+                targetCpa: 0,
+                emergencyBrakeActive: parsed.data.active,
+            },
+            update: { emergencyBrakeActive: parsed.data.active },
+        });
+        logger.warn(`[AiAds] Emergency Brake bisnis ${businessId} di-set ke: ${parsed.data.active}`);
+        res.json({
+            ok: true,
+            emergencyBrakeActive: config.emergencyBrakeActive,
+            message: parsed.data.active ? 'Emergency Brake diaktifkan.' : 'Emergency Brake dinonaktifkan.',
+        });
+    }
+    catch (err) {
+        next(err);
+    }
+});
+
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║  FASE 7A — Endpoint Baru untuk UI Dashboard & Approval Queue              ║
+// ║  Ditulis oleh: Antigravity (Gemini), 2026-08-29                           ║
+// ║  Claude trackback: sesi 26b52cab                                          ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+
+// ── GET /ai-ads/modules/status — status semua modul (7.1–7.6) per business ──
+// Response dipakai Dashboard Tab (7C) untuk render kartu per modul:
+// lastRun, findingCount, pendingApprovalCount, hasUrgent
+router.get('/modules/status', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+
+        // Daftar layerKey prefix per modul (sesuai blueprint Bagian 7)
+        const MODULE_KEYS = [
+            { moduleId: '7.1', label: 'Threshold Shift & Early Kill', layerPrefix: 'layer0' },
+            { moduleId: '7.2', label: 'Velocity Spike & Stop Darurat', layerPrefix: 'layer07' },
+            { moduleId: '7.3', label: 'Landing Page & Message Match', layerPrefix: 'layer1' },
+            { moduleId: '7.4', label: 'Tiga Bot Spesialis', layerPrefix: 'layer04' },
+            { moduleId: '7.5', label: 'Budget Waste & CAPI EMQ', layerPrefix: 'layer16' },
+            { moduleId: '7.6', label: 'A/B Test Significance Engine', layerPrefix: 'layer14' },
+        ];
+
+        const now = new Date();
+        const since24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+
+        const results = await Promise.all(MODULE_KEYS.map(async (m) => {
+            const [pendingCount, urgentCount, recent] = await Promise.all([
+                (prisma as any).aiAdsRecommendation.count({
+                    where: {
+                        businessId,
+                        layerKey: { startsWith: m.layerPrefix },
+                        status: 'PENDING_APPROVAL',
+                    },
+                }),
+                (prisma as any).aiAdsRecommendation.count({
+                    where: {
+                        businessId,
+                        layerKey: { startsWith: m.layerPrefix },
+                        status: 'PENDING_APPROVAL',
+                        isUrgent: true,
+                    },
+                }),
+                (prisma as any).aiAdsRecommendation.findFirst({
+                    where: {
+                        businessId,
+                        layerKey: { startsWith: m.layerPrefix },
+                        createdAt: { gte: since24h },
+                    },
+                    orderBy: { createdAt: 'desc' },
+                    select: { createdAt: true, layerKey: true },
+                }),
+            ]);
+            return {
+                moduleId: m.moduleId,
+                label: m.label,
+                layerPrefix: m.layerPrefix,
+                pendingApprovalCount: pendingCount,
+                hasUrgent: urgentCount > 0,
+                lastRunAt: recent?.createdAt ?? null,
+                lastRunLayer: recent?.layerKey ?? null,
+            };
+        }));
+
+        res.json({ ok: true, businessId, modules: results });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// ── GET /ai-ads/approval-queue — antrian approval dengan tipe & urgency ──────
+// Extended dari halaman lama: sekarang include layerKey, routingType, isUrgent,
+// dan contentData (preview untuk content_review). Item urgent naik ke atas.
+// Query params: ?page=1&limit=20&routingType=mutation|content_review&status=PENDING_APPROVAL
+router.get('/approval-queue', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10));
+        const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit ?? '20'), 10)));
+        const skip = (page - 1) * limit;
+
+        // Filter opsional
+        const routingTypeFilter = typeof req.query.routingType === 'string' ? req.query.routingType : undefined;
+        const statusFilter = typeof req.query.status === 'string' ? req.query.status : 'PENDING_APPROVAL';
+
+        const where: any = { businessId, status: statusFilter };
+        if (routingTypeFilter) where.routingType = routingTypeFilter;
+
+        const [items, total] = await Promise.all([
+            (prisma as any).aiAdsRecommendation.findMany({
+                where,
+                orderBy: [
+                    { isUrgent: 'desc' },   // urgent dulu
+                    { createdAt: 'desc' },  // terbaru kedua
+                ],
+                skip,
+                take: limit,
+                select: {
+                    id: true,
+                    layerKey: true,
+                    routingType: true,
+                    isUrgent: true,
+                    shiftType: true,
+                    status: true,
+                    requestedBy: true,
+                    planSummary: true,
+                    contentData: true,
+                    planPath: true,
+                    createdAt: true,
+                    updatedAt: true,
+                    approvedAt: true,
+                    rejectedAt: true,
+                    executedAt: true,
+                },
+            }),
+            (prisma as any).aiAdsRecommendation.count({ where }),
+        ]);
+
+        res.json({
+            ok: true,
+            page,
+            limit,
+            total,
+            totalPages: Math.ceil(total / limit),
+            items,
+        });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// ── GET /ai-ads/module/:key/findings — temuan terbaru 1 modul (24h) ──────────
+// Dipakai "Scan Sekarang" button per Kartu Modul (Fase 7C) dan juga drawer
+// detail modul. key: prefix layer seperti "layer01", "layer07", "layer16", dll.
+// Query params: ?hours=24&status=PENDING_APPROVAL|APPROVED|all
+router.get('/module/:key/findings', async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const layerPrefix = req.params.key;
+        if (!layerPrefix || layerPrefix.length < 3) {
+            res.status(400).json({ error: { message: 'Parameter key tidak valid (min 3 karakter).' } });
+            return;
+        }
+
+        const hours = Math.min(168, Math.max(1, parseInt(String(req.query.hours ?? '24'), 10)));
+        const since = new Date(Date.now() - hours * 60 * 60 * 1000);
+        const statusFilter = typeof req.query.status === 'string' && req.query.status !== 'all'
+            ? req.query.status
+            : undefined;
+
+        const where: any = {
+            businessId,
+            layerKey: { startsWith: layerPrefix },
+            createdAt: { gte: since },
+        };
+        if (statusFilter) where.status = statusFilter;
+
+        const findings = await (prisma as any).aiAdsRecommendation.findMany({
+            where,
+            orderBy: [{ isUrgent: 'desc' }, { createdAt: 'desc' }],
+            take: 50,
+            select: {
+                id: true,
+                layerKey: true,
+                routingType: true,
+                isUrgent: true,
+                status: true,
+                planSummary: true,
+                contentData: true,
+                requestedBy: true,
+                createdAt: true,
+                approvedAt: true,
+            },
+        });
+
+        res.json({
+            ok: true,
+            layerPrefix,
+            hours,
+            count: findings.length,
+            findings,
+        });
+    } catch (err) {
+        next(err);
+    }
+});
+
+// ╔════════════════════════════════════════════════════════════════════════════╗
+// ║  FASE 7D — Tab Pengaturan: GET/PUT /ai-ads/module-config                  ║
+// ║  Ditulis oleh: Antigravity (Gemini), 2026-08-29                           ║
+// ║  Claude trackback: sesi 26b52cab                                          ║
+// ╚════════════════════════════════════════════════════════════════════════════╝
+
+// ── GET /ai-ads/module-config?bmId=xxx — baca konfigurasi modul dari VPS45 ──
+// Proxy ke API Bridge VPS45 GET /v1/module-config. Kalau Bridge tidak tersedia
+// (env tidak diset), kembalikan config default hardcoded supaya Tab Pengaturan
+// tetap bisa tampil walau belum ada Bridge (graceful degradation).
+//
+// Response: { ok, source: 'bridge'|'default', config: ModuleConfigShape }
+// ModuleConfigShape mengikuti parameter Bagian 8 blueprint — 6 modul.
+router.get('/module-config', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const { businessId } = req.user!;
+        const bmId = typeof req.query.bmId === 'string' ? req.query.bmId : '';
+
+        // Jika Bridge tersedia, proxy ke VPS45
+        if (env.AI_ADS_BRIDGE_URL && env.AI_ADS_BRIDGE_API_KEY) {
+            try {
+                const bmParam = bmId ? `?bmId=${encodeURIComponent(bmId)}` : '';
+                const bridgeResp = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/module-config${bmParam}`, {
+                    headers: { 'X-Bridge-Api-Key': env.AI_ADS_BRIDGE_API_KEY },
+                });
+                if (bridgeResp.ok) {
+                    const bridgeBody = await bridgeResp.json() as any;
+                    res.json({ ok: true, source: 'bridge', config: bridgeBody.config ?? bridgeBody });
+                    return;
+                }
+                logger.warn(`[AiAds] /module-config: Bridge menjawab ${bridgeResp.status}, fallback ke default.`);
+            } catch (bridgeErr: any) {
+                logger.warn(`[AiAds] /module-config: Gagal hubungi Bridge (${bridgeErr?.message}), fallback ke default.`);
+            }
+        }
+
+        // Fallback: config default hardcoded (nilai dari Bagian 8 blueprint)
+        const DEFAULT_MODULE_CONFIG = {
+            module_7_1: {
+                enabled: true,
+                lock_period_hours: 48,
+                reduce_soft_pct: 0.30,
+                reduce_hard_pct: 0.50,
+                roas_band_soft_min: 0.70,
+                roas_band_soft_max: 0.85,
+                roas_band_hard_min: 0.50,
+                roas_band_hard_max: 0.70,
+                early_kill_spend_multiplier: 1.2,
+                hard_kill_cpa_multiplier: 3.0,
+                hard_kill_min_days: 7,
+                fatigue_frequency_threshold: 3.5,
+                fatigue_ctr_decay_threshold: -0.25,
+            },
+            module_7_2: {
+                enabled: true,
+                shift_morning_early_kill_hour: 9,
+                shift_midday_pacing_hour: 13,
+                shift_golden_hour_scaling_hour: 16,
+                morning_briefing_hour: 7,
+                morning_briefing_minute: 30,
+            },
+            module_7_3: {
+                enabled: true,
+                velocity_spike_pct_daily_budget: 0.50,
+                velocity_spike_window_hours: 2,
+                zero_conv_warning_cpa_multiplier: 1.5,
+                zero_conv_hard_stop_cpa_multiplier: 2.5,
+                lp_dead_link_consecutive_fails: 2,
+                lp_dead_link_timeout_seconds: 10,
+                circuit_breaker_plafon_multiplier: 1.10,
+            },
+            module_7_4: {
+                enabled: true,
+                cpc_surge_warning_pct: 0.50,
+                cpc_surge_critical_pct: 1.00,
+                cpc_surge_min_clicks: 10,
+                cpc_surge_min_spend_cpa_ratio: 0.5,
+                hook_diagnostician_min_impressions: 1000,
+                hook_diagnostician_ctr_threshold: 0.006,
+                lp_message_match_min_clicks: 50,
+                lp_message_match_ctr_threshold: 0.012,
+                lp_message_match_cvr_threshold: 0.008,
+            },
+            module_7_5: {
+                enabled: true,
+                waste_threshold_pct_spend7d: 0.10,
+                emq_target_purchase: 9.3,
+                emq_target_lead: 8.0,
+                exclude_window_days: 180,
+                bofu_campaign_ids: [],
+            },
+            module_7_6: {
+                enabled: true,
+                min_trials_per_variant: 20,
+                max_test_days: 14,
+                early_loser_kill_cpa_multiplier: 2.0,
+            },
+        };
+
+        res.json({ ok: true, source: 'default', config: DEFAULT_MODULE_CONFIG });
+    } catch (err) {
+        next(err);
+    }
+});
+
+const moduleConfigUpdateSchema = z.object({
+    bmId: z.string().optional(),
+    // Tiap modul bisa partial update — key yang tidak dikirim tidak diubah
+    module_7_1: z.record(z.any()).optional(),
+    module_7_2: z.record(z.any()).optional(),
+    module_7_3: z.record(z.any()).optional(),
+    module_7_4: z.record(z.any()).optional(),
+    module_7_5: z.record(z.any()).optional(),
+    module_7_6: z.record(z.any()).optional(),
+});
+
+// ── PUT /ai-ads/module-config — tulis konfigurasi modul ke VPS45 ─────────────
+// Proxy ke API Bridge VPS45 PUT /v1/module-config. Kalau Bridge tidak tersedia,
+// kembalikan 503 (tidak ada fallback untuk WRITE — perlu konfirmasi tersimpan).
+router.put('/module-config', authorize('ADMIN'), async (req, res, next) => {
+    try {
+        const parsed = moduleConfigUpdateSchema.safeParse(req.body);
+        if (!parsed.success) {
+            res.status(400).json({ error: { message: 'Payload tidak valid', issues: parsed.error.issues } });
+            return;
+        }
+
+        if (!env.AI_ADS_BRIDGE_URL || !env.AI_ADS_BRIDGE_API_KEY) {
+            res.status(503).json({
+                error: {
+                    message: 'API Bridge VPS45 belum dikonfigurasi — tidak bisa menyimpan perubahan config ke VPS45. Hubungi admin untuk set AI_ADS_BRIDGE_URL dan AI_ADS_BRIDGE_API_KEY.',
+                }
+            });
+            return;
+        }
+
+        const bridgeResp = await fetch(`${env.AI_ADS_BRIDGE_URL}/v1/module-config`, {
+            method: 'PUT',
+            headers: {
+                'Content-Type': 'application/json',
+                'X-Bridge-Api-Key': env.AI_ADS_BRIDGE_API_KEY,
+            },
+            body: JSON.stringify(parsed.data),
+        });
+
+        if (!bridgeResp.ok) {
+            const errBody = await bridgeResp.json().catch(() => ({}));
+            const errMsg = (errBody as any)?.error?.message || `Bridge HTTP ${bridgeResp.status}`;
+            logger.error(`[AiAds] PUT /module-config: Bridge menjawab error: ${errMsg}`);
+            res.status(502).json({ error: { message: `Gagal menyimpan ke VPS45: ${errMsg}` } });
+            return;
+        }
+
+        const bridgeBody = await bridgeResp.json();
+        logger.info(`[AiAds] PUT /module-config: Config berhasil diupdate di VPS45 (bisnis ${req.user!.businessId}).`);
+        res.json({ ok: true, message: 'Konfigurasi modul berhasil disimpan ke VPS45.', result: bridgeBody });
+    } catch (err) {
+        next(err);
+    }
+});
+
+export default router;
+//# sourceMappingURL=ai-ads.routes.js.map
